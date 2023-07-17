@@ -8,6 +8,7 @@ from enum import IntEnum
 import cherrypy
 import rados
 import rbd
+import time
 
 from .. import mgr
 from ..exceptions import DashboardException
@@ -630,8 +631,14 @@ class RbdService(object):
 
         image = RbdService.get_image(image_spec)
         snapshots = image['snapshots']
-        for snap in snapshots:
-            RbdSnapshotService.remove_snapshot(image_spec, snap['name'], snap['is_protected'])
+        if len(snapshots) > 0:
+            for snap in snapshots:
+                RbdSnapshotService.remove_snapshot(image_spec, snap['name'], snap['is_protected'])
+            while True:
+                image = RbdService.get_image(image_spec)
+                if len(image['snapshots']) < 1:
+                    break;
+                time.sleep(1)
 
         rbd_inst = rbd.RBD()
         return rbd_call(pool_name, namespace, rbd_inst.remove, image_name)
