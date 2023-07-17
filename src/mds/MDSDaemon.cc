@@ -376,10 +376,6 @@ void MDSDaemon::set_up_admin_socket()
 				     asok_hook,
 				     "Evict a client session by id");
   ceph_assert(r == 0);
-  r = admin_socket->register_command("session ls name=cap_dump,type=CephBool,req=false",
-				     asok_hook,
-				     "Enumerate connected CephFS clients");
-  ceph_assert(r == 0);
   r = admin_socket->register_command("session config "
 				     "name=client_id,type=CephInt,req=true "
 				     "name=option,type=CephString,req=true "
@@ -1080,7 +1076,7 @@ bool MDSDaemon::parse_caps(const AuthCapsInfo& info, MDSAuthCaps& caps)
 
     dout(10) << __func__ << ": parsing auth_cap_str='" << auth_cap_str << "'" << dendl;
     CachedStackStringStream cs;
-    if (caps.parse(g_ceph_context, auth_cap_str, cs.get())) {
+    if (caps.parse(auth_cap_str, cs.get())) {
       return true;
     } else {
       dout(1) << __func__ << ": auth cap parse error: " << cs->strv() << " parsing '" << auth_cap_str << "'" << dendl;

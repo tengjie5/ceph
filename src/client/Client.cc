@@ -1210,6 +1210,11 @@ Dentry *Client::insert_dentry_inode(Dir *dir, const string& dname, LeaseStat *dl
     Inode *diri = dir->parent_inode;
     clear_dir_complete_and_ordered(diri, false);
     dn = link(dir, dname, in, dn);
+
+    if (old_dentry) {
+      dn->is_renaming = false;
+      signal_cond_list(waiting_for_rename);
+    }
   }
 
   update_dentry_lease(dn, dlease, from, session);
@@ -3575,7 +3580,7 @@ void Client::put_cap_ref(Inode *in, int cap)
     int put_nref = 0;
     int drop = last & ~in->caps_issued();
     if (in->snapid == CEPH_NOSNAP) {
-      if ((last & (CEPH_CAP_FILE_WR | CEPH_CAP_FILE_BUFFER)) &&
+      if ((last & CEPH_CAP_FILE_WR) &&
 	  !in->cap_snaps.empty() &&
 	  in->cap_snaps.rbegin()->second.writing) {
 	ldout(cct, 10) << __func__ << " finishing pending cap_snap on " << *in << dendl;
@@ -3589,6 +3594,10 @@ void Client::put_cap_ref(Inode *in, int cap)
 	signal_cond_list(in->waitfor_commit);
 	ldout(cct, 5) << __func__ << " dropped last FILE_BUFFER ref on " << *in << dendl;
 	++put_nref;
+
+	if (!in->cap_snaps.empty()) {
+	  flush_snaps(in);
+	}
       }
     }
     if (last & CEPH_CAP_FILE_CACHE) {
@@ -4049,15 +4058,13 @@ void Client::queue_cap_snap(Inode *in, SnapContext& old_snapc)
       in->cap_snaps.rbegin()->second.writing) {
     ldout(cct, 10) << __func__ << " already have pending cap_snap on " << *in << dendl;
     return;
-  } else if (in->caps_dirty() ||
-            (used & CEPH_CAP_FILE_WR) ||
-	     (dirty & CEPH_CAP_ANY_WR)) {
+  } else if (dirty || (used & CEPH_CAP_FILE_WR)) {
     const auto &capsnapem = in->cap_snaps.emplace(std::piecewise_construct, std::make_tuple(old_snapc.seq), std::make_tuple(in));
     ceph_assert(capsnapem.second); /* element inserted */
     CapSnap &capsnap = capsnapem.first->second;
     capsnap.context = old_snapc;
     capsnap.issued = in->caps_issued();
-    capsnap.dirty = in->caps_dirty();
+    capsnap.dirty = dirty;
 
     capsnap.dirty_data = (used & CEPH_CAP_FILE_BUFFER);
 
@@ -4104,9 +4111,11 @@ void Client::finish_cap_snap(Inode *in, CapSnap &capsnap, int used)
   }
 
   if (used & CEPH_CAP_FILE_BUFFER) {
-    capsnap.writing = 1;
     ldout(cct, 10) << __func__ << " " << *in << " cap_snap " << &capsnap << " used " << used
-	     << " WRBUFFER, delaying" << dendl;
+	     << " WRBUFFER, trigger to flush dirty buffer" << dendl;
+
+    /* trigger to flush the buffer */
+    _flush(in, new C_Client_FlushComplete(this, in));
   } else {
     capsnap.dirty_data = 0;
     flush_snaps(in);
@@ -5309,24 +5318,48 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
 
   got_mds_push(session.get());
 
+  bool do_cap_release = false;
   Inode *in;
   vinodeno_t vino(m->get_ino(), CEPH_NOSNAP);
   if (auto it = inode_map.find(vino); it != inode_map.end()) {
     in = it->second;
-  } else {
-    if (m->get_op() == CEPH_CAP_OP_IMPORT) {
-      ldout(cct, 5) << __func__ << " don't have vino " << vino << " on IMPORT, immediately releasing" << dendl;
-      session->enqueue_cap_release(
-        m->get_ino(),
-        m->get_cap_id(),
-        m->get_seq(),
-        m->get_mseq(),
-        cap_epoch_barrier);
-    } else {
-      ldout(cct, 5) << __func__ << " don't have vino " << vino << ", dropping" << dendl;
-    }
 
-    // in case the mds is waiting on e.g. a revocation
+    /* MDS maybe waiting for cap release with increased seq */
+    switch (m->get_op()) {
+      case CEPH_CAP_OP_REVOKE:
+      case CEPH_CAP_OP_GRANT:
+        if (!in->caps.count(mds)) {
+	  do_cap_release = true;
+          ldout(cct, 5) << __func__ << " vino " << vino << " don't have cap "
+                        << m->get_cap_id() << " op " << m->get_op()
+                        << ", immediately releasing" << dendl;
+	}
+    }
+  } else {
+    /* MDS maybe waiting for cap release with increased seq */
+    switch (m->get_op()) {
+      case CEPH_CAP_OP_IMPORT:
+      case CEPH_CAP_OP_REVOKE:
+      case CEPH_CAP_OP_GRANT:
+	do_cap_release = true;
+        ldout(cct, 5) << __func__ << " don't have vino " << vino << " op "
+                      << m->get_op() << ", immediately releasing" << dendl;
+	break;
+      default:
+        ldout(cct, 5) << __func__ << " don't have vino " << vino << ", dropping" << dendl;
+	return;
+    }
+  }
+
+  // In case the mds is waiting on e.g. a revocation
+  if (do_cap_release) {
+    session->enqueue_cap_release(
+      m->get_ino(),
+      m->get_cap_id(),
+      m->get_seq(),
+      m->get_mseq(),
+      cap_epoch_barrier);
+
     flush_cap_releases();
     return;
   }
@@ -5801,6 +5834,13 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
 	}
       }
     }
+  }
+
+  // just in case the caps was released just before we get the revoke msg
+  if (!check && m->get_op() == CEPH_CAP_OP_REVOKE) {
+    cap->wanted = 0; // don't let check_caps skip sending a response to MDS
+    check = true;
+    flags = CHECK_CAPS_NODELAY;
   }
 
   if (check)
@@ -6649,11 +6689,18 @@ void Client::_unmount(bool abort)
   }
 
   mount_cond.wait(lock, [this] {
-    if (!mds_requests.empty()) {
-      ldout(cct, 10) << "waiting on " << mds_requests.size() << " requests"
-		     << dendl;
+    // Only wait for write OPs
+    for (auto& [tid, req] : mds_requests) {
+      if (req->is_write()) {
+        ldout(cct, 10) << "waiting for write request '" << tid
+                       << "' to complete, currently there are "
+                       << mds_requests.size()
+                       << " outstanding read/write requests"
+                       << dendl;
+        return false;
+      }
     }
-    return mds_requests.empty();
+    return true;
   });
 
   cwd.reset();
@@ -6666,7 +6713,7 @@ void Client::_unmount(bool abort)
     ldout(cct, 0) << " destroyed lost open file " << fh << " on " << *fh->inode << dendl;
     _release_fh(fh);
   }
-  
+
   while (!ll_unclosed_fh_set.empty()) {
     set<Fh*>::iterator it = ll_unclosed_fh_set.begin();
     Fh *fh = *it;
@@ -6927,6 +6974,13 @@ void Client::collect_and_send_global_metrics() {
   ldout(cct, 20) << __func__ << dendl;
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
+  /* Do not send the metrics until the MDS rank is ready */
+  if (!mdsmap->is_active((mds_rank_t)0)) {
+    ldout(cct, 5) << __func__ << " MDS rank 0 is not ready yet -- not sending metric"
+                  << dendl;
+    return;
+  }
+
   if (!have_open_session((mds_rank_t)0)) {
     ldout(cct, 5) << __func__ << ": no session with rank=0 -- not sending metric"
                   << dendl;
@@ -7098,7 +7152,8 @@ bool Client::_dentry_valid(const Dentry *dn)
 }
 
 int Client::_lookup(Inode *dir, const string& dname, int mask, InodeRef *target,
-		    const UserPerm& perms, std::string* alternate_name)
+                    const UserPerm& perms, std::string* alternate_name,
+                    bool is_rename)
 {
   int r = 0;
   Dentry *dn = NULL;
@@ -7176,6 +7231,19 @@ relookup:
       }
     } else {
       ldout(cct, 20) << " no cap on " << dn->inode->vino() << dendl;
+    }
+
+    // In rare case during the rename if another thread tries to
+    // lookup the dst dentry, it may get an inconsistent result
+    // that both src dentry and dst dentry will link to the same
+    // inode at the same time.
+    // Will wait the rename to finish and try it again.
+    if (!is_rename && dn->is_renaming) {
+      ldout(cct, 1) << __func__ << " dir " << *dir
+                    << " rename is on the way, will wait for dn '"
+                    << dname << "'" << dendl;
+      wait_on_list(waiting_for_rename);
+      goto relookup;
     }
   } else {
     // can we conclude ENOENT locally?
@@ -9171,7 +9239,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     }
 
     int idx = pd - dir->readdir_cache.begin();
-    if (dn->inode->is_dir()) {
+    if (dn->inode->is_dir() && cct->_conf->client_dirsize_rbytes) {
       mask |= CEPH_STAT_RSTAT;
     }
     int r = _getattr(dn->inode, mask, dirp->perms);
@@ -9279,6 +9347,7 @@ int Client::_readdir_r_cb(int op,
   bool bypass_cache)
 {
   int caps = statx_to_mask(flags, want);
+  int rstat_on_dir = cct->_conf->client_dirsize_rbytes ? CEPH_STAT_RSTAT : 0;
 
   RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
   if (!mref_reader.is_state_satisfied())
@@ -9308,7 +9377,7 @@ int Client::_readdir_r_cb(int op,
     uint64_t next_off = 1;
 
     int r;
-    r = _getattr(diri, caps | CEPH_STAT_RSTAT, dirp->perms);
+    r = _getattr(diri, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9341,7 +9410,7 @@ int Client::_readdir_r_cb(int op,
       in = diri->get_first_parent()->dir->parent_inode;
 
     int r;
-    r = _getattr(in, caps | CEPH_STAT_RSTAT, dirp->perms);
+    r = _getattr(in, caps | rstat_on_dir, dirp->perms);
     if (r < 0)
       return r;
 
@@ -9412,7 +9481,7 @@ int Client::_readdir_r_cb(int op,
       if (check_caps) {
 	int mask = caps;
 	if(entry.inode->is_dir()){
-          mask |= CEPH_STAT_RSTAT;
+          mask |= rstat_on_dir;
 	}
 	r = _getattr(entry.inode, mask, dirp->perms);
 	if (r < 0)
@@ -11940,6 +12009,9 @@ int Client::_sync_fs()
   flush_caps_sync();
   ceph_tid_t flush_tid = last_flush_tid;
 
+  // flush the mdlog before waiting for unsafe requests.
+  flush_mdlog_sync();
+
   // wait for unsafe mds requests
   wait_unsafe_requests();
 
@@ -14364,12 +14436,13 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
     req->old_dentry_drop = CEPH_CAP_FILE_SHARED;
     req->old_dentry_unless = CEPH_CAP_FILE_EXCL;
 
+    de->is_renaming = true;
     req->set_dentry(de);
     req->dentry_drop = CEPH_CAP_FILE_SHARED;
     req->dentry_unless = CEPH_CAP_FILE_EXCL;
 
     InodeRef oldin, otherin;
-    res = _lookup(fromdir, fromname, 0, &oldin, perm);
+    res = _lookup(fromdir, fromname, 0, &oldin, perm, nullptr, true);
     if (res < 0)
       goto fail;
 
@@ -14378,7 +14451,7 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
     req->set_old_inode(oldinode);
     req->old_inode_drop = CEPH_CAP_LINK_SHARED;
 
-    res = _lookup(todir, toname, 0, &otherin, perm);
+    res = _lookup(todir, toname, 0, &otherin, perm, nullptr, true);
     switch (res) {
     case 0:
       {
@@ -14406,6 +14479,12 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
 
   res = make_request(req, perm, &target);
   ldout(cct, 10) << "rename result is " << res << dendl;
+
+  // if rename fails it will miss waking up the waiters
+  if (op == CEPH_MDS_OP_RENAME && de->is_renaming) {
+    de->is_renaming = false;
+    signal_cond_list(waiting_for_rename);
+  }
 
   // renamed item from our cache
 

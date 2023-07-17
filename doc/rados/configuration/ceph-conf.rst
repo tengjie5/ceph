@@ -4,116 +4,116 @@
  Configuring Ceph
 ==================
 
-When Ceph services start, the initialization process activates a series
-of daemons that run in the background. A :term:`Ceph Storage Cluster` runs 
-at a minimum three types of daemons:
+When Ceph services start, the initialization process activates a series of
+daemons that run in the background. A :term:`Ceph Storage Cluster` runs at
+least three types of daemons:
 
 - :term:`Ceph Monitor` (``ceph-mon``)
 - :term:`Ceph Manager` (``ceph-mgr``)
 - :term:`Ceph OSD Daemon` (``ceph-osd``)
 
 Ceph Storage Clusters that support the :term:`Ceph File System` also run at
-least one :term:`Ceph Metadata Server` (``ceph-mds``). Clusters that
-support :term:`Ceph Object Storage` run Ceph RADOS Gateway daemons
-(``radosgw``) as well.
+least one :term:`Ceph Metadata Server` (``ceph-mds``). Clusters that support
+:term:`Ceph Object Storage` run Ceph RADOS Gateway daemons (``radosgw``).
 
-Each daemon has a number of configuration options, each of which has a
-default value.  You may adjust the behavior of the system by changing these
-configuration options.  Be careful to understand the consequences before
+Each daemon has a number of configuration options, each of which has a default
+value. You may adjust the behavior of the system by changing these
+configuration options. Be careful to understand the consequences before
 overriding default values, as it is possible to significantly degrade the
-performance and stability of your cluster.  Also note that default values
-sometimes change between releases, so it is best to review the version of
-this documentation that aligns with your Ceph release.
+performance and stability of your cluster. Note too that default values
+sometimes change between releases. For this reason, it is best to review the
+version of this documentation that applies to your Ceph release.
 
 Option names
 ============
 
-All Ceph configuration options have a unique name consisting of words
-formed with lower-case characters and connected with underscore
-(``_``) characters.
+Each of the Ceph configuration options has a unique name that consists of words
+formed with lowercase characters and connected with underscore characters
+(``_``).
 
-When option names are specified on the command line, either underscore
-(``_``) or dash (``-``) characters can be used interchangeable (e.g.,
+When option names are specified on the command line, underscore (``_``) and
+dash (``-``) characters can be used interchangeably (for example,
 ``--mon-host`` is equivalent to ``--mon_host``).
 
-When option names appear in configuration files, spaces can also be
-used in place of underscore or dash.  We suggest, though, that for
-clarity and convenience you consistently use underscores, as we do
+When option names appear in configuration files, spaces can also be used in
+place of underscores or dashes. However, for the sake of clarity and
+convenience, we suggest that you consistently use underscores, as we do
 throughout this documentation.
 
 Config sources
 ==============
 
-Each Ceph daemon, process, and library will pull its configuration
-from several sources, listed below.  Sources later in the list will
-override those earlier in the list when both are present.
+Each Ceph daemon, process, and library pulls its configuration from one or more
+of the several sources listed below. Sources that occur later in the list
+override those that occur earlier in the list (when both are present).
 
 - the compiled-in default value
 - the monitor cluster's centralized configuration database
 - a configuration file stored on the local host
 - environment variables
-- command line arguments
-- runtime overrides set by an administrator
+- command-line arguments
+- runtime overrides that are set by an administrator
 
 One of the first things a Ceph process does on startup is parse the
-configuration options provided via the command line, environment, and
-local configuration file.  The process will then contact the monitor
-cluster to retrieve configuration stored centrally for the entire
-cluster.  Once a complete view of the configuration is available, the
-daemon or process startup will proceed.
+configuration options provided via the command line, via the environment, and
+via the local configuration file. Next, the process contacts the monitor
+cluster to retrieve centrally-stored configuration for the entire cluster.
+After a complete view of the configuration is available, the startup of the
+daemon or process will commence.
 
 .. _bootstrap-options:
 
 Bootstrap options
 -----------------
 
-Some configuration options affect the process's ability to contact the
-monitors, to authenticate, and to retrieve the cluster-stored configuration.
-For this reason, these options might need to be stored locally on the node, and
-set by means of a local configuration file. These options include the
-following:
+Bootstrap options are configuration options that affect the process's ability
+to contact the monitors, to authenticate, and to retrieve the cluster-stored
+configuration.  For this reason, these options might need to be stored locally
+on the node, and set by means of a local configuration file. These options
+include the following:
 
 .. confval:: mon_host
 .. confval:: mon_host_override
 
 - :confval:`mon_dns_srv_name`
-- :confval:`mon_data`, :confval:`osd_data`, :confval:`mds_data`, :confval:`mgr_data`, and
-  similar options that define which local directory the daemon
-  stores its data in.
-- :confval:`keyring`, :confval:`keyfile`, and/or :confval:`key`, which can be used to
-  specify the authentication credential to use to authenticate with
-  the monitor.  Note that in most cases the default keyring location
-  is in the data directory specified above.
+- :confval:`mon_data`, :confval:`osd_data`, :confval:`mds_data`, 
+  :confval:`mgr_data`, and similar options that define which local directory
+  the daemon stores its data in.
+- :confval:`keyring`, :confval:`keyfile`, and/or :confval:`key`, which can be 
+  used to specify the authentication credential to use to authenticate with the
+  monitor. Note that in most cases the default keyring location is in the data
+  directory specified above.
 
-In most cases, the default values of these options are suitable. There is one
-exception to this: the :confval:`mon_host` option that identifies the addresses
-of the cluster's monitors.  When DNS is used to identify monitors, a local Ceph
-configuration file can be avoided entirely.
+In most cases, there is no reason to modify the default values of these
+options. However, there is one exception to this: the :confval:`mon_host`
+option that identifies the addresses of the cluster's monitors. But when DNS is
+used to identify monitors, a local Ceph configuration file can be avoided
+entirely.
+
 
 Skipping monitor config
 -----------------------
 
-Pass the option ``--no-mon-config`` to any process to skip the step that
-retrieves configuration information from the cluster monitors. This is useful
-in cases where configuration is managed entirely via configuration files, or
-when the monitor cluster is down and some maintenance activity needs to be
-done.
-
+The option ``--no-mon-config`` can be passed in any command in order to skip
+the step that retrieves configuration information from the cluster's monitors.
+Skipping this retrieval step can be useful in cases where configuration is
+managed entirely via configuration files, or when maintenance activity needs to
+be done but the monitor cluster is down.
 
 .. _ceph-conf-file:
-
 
 Configuration sections
 ======================
 
-Any given process or daemon has a single value for each configuration
-option.  However, values for an option may vary across different
-daemon types even daemons of the same type.  Ceph options that are
-stored in the monitor configuration database or in local configuration
-files are grouped into sections to indicate which daemons or clients
-they apply to.
+Each of the configuration options associated with a single process or daemon
+has a single value. However, the values for a configuration option can vary
+across daemon types, and can vary even across different daemons of the same
+type. Ceph options that are stored in the monitor configuration database or in
+local configuration files are grouped into sections |---| so-called "configuration
+sections" |---| to indicate which daemons or clients they apply to.
 
-These sections include:
+
+These sections include the following:
 
 .. confsec:: global
 
@@ -156,41 +156,40 @@ These sections include:
 
 .. confsec:: client
 
-   Settings under ``client`` affect all Ceph Clients
-   (e.g., mounted Ceph File Systems, mounted Ceph Block Devices,
-   etc.) as well as Rados Gateway (RGW) daemons.
+   Settings under ``client`` affect all Ceph clients
+   (for example, mounted Ceph File Systems, mounted Ceph Block Devices)
+   as well as RADOS Gateway (RGW) daemons.
 
    :example: ``objecter_inflight_ops = 512``
 
 
-Sections may also specify an individual daemon or client name.  For example,
+Configuration sections can also specify an individual daemon or client name. For example,
 ``mon.foo``, ``osd.123``, and ``client.smith`` are all valid section names.
 
 
-Any given daemon will draw its settings from the global section, the
-daemon or client type section, and the section sharing its name.
-Settings in the most-specific section take precedence, so for example
-if the same option is specified in both :confsec:`global`, :confsec:`mon`, and
-``mon.foo`` on the same source (i.e., in the same configurationfile),
-the ``mon.foo`` value will be used.
+Any given daemon will draw its settings from the global section, the daemon- or
+client-type section, and the section sharing its name. Settings in the
+most-specific section take precedence so precedence: for example, if the same
+option is specified in both :confsec:`global`, :confsec:`mon`, and ``mon.foo``
+on the same source (i.e. that is, in the same configuration file), the
+``mon.foo`` setting will be used.
 
 If multiple values of the same configuration option are specified in the same
-section, the last value wins.
+section, the last value specified takes precedence.
 
-Note that values from the local configuration file always take
-precedence over values from the monitor configuration database,
-regardless of which section they appear in.
-
+Note that values from the local configuration file always take precedence over
+values from the monitor configuration database, regardless of the section in 
+which they appear.
 
 .. _ceph-metavariables:
 
 Metavariables
 =============
 
-Metavariables simplify Ceph Storage Cluster configuration
-dramatically. When a metavariable is set in a configuration value,
-Ceph expands the metavariable into a concrete value at the time the
-configuration value is used. Ceph metavariables are similar to variable expansion in the Bash shell.
+Metavariables dramatically simplify Ceph storage cluster configuration. When a
+metavariable is set in a configuration value, Ceph expands the metavariable at
+the time the configuration value is used. In this way, Ceph metavariables
+behave similarly to the way that variable expansion works in the Bash shell.
 
 Ceph supports the following metavariables: 
 
@@ -204,7 +203,7 @@ Ceph supports the following metavariables:
 
 .. describe:: $type
 
-   Expands to a daemon or process type (e.g., ``mds``, ``osd``, or ``mon``)
+   Expands to a daemon or process type (for example, ``mds``, ``osd``, or ``mon``)
 
    :example: ``/var/lib/ceph/$type``
 
@@ -233,33 +232,32 @@ Ceph supports the following metavariables:
    :example: ``/var/run/ceph/$cluster-$name-$pid.asok``
 
 
-
-The Configuration File
-======================
+Ceph configuration file
+=======================
 
 On startup, Ceph processes search for a configuration file in the
 following locations:
 
-#. ``$CEPH_CONF`` (*i.e.,* the path following the ``$CEPH_CONF``
+#. ``$CEPH_CONF`` (that is, the path following the ``$CEPH_CONF``
    environment variable)
-#. ``-c path/path``  (*i.e.,* the ``-c`` command line argument)
+#. ``-c path/path``  (that is, the ``-c`` command line argument)
 #. ``/etc/ceph/$cluster.conf``
 #. ``~/.ceph/$cluster.conf``
-#. ``./$cluster.conf`` (*i.e.,* in the current working directory)
+#. ``./$cluster.conf`` (that is, in the current working directory)
 #. On FreeBSD systems only, ``/usr/local/etc/ceph/$cluster.conf``
 
-where ``$cluster`` is the cluster's name (default ``ceph``).
+Here ``$cluster`` is the cluster's name (default: ``ceph``).
 
-The Ceph configuration file uses an *ini* style syntax. You can add comment
-text after a pound sign (#) or a semi-colon (;).  For example:
+The Ceph configuration file uses an ``ini`` style syntax. You can add "comment
+text" after a pound sign (#) or a semi-colon semicolon (;). For example:
 
 .. code-block:: ini
 
-	# <--A number (#) sign precedes a comment.
-	; A comment may be anything.
-	# Comments always follow a semi-colon (;) or a pound (#) on each line.
-	# The end of the line terminates a comment.
-	# We recommend that you provide comments in your configuration file(s).
+    # <--A number (#) sign number sign (#) precedes a comment.
+    ; A comment may be anything.
+    # Comments always follow a semi-colon semicolon (;) or a pound sign (#) on each line.
+    # The end of the line terminates a comment.
+    # We recommend that you provide comments in your configuration file(s).
 
 
 .. _ceph-conf-settings:
@@ -268,23 +266,22 @@ Config file section names
 -------------------------
 
 The configuration file is divided into sections. Each section must begin with a
-valid configuration section name (see `Configuration sections`_, above)
-surrounded by square brackets. For example,
+valid configuration section name (see `Configuration sections`_, above) that is
+surrounded by square brackets. For example:
 
 .. code-block:: ini
 
-	[global]
-	debug_ms = 0
-	
-	[osd]
-	debug_ms = 1
+    [global]
+    debug_ms = 0
+    
+    [osd]
+    debug_ms = 1
 
-	[osd.1]
-	debug_ms = 10
+    [osd.1]
+    debug_ms = 10
 
-	[osd.2]
-	debug_ms = 10
-
+    [osd.2]
+    debug_ms = 10
 
 Config file option values
 -------------------------
@@ -701,3 +698,6 @@ These changes are as follows:
   all options would be set as though they were within the :confsec:`global` section. This is
   now discouraged. Since Octopus, only a single option is allowed for
   configuration files without a section name.
+
+.. |---|   unicode:: U+2014 .. EM DASH
+   :trim:

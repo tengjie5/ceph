@@ -100,10 +100,12 @@ struct connection_t {
     // fire all remaining callbacks (if not fired by rd_kafka_flush)
     std::for_each(callbacks.begin(), callbacks.end(), [this](auto& cb_tag) {
         cb_tag.cb(status);
-        ldout(cct, 20) << "Kafka destroy: invoking callback with tag=" << cb_tag.tag << dendl;
+        ldout(cct, 20) << "Kafka destroy: invoking callback with tag=" << cb_tag.tag << 
+          " for: " << broker << dendl;
       });
     callbacks.clear();
     delivery_tag = 1;
+    ldout(cct, 20) << "Kafka destroy: complete for: " << broker << dendl;
   }
 
   bool is_ok() const {
@@ -427,6 +429,7 @@ private:
     } else {
         ldout(conn->cct, 20) << "Kafka publish (no callback): OK" << dendl;
     }
+    // coverity[leaked_storage:SUPPRESS]
   }
 
   // the managers thread:
@@ -459,7 +462,6 @@ private:
         // Checking the connection idlesness
         if(conn->timestamp.sec() + max_idle_time < ceph_clock_now()) {
           ldout(conn->cct, 20) << "kafka run: deleting a connection due to idle behaviour: " << ceph_clock_now() << dendl;
-          conn->destroy(STATUS_CONNECTION_IDLE);
           std::lock_guard lock(connections_lock);
           conn_it = connections.erase(conn_it);
           --connection_count; \
@@ -600,7 +602,9 @@ public:
     if (stopped) {
       return STATUS_MANAGER_STOPPED;
     }
-    if (messages.push(new message_wrapper_t(conn_name, topic, message, nullptr))) {
+    auto message_wrapper = std::make_unique<message_wrapper_t>(conn_name, topic, message, nullptr);
+    if (messages.push(message_wrapper.get())) {
+      std::ignore = message_wrapper.release();
       ++queued;
       return STATUS_OK;
     }
@@ -614,7 +618,9 @@ public:
     if (stopped) {
       return STATUS_MANAGER_STOPPED;
     }
-    if (messages.push(new message_wrapper_t(conn_name, topic, message, cb))) {
+    auto message_wrapper = std::make_unique<message_wrapper_t>(conn_name, topic, message, cb);
+    if (messages.push(message_wrapper.get())) {
+      std::ignore = message_wrapper.release();
       ++queued;
       return STATUS_OK;
     }

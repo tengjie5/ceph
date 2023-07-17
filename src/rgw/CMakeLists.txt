@@ -222,6 +222,11 @@ endif()
 if(WITH_RADOSGW_DAOS)
   list(APPEND librgw_common_srcs rgw_sal_daos.cc)
 endif()
+if(WITH_RADOSGW_D4N)
+  list(APPEND librgw_common_srcs driver/d4n/d4n_directory.cc)
+  list(APPEND librgw_common_srcs driver/d4n/d4n_datacache.cc)
+  list(APPEND librgw_common_srcs driver/d4n/rgw_sal_d4n.cc)
+endif()
 if(WITH_JAEGER)
   list(APPEND librgw_common_srcs rgw_tracer.cc)
 endif()
@@ -276,6 +281,14 @@ target_include_directories(rgw_common
   PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados"
   PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw"
   PUBLIC "${LUA_INCLUDE_DIR}")
+
+if(WITH_RADOSGW_D4N)
+  add_dependencies(rgw_common cpp_redis)
+  target_link_libraries(rgw_common PRIVATE cpp_redis)
+  target_include_directories(rgw_common SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/src/cpp_redis/includes")
+  target_include_directories(rgw_common SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/src/cpp_redis/tacopie/includes")
+endif()
+
 if(WITH_RADOSGW_KAFKA_ENDPOINT)
   # used by rgw_kafka.cc
   target_link_libraries(rgw_common
@@ -537,13 +550,13 @@ target_link_libraries(rgw
   ${LIB_RESOLV}
   ${CURL_LIBRARIES}
   ${EXPAT_LIBRARIES}
+  OpenSSL::SSL
   PUBLIC
   RapidJSON::RapidJSON
   dmclock::dmclock)
 
 if(WITH_RADOSGW_AMQP_ENDPOINT)
   target_link_libraries(rgw PRIVATE RabbitMQ::RabbitMQ)
-  target_link_libraries(rgw PRIVATE OpenSSL::SSL)
 endif()
 
 if(WITH_RADOSGW_KAFKA_ENDPOINT)
