@@ -61,15 +61,13 @@ struct rgw_http_req_data : public RefCountedObject {
     memset(error_buf, 0, sizeof(error_buf));
   }
 
-  template <typename ExecutionContext, typename CompletionToken>
-  auto async_wait(ExecutionContext& ctx, CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken, Signature> init(token);
-    auto& handler = init.completion_handler;
-    {
-      std::unique_lock l{lock};
-      completion = Completion::create(ctx.get_executor(), std::move(handler));
-    }
-    return init.result.get();
+  template <typename Executor, typename CompletionToken>
+  auto async_wait(const Executor& ex, CompletionToken&& token) {
+    return boost::asio::async_initiate<CompletionToken, Signature>(
+        [this] (auto handler, auto ex) {
+          std::unique_lock l{lock};
+          completion = Completion::create(ex, std::move(handler));
+        }, token, ex);
   }
 
   int wait(optional_yield y) {
@@ -77,10 +75,9 @@ struct rgw_http_req_data : public RefCountedObject {
       return ret;
     }
     if (y) {
-      auto& context = y.get_io_context();
       auto& yield = y.get_yield_context();
       boost::system::error_code ec;
-      async_wait(context, yield[ec]);
+      async_wait(yield.get_executor(), yield[ec]);
       return -ec.value();
     }
     // work on asio threads should be asynchronous, so warn when they block
@@ -306,6 +303,7 @@ RGWHTTPClient::RGWHTTPClient(CephContext *cct,
       verify_ssl(cct->_conf->rgw_verify_ssl),
       cct(cct),
       method(_method),
+      url_orig(_url),
       url(_url) {
   init();
 }
@@ -590,6 +588,8 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   curl_easy_setopt(easy_handle, CURLOPT_READFUNCTION, send_http_data);
   curl_easy_setopt(easy_handle, CURLOPT_READDATA, (void *)req_data);
   curl_easy_setopt(easy_handle, CURLOPT_BUFFERSIZE, cct->_conf->rgw_curl_buffersize);
+  curl_easy_setopt(easy_handle, CURLOPT_PATH_AS_IS, 1L);
+
   if (send_data_hint || is_upload_request(method)) {
     curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L);
   }
@@ -1017,7 +1017,10 @@ int RGWHTTPManager::set_request_state(RGWHTTPClient *client, RGWHTTPRequestSetSt
     return 0;
   }
 
+  // mutex already locked
+  // coverity[missing_lock:SUPPRESS]
   req_data->write_paused = suggested_wr_paused;
+  // coverity[missing_lock:SUPPRESS]
   req_data->read_paused = suggested_rd_paused;
 
   int bitmask = CURLPAUSE_CONT;
@@ -1151,6 +1154,7 @@ void *RGWHTTPManager::reqs_thread_entry()
           case CURLE_OPERATION_TIMEDOUT:
             dout(0) << "WARNING: curl operation timed out, network average transfer speed less than " 
               << cct->_conf->rgw_curl_low_speed_limit << " Bytes per second during " << cct->_conf->rgw_curl_low_speed_time << " seconds." << dendl;
+          // coverity[unterminated_case:SUPPRESS]
           default:
             dout(20) << "ERROR: msg->data.result=" << result << " req_data->id=" << id << " http_status=" << http_status << dendl;
             dout(20) << "ERROR: curl error: " << curl_easy_strerror((CURLcode)result) << " req_data->error_buf=" << req_data->error_buf << dendl;

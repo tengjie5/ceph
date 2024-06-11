@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <iterator>
 #include <random>
+
+#include <boost/asio/post.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/filtered.hpp>
 #include <boost/range/algorithm/copy.hpp>
@@ -129,7 +131,7 @@ int MonClient::get_monmap_and_config()
   messenger = Messenger::create_client_messenger(
     cct, "temp_mon_client");
   ceph_assert(messenger);
-  messenger->add_dispatcher_head(this);
+  messenger->add_dispatcher_head(this, Dispatcher::PRIORITY_HIGH);
   messenger->start();
   auto shutdown_msgr = make_scope_guard([this] {
     messenger->shutdown();
@@ -154,11 +156,8 @@ int MonClient::get_monmap_and_config()
     if (r < 0) {
       return r;
     }
-    r = authenticate(std::chrono::duration<double>(cct->_conf.get_val<std::chrono::seconds>("client_mount_timeout")).count());
-    if (r == -ETIMEDOUT) {
-      shutdown();
-      continue;
-    }
+    r = authenticate(
+      cct->_conf.get_val<std::chrono::seconds>("client_mount_timeout").count());
     if (r < 0) {
       break;
     }
@@ -266,7 +265,7 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
 						result_reply);
 
   Messenger *smsgr = Messenger::create_client_messenger(cct, "temp_ping_client");
-  smsgr->add_dispatcher_head(pinger);
+  smsgr->add_dispatcher_head(pinger, Dispatcher::PRIORITY_HIGH);
   smsgr->set_auth_client(pinger);
   smsgr->start();
 
@@ -296,6 +295,7 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
 
 bool MonClient::ms_dispatch(Message *m)
 {
+  ldout(cct, 25) << __func__ << " processing " << m << dendl;
   // we only care about these message types
   switch (m->get_type()) {
   case CEPH_MSG_MON_MAP:
@@ -512,7 +512,7 @@ int MonClient::init()
   initialized = true;
 
   messenger->set_auth_client(this);
-  messenger->add_dispatcher_head(this);
+  messenger->add_dispatcher_head(this, Dispatcher::PRIORITY_HIGH);
 
   timer.init();
   schedule_tick();
@@ -751,6 +751,10 @@ void MonClient::_reopen_session(int rank)
   authenticate_err = 1;  // == in progress
 
   _start_hunting();
+
+  if (rank == -1) {
+    rank = cct->_conf.get_val<int64_t>("mon_client_target_rank");
+  }
 
   if (rank >= 0) {
     _add_conn(rank);
@@ -1605,7 +1609,7 @@ int MonClient::handle_auth_request(
     // for some channels prior to nautilus (osd heartbeat), we
     // tolerate the lack of an authorizer.
     if (!con->get_messenger()->require_authorizer) {
-      handle_authentication_dispatcher->ms_handle_authentication(con);
+      handle_authentication_dispatcher->ms_handle_fast_authentication(con);
       return 1;
     }
     return -EACCES;
@@ -1643,7 +1647,7 @@ int MonClient::handle_auth_request(
     &auth_meta->connection_secret,
     ac);
   if (isvalid) {
-    handle_authentication_dispatcher->ms_handle_authentication(con);
+    handle_authentication_dispatcher->ms_handle_fast_authentication(con);
     return 1;
   }
   if (!more && !was_challenge && auth_meta->authorizer_challenge) {

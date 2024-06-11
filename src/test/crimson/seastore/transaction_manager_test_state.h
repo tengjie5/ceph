@@ -18,10 +18,18 @@
 #include "crimson/os/seastore/random_block_manager/rbm_device.h"
 #include "crimson/os/seastore/journal/circular_bounded_journal.h"
 #include "crimson/os/seastore/random_block_manager/block_rb_manager.h"
+#ifdef UNIT_TESTS_BUILT
+#include "test/crimson/gtest_seastar.h"
+#endif
 
 using namespace crimson;
 using namespace crimson::os;
 using namespace crimson::os::seastore;
+
+enum class integrity_check_t : uint8_t {
+  FULL_CHECK,
+  NONFULL_CHECK
+};
 
 class EphemeralDevices {
 public:
@@ -167,9 +175,14 @@ public:
   void set_primary_device_ref(DeviceRef) final;
 };
 
-class EphemeralTestState {
+class EphemeralTestState 
+#ifdef UNIT_TESTS_BUILT
+  : public ::testing::WithParamInterface<
+	      std::tuple<const char*, integrity_check_t>> {
+#else 
+  {
+#endif
 protected:
-  journal_type_t journal_type;
   size_t num_main_device_managers = 0;
   size_t num_cold_device_managers = 0;
   EphemeralDevicesRef devices;
@@ -209,20 +222,23 @@ protected:
     restart_fut().get0();
   }
 
-  seastar::future<> tm_setup(
-    journal_type_t type = journal_type_t::SEGMENTED) {
+  seastar::future<> tm_setup() {
     LOG_PREFIX(EphemeralTestState::tm_setup);
-    journal_type = type;
-    if (journal_type == journal_type_t::SEGMENTED) {
-      devices.reset(new
-        EphemeralSegmentedDevices(
-          num_main_device_managers, num_cold_device_managers));
-    } else {
-      assert(journal_type == journal_type_t::RANDOM_BLOCK);
+#ifdef UNIT_TESTS_BUILT
+    std::string j_type = std::get<0>(GetParam());
+#else
+    std::string j_type = "segmented";
+#endif
+    if (j_type == "circularbounded") {
       //TODO: multiple devices
       ceph_assert(num_main_device_managers == 1);
       ceph_assert(num_cold_device_managers == 0);
       devices.reset(new EphemeralRandomBlockDevices(1));
+    } else {
+      // segmented by default
+      devices.reset(new
+        EphemeralSegmentedDevices(
+          num_main_device_managers, num_cold_device_managers));
     }
     SUBINFO(test, "begin with {} devices ...", devices->get_num_devices());
     return devices->setup(
@@ -266,11 +282,21 @@ protected:
   virtual seastar::future<> _init() override {
     auto sec_devices = devices->get_secondary_devices();
     auto p_dev = devices->get_primary_device();
+    auto fut = seastar::now();
+#ifdef UNIT_TESTS_BUILT
+    if (std::get<1>(GetParam()) == integrity_check_t::FULL_CHECK) {
+      fut = crimson::common::local_conf().set_val(
+	"seastore_full_integrity_check", "true");
+    } else {
+      fut = crimson::common::local_conf().set_val(
+	"seastore_full_integrity_check", "false");
+    }
+#endif
     tm = make_transaction_manager(p_dev, sec_devices, true);
     epm = tm->get_epm();
     lba_manager = tm->get_lba_manager();
     cache = tm->get_cache();
-    return seastar::now();
+    return fut;
   }
 
   virtual seastar::future<> _destroy() override {
@@ -410,10 +436,21 @@ protected:
   SeaStoreTestState() : EphemeralTestState(1, 0) {}
 
   virtual seastar::future<> _init() final {
+    auto fut = seastar::now();
+#ifdef UNIT_TESTS_BUILT
+    if (std::get<1>(GetParam()) == integrity_check_t::FULL_CHECK) {
+      fut = crimson::common::local_conf().set_val(
+	"seastore_full_integrity_check", "true");
+    } else {
+      fut = crimson::common::local_conf().set_val(
+	"seastore_full_integrity_check", "false");
+    }
+#endif
     seastore = make_test_seastore(
       std::make_unique<TestMDStoreState::Store>(mdstore_state.get_mdstore()));
-    return seastore->test_start(devices->get_primary_device_ref()
-    ).then([this] {
+    return fut.then([this] {
+      return seastore->test_start(devices->get_primary_device_ref());
+    }).then([this] {
       sharded_seastore = &(seastore->get_sharded_store());
     });
   }

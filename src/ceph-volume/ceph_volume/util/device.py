@@ -33,20 +33,30 @@ class Devices(object):
     A container for Device instances with reporting
     """
 
-    def __init__(self, filter_for_batch=False, with_lsm=False):
+    def __init__(self,
+                 filter_for_batch=False,
+                 with_lsm=False,
+                 list_all=False):
         lvs = lvm.get_lvs()
         lsblk_all = disk.lsblk_all()
         all_devices_vgs = lvm.get_all_devices_vgs()
         if not sys_info.devices:
             sys_info.devices = disk.get_devices()
-        self.devices = [Device(k,
-                               with_lsm,
-                               lvs=lvs,
-                               lsblk_all=lsblk_all,
-                               all_devices_vgs=all_devices_vgs) for k in
-                        sys_info.devices.keys()]
-        if filter_for_batch:
-            self.devices = [d for d in self.devices if d.available_lvm_batch]
+        self._devices = [Device(k,
+                                with_lsm,
+                                lvs=lvs,
+                                lsblk_all=lsblk_all,
+                                all_devices_vgs=all_devices_vgs) for k in
+                         sys_info.devices.keys()]
+        self.devices = []
+        for device in self._devices:
+            if filter_for_batch and not device.available_lvm_batch:
+                continue
+            if device.is_lv and not list_all:
+                continue
+            if device.is_partition and not list_all:
+                continue
+            self.devices.append(device)
 
     def pretty_report(self):
         output = [
@@ -111,13 +121,8 @@ class Device(object):
             # check if we are not a device mapper
             if "dm-" not in real_path:
                 self.path = real_path
-        if not sys_info.devices:
-            if self.path:
-                sys_info.devices = disk.get_devices(device=self.path)
-            else:
-                sys_info.devices = disk.get_devices()
-        if sys_info.devices.get(self.path, {}):
-            self.device_nodes = sys_info.devices[self.path]['device_nodes']
+        if not sys_info.devices.get(self.path):
+            sys_info.devices = disk.get_devices()
         self.sys_api = sys_info.devices.get(self.path, {})
         self.partitions = self._get_partitions()
         self.lv_api = None
@@ -133,6 +138,8 @@ class Device(object):
         self._is_lvm_member = None
         self.ceph_device = False
         self._parse()
+        if self.path in sys_info.devices.keys():
+            self.device_nodes = sys_info.devices[self.path]['device_nodes']
         self.lsm_data = self.fetch_lsm(with_lsm)
 
         self.available_lvm, self.rejected_reasons_lvm = self._check_lvm_reject_reasons()
@@ -450,11 +457,11 @@ class Device(object):
     def device_type(self):
         self.load_blkid_api()
         if 'type' in self.sys_api:
-            return self.sys_api['type']
+            return self.sys_api.get('type')
         elif self.disk_api:
-            return self.disk_api['TYPE']
+            return self.disk_api.get('TYPE')
         elif self.blkid_api:
-            return self.blkid_api['TYPE']
+            return self.blkid_api.get('TYPE')
 
     @property
     def is_mpath(self):
@@ -468,9 +475,9 @@ class Device(object):
     def is_partition(self):
         self.load_blkid_api()
         if self.disk_api:
-            return self.disk_api['TYPE'] == 'part'
+            return self.disk_api.get('TYPE') == 'part'
         elif self.blkid_api:
-            return self.blkid_api['TYPE'] == 'part'
+            return self.blkid_api.get('TYPE') == 'part'
         return False
 
     @property
@@ -490,7 +497,7 @@ class Device(object):
 
     @property
     def is_acceptable_device(self):
-        return self.is_device or self.is_partition
+        return self.is_device or self.is_partition or self.is_lv
 
     @property
     def is_encrypted(self):
@@ -584,9 +591,8 @@ class Device(object):
 
     def _check_generic_reject_reasons(self):
         reasons = [
-            ('removable', 1, 'removable'),
-            ('ro', 1, 'read-only'),
-            ('locked', 1, 'locked'),
+            ('id_bus', 'usb', 'id_bus'),
+            ('ro', '1', 'read-only'),
         ]
         rejected = [reason for (k, v, reason) in reasons if
                     self.sys_api.get(k, '') == v]
@@ -622,6 +628,8 @@ class Device(object):
             rejected.append('Has GPT headers')
         if self.has_partitions:
             rejected.append('Has partitions')
+        if self.has_fs:
+            rejected.append('Has a FileSystem')
         return rejected
 
     def _check_lvm_reject_reasons(self):

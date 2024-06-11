@@ -87,12 +87,12 @@ int ErasureCodeClay::init(ErasureCodeProfile &profile,
 
 }
 
-unsigned int ErasureCodeClay::get_chunk_size(unsigned int object_size) const
+unsigned int ErasureCodeClay::get_chunk_size(unsigned int stripe_width) const
 {
   unsigned int alignment_scalar_code = pft.erasure_code->get_chunk_size(1);
   unsigned int alignment = sub_chunk_no * k * alignment_scalar_code;
   
-  return round_up_to(object_size, alignment) / k;
+  return round_up_to(stripe_width, alignment) / k;
 }
 
 int ErasureCodeClay::minimum_to_decode(const set<int> &want_to_read,
@@ -507,7 +507,7 @@ int ErasureCodeClay::repair_one_lost_chunk(map<int, bufferlist> &recovered_data,
     }
   }
 
-  int lost_chunk;
+  int lost_chunk = 0;
   int count = 0;
   for ([[maybe_unused]] auto& [node, bl] : recovered_data) {
     lost_chunk = node;

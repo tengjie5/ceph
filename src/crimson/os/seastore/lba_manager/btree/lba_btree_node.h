@@ -33,17 +33,18 @@ using LBANode = FixedKVNode<laddr_t>;
  */
 struct lba_map_val_t {
   extent_len_t len = 0;  ///< length of mapping
-  paddr_t paddr;         ///< physical addr of mapping
-  uint32_t refcount = 0; ///< refcount
+  pladdr_t pladdr;         ///< physical addr of mapping or
+			   //	laddr of a physical lba mapping(see btree_lba_manager.h)
+  extent_ref_count_t refcount = 0; ///< refcount
   uint32_t checksum = 0; ///< checksum of original block written at paddr (TODO)
 
   lba_map_val_t() = default;
   lba_map_val_t(
     extent_len_t len,
-    paddr_t paddr,
-    uint32_t refcount,
+    pladdr_t pladdr,
+    extent_ref_count_t refcount,
     uint32_t checksum)
-    : len(len), paddr(paddr), refcount(refcount), checksum(checksum) {}
+    : len(len), pladdr(pladdr), refcount(refcount), checksum(checksum) {}
   bool operator==(const lba_map_val_t&) const = default;
 };
 
@@ -62,8 +63,8 @@ using lba_node_meta_le_t = fixed_kv_node_meta_le_t<laddr_le_t>;
  * LBA Tree.
  *
  * Layout (4k):
+ *   checksum   :                            4b
  *   size       : uint32_t[1]                4b
- *   (padding)  :                            4b
  *   meta       : lba_node_meta_le_t[3]      (1*24)b
  *   keys       : laddr_t[255]               (254*8)b
  *   values     : paddr_t[255]               (254*8)b
@@ -100,17 +101,17 @@ using LBAInternalNodeRef = LBAInternalNode::Ref;
  * LBA Tree.
  *
  * Layout (4k):
+ *   checksum   :                            4b
  *   size       : uint32_t[1]                4b
- *   (padding)  :                            4b
  *   meta       : lba_node_meta_le_t[3]      (1*24)b
- *   keys       : laddr_t[170]               (145*8)b
- *   values     : lba_map_val_t[170]         (145*20)b
+ *   keys       : laddr_t[170]               (140*8)b
+ *   values     : lba_map_val_t[170]         (140*21)b
  *                                           = 4092
  *
  * TODO: update FixedKVNodeLayout to handle the above calculation
  * TODO: the above alignment probably isn't portable without further work
  */
-constexpr size_t LEAF_NODE_CAPACITY = 145;
+constexpr size_t LEAF_NODE_CAPACITY = 140;
 
 /**
  * lba_map_val_le_t
@@ -119,20 +120,20 @@ constexpr size_t LEAF_NODE_CAPACITY = 145;
  */
 struct lba_map_val_le_t {
   extent_len_le_t len = init_extent_len_le(0);
-  paddr_le_t paddr;
-  ceph_le32 refcount{0};
+  pladdr_le_t pladdr;
+  extent_ref_count_le_t refcount{0};
   ceph_le32 checksum{0};
 
   lba_map_val_le_t() = default;
   lba_map_val_le_t(const lba_map_val_le_t &) = default;
   explicit lba_map_val_le_t(const lba_map_val_t &val)
     : len(init_extent_len_le(val.len)),
-      paddr(paddr_le_t(val.paddr)),
+      pladdr(pladdr_le_t(val.pladdr)),
       refcount(val.refcount),
       checksum(val.checksum) {}
 
   operator lba_map_val_t() const {
-    return lba_map_val_t{ len, paddr, refcount, checksum };
+    return lba_map_val_t{ len, pladdr, refcount, checksum };
   }
 };
 
@@ -170,6 +171,8 @@ struct LBALeafNode
 
     for (auto i : *this) {
       auto child = (LogicalCachedExtent*)this->children[i.get_offset()];
+      // Children may not be marked as stable yet,
+      // the specific order is undefined in the transaction prepare record phase.
       if (is_valid_child_ptr(child) && child->get_laddr() != i.get_key()) {
 	SUBERROR(seastore_fixedkv_tree,
 	  "stable child not valid: child {}, key {}",
@@ -193,9 +196,15 @@ struct LBALeafNode
 	iter.get_offset(),
 	*nextent);
       // child-ptr may already be correct, see LBAManager::update_mappings()
-      this->update_child_ptr(iter, nextent);
+      if (!nextent->has_parent_tracker()) {
+	this->update_child_ptr(iter, nextent);
+      }
+      assert(nextent->has_parent_tracker()
+	&& nextent->get_parent_node<LBALeafNode>().get() == this);
     }
-    val.paddr = this->maybe_generate_relative(val.paddr);
+    if (val.pladdr.is_paddr()) {
+      val.pladdr = maybe_generate_relative(val.pladdr.get_paddr());
+    }
     return this->journal_update(
       iter,
       val,
@@ -214,7 +223,9 @@ struct LBALeafNode
       addr,
       (void*)nextent);
     this->insert_child_ptr(iter, nextent);
-    val.paddr = this->maybe_generate_relative(val.paddr);
+    if (val.pladdr.is_paddr()) {
+      val.pladdr = maybe_generate_relative(val.pladdr.get_paddr());
+    }
     this->journal_insert(
       iter,
       addr,
@@ -245,9 +256,10 @@ struct LBALeafNode
     if (this->is_initial_pending()) {
       for (auto i = from; i != to; ++i) {
 	auto val = i->get_val();
-	if (val.paddr.is_relative()) {
-	  assert(val.paddr.is_block_relative());
-	  val.paddr = this->get_paddr().add_relative(val.paddr);
+	if (val.pladdr.is_paddr()
+	    && val.pladdr.get_paddr().is_relative()) {
+	  assert(val.pladdr.get_paddr().is_block_relative());
+	  val.pladdr = this->get_paddr().add_relative(val.pladdr.get_paddr());
 	  i->set_val(val);
 	}
       }
@@ -260,10 +272,10 @@ struct LBALeafNode
     if (this->is_initial_pending()) {
       for (auto i = from; i != to; ++i) {
 	auto val = i->get_val();
-	if (val.paddr.is_relative()) {
-	  auto val = i->get_val();
-	  assert(val.paddr.is_record_relative());
-	  val.paddr = val.paddr.block_relative_to(this->get_paddr());
+	if (val.pladdr.is_paddr()
+	    && val.pladdr.get_paddr().is_relative()) {
+	  assert(val.pladdr.get_paddr().is_record_relative());
+	  val.pladdr = val.pladdr.get_paddr().block_relative_to(this->get_paddr());
 	  i->set_val(val);
 	}
       }

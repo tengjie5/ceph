@@ -131,6 +131,8 @@
 #include "messages/MClientMetrics.h"
 
 #include "messages/MMDSPeerRequest.h"
+#include "messages/MMDSQuiesceDbListing.h"
+#include "messages/MMDSQuiesceDbAck.h"
 
 #include "messages/MMDSMap.h"
 #include "messages/MFSMap.h"
@@ -831,9 +833,6 @@ Message *decode_message(CephContext *cct,
     break;
 
 
-  case MSG_MDS_DENTRYUNLINK_ACK:
-    m = make_message<MDentryUnlinkAck>();
-    break;
   case MSG_MDS_DENTRYUNLINK:
     m = make_message<MDentryUnlink>();
     break;
@@ -851,6 +850,14 @@ Message *decode_message(CephContext *cct,
 
   case MSG_MDS_TABLE_REQUEST:
     m = make_message<MMDSTableRequest>();
+    break;
+
+  case MSG_MDS_QUIESCE_DB_LISTING:
+    m = make_message<MMDSQuiesceDbListing>();
+    break;
+
+  case MSG_MDS_QUIESCE_DB_ACK:
+    m = make_message<MMDSQuiesceDbAck>();
     break;
 
 	/*  case MSG_MDS_INODEUPDATE:
@@ -1036,6 +1043,15 @@ void Message::decode_trace(ceph::bufferlist::const_iterator &p, bool create)
 #endif
 }
 
+void Message::encode_otel_trace(ceph::bufferlist &bl, uint64_t features) const
+{
+  tracing::encode(otel_trace, bl);
+}
+
+void Message::decode_otel_trace(ceph::bufferlist::const_iterator &p, bool create)
+{
+  tracing::decode(otel_trace, p);
+}
 
 // This routine is not used for ordinary messages, but only when encapsulating a message
 // for forwarding and routing.  It's also used in a backward compatibility test, which only

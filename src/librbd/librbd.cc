@@ -15,6 +15,12 @@
 
 #include <errno.h>
 
+// these strand headers declare static variables that need to be shared between
+// librbd.so and librados.so. referencing them here causes librbd.so to link
+// their symbols as 'global unique'. see https://tracker.ceph.com/issues/63682
+#include <boost/asio/strand.hpp>
+#include <boost/asio/io_context_strand.hpp>
+
 #include "common/deleter.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -45,6 +51,7 @@
 #include "librbd/io/ReadResult.h"
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef WITH_LTTNG
@@ -1601,6 +1608,17 @@ namespace librbd {
   Image::~Image()
   {
     close();
+  }
+
+  Image::Image(Image&& rhs) noexcept : ctx{std::exchange(rhs.ctx, nullptr)}
+  {
+  }
+
+  Image& Image::operator=(Image&& rhs) noexcept
+  {
+    Image tmp(std::move(rhs));
+    std::swap(ctx, tmp.ctx);
+    return *this;
   }
 
   int Image::close()

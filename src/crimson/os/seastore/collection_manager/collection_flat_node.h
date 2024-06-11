@@ -94,11 +94,11 @@ struct CollectionNode
   : LogicalCachedExtent {
   using CollectionNodeRef = TCachedExtentRef<CollectionNode>;
 
-  bool loaded = false;
-
-  template <typename... T>
-  CollectionNode(T&&... t)
-    : LogicalCachedExtent(std::forward<T>(t)...) {}
+  explicit CollectionNode(ceph::bufferptr &&ptr)
+    : LogicalCachedExtent(std::move(ptr)) {}
+  explicit CollectionNode(const CollectionNode &other)
+    : LogicalCachedExtent(other),
+      decoded(other.decoded) {}
 
   static constexpr extent_types_t type = extent_types_t::COLL_BLOCK;
 
@@ -134,13 +134,11 @@ struct CollectionNode
   using update_ret = CollectionManager::update_ret;
   update_ret update(coll_context_t cc, coll_t coll, unsigned bits);
 
-  void read_to_local() {
-    if (loaded) return;
+  void on_clean_read() final {
     bufferlist bl;
     bl.append(get_bptr());
     auto iter = bl.cbegin();
     decode((base_coll_map_t&)decoded, iter);
-    loaded = true;
   }
 
   void copy_to_node() {
@@ -155,10 +153,19 @@ struct CollectionNode
   }
 
   ceph::bufferlist get_delta() final {
-    assert(!delta_buffer.empty());
     ceph::bufferlist bl;
-    encode(delta_buffer, bl);
-    delta_buffer.clear();
+    // FIXME: CollectionNodes are always first mutated and
+    // 	      then checked whether they have enough space,
+    // 	      and if not, new ones will be created and the
+    // 	      mutation_pending ones are left untouched.
+    //
+    // 	      The above order should be reversed, nodes should
+    // 	      be mutated only if there are enough space for new
+    // 	      entries.
+    if (!delta_buffer.empty()) {
+      encode(delta_buffer, bl);
+      delta_buffer.clear();
+    }
     return bl;
   }
 

@@ -65,6 +65,7 @@ D3nDataCache::D3nDataCache()
 
 void D3nDataCache::init(CephContext *_cct) {
   cct = _cct;
+  // coverity[missing_lock:SUPPRESS]
   free_data_cache_size = cct->_conf->rgw_d3n_l1_datacache_size;
   head = nullptr;
   tail = nullptr;
@@ -103,41 +104,52 @@ void D3nDataCache::init(CephContext *_cct) {
   struct aioinit ainit{0};
   ainit.aio_threads = cct->_conf.get_val<int64_t>("rgw_d3n_libaio_aio_threads");
   ainit.aio_num = cct->_conf.get_val<int64_t>("rgw_d3n_libaio_aio_num");
-  ainit.aio_idle_time = 10;
+  ainit.aio_idle_time = 5;
   aio_init(&ainit);
 #endif
 }
 
 int D3nDataCache::d3n_io_write(bufferlist& bl, unsigned int len, std::string oid)
 {
-  D3nChunkDataInfo* chunk_info = new D3nChunkDataInfo;
+  D3nChunkDataInfo* chunk_info{nullptr};
   std::string location = cache_location + url_encode(oid, true);
+  int r = 0;
 
   lsubdout(g_ceph_context, rgw_datacache, 20) << "D3nDataCache: " << __func__ << "(): location=" << location << dendl;
-  FILE *cache_file = nullptr;
-  int r = 0;
-  size_t nbytes = 0;
 
-  cache_file = fopen(location.c_str(), "w+");
-  if (cache_file == nullptr) {
-    ldout(cct, 0) << "ERROR: D3nDataCache::fopen file has return error, errno=" << errno << dendl;
-    return -errno;
+  {
+    size_t nbytes = 0;
+    auto file_closer = [&r](FILE* fd) {
+      if (fd != nullptr) {
+        r = std::fclose(fd);
+      }
+      fd = nullptr;
+    };
+
+    std::unique_ptr<FILE, decltype(file_closer)> cache_file(
+      fopen(location.c_str(), "w+"), file_closer);
+
+    if (cache_file == nullptr) {
+      ldout(cct, 0) << "ERROR: D3nDataCache::fopen file has return error, errno=" << errno << dendl;
+      return -errno;
+    }
+
+    nbytes = fwrite(bl.c_str(), 1, len, cache_file.get());
+    if (nbytes != len) {
+      ldout(cct, 0) << "ERROR: D3nDataCache::io_write: fwrite has returned error: nbytes!=len, nbytes=" << nbytes << ", len=" << len << dendl;
+      return -EIO;
+    }
   }
 
-  nbytes = fwrite(bl.c_str(), 1, len, cache_file);
-  if (nbytes != len) {
-    ldout(cct, 0) << "ERROR: D3nDataCache::io_write: fwrite has returned error: nbytes!=len, nbytes=" << nbytes << ", len=" << len << dendl;
-    return -EIO;
-  }
-
-  r = fclose(cache_file);
+  // Check whether fclose returned an error
   if (r != 0) {
-    ldout(cct, 0) << "ERROR: D3nDataCache::fclsoe file has return error, errno=" << errno << dendl;
+    ldout(cct, 0) << "ERROR: D3nDataCache::fclose file has return error, errno=" << errno << dendl;
     return -errno;
   }
 
-  { // update cahce_map entries for new chunk in cache
+  { // update cache_map entries for new chunk in cache
     const std::lock_guard l(d3n_cache_lock);
+    chunk_info = new D3nChunkDataInfo;
     chunk_info->oid = oid;
     chunk_info->set_ctx(cct);
     chunk_info->size = len;
@@ -282,7 +294,7 @@ bool D3nDataCache::get(const string& oid, const off_t len)
     struct D3nChunkDataInfo* chdo = iter->second;
     struct stat st;
     int r = stat(location.c_str(), &st);
-    if ( r != -1 && st.st_size == len) { // file exists and containes required data range length
+    if ( r != -1 && st.st_size == len) { // file exists and contains required data range length
       exist = true;
       /*LRU*/
       /*get D3nChunkDataInfo*/

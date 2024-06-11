@@ -33,13 +33,13 @@
 
 using namespace std;
 
-ostream& CDentry::print_db_line_prefix(ostream& out)
+ostream& CDentry::print_db_line_prefix(ostream& out) const
 {
   return out << ceph_clock_now() << " mds." << dir->mdcache->mds->get_nodeid() << ".cache.den(" << dir->ino() << " " << name << ") ";
 }
 
-LockType CDentry::lock_type(CEPH_LOCK_DN);
-LockType CDentry::versionlock_type(CEPH_LOCK_DVERSION);
+const LockType CDentry::lock_type(CEPH_LOCK_DN);
+const LockType CDentry::versionlock_type(CEPH_LOCK_DVERSION);
 
 
 // CDentry
@@ -108,8 +108,6 @@ ostream& operator<<(ostream& out, const CDentry& dn)
   out << " state=" << dn.get_state();
   if (dn.is_new()) out << "|new";
   if (dn.state_test(CDentry::STATE_BOTTOMLRU)) out << "|bottomlru";
-  if (dn.state_test(CDentry::STATE_UNLINKING)) out << "|unlinking";
-  if (dn.state_test(CDentry::STATE_REINTEGRATING)) out << "|reintegrating";
 
   if (dn.get_num_ref()) {
     out << " |";
@@ -137,7 +135,7 @@ bool operator<(const CDentry& l, const CDentry& r)
 }
 
 
-void CDentry::print(ostream& out)
+void CDentry::print(ostream& out) const
 {
   out << *this;
 }
@@ -704,7 +702,7 @@ bool CDentry::check_corruption(bool load)
 {
   auto&& snapclient = dir->mdcache->mds->snapclient;
   auto next_snap = snapclient->get_last_seq()+1;
-  if (first > last || (snapclient->is_server_ready() && first > next_snap)) {
+  if (first > last || (snapclient->is_synced() && first > next_snap)) {
     if (load) {
       dout(1) << "loaded already corrupt dentry: " << *this << dendl;
       corrupt_first_loaded = true;
@@ -716,7 +714,7 @@ bool CDentry::check_corruption(bool load)
     }
     if (!load && g_conf().get_val<bool>("mds_abort_on_newly_corrupt_dentry")) {
       dir->mdcache->mds->clog->error() << "MDS abort because newly corrupt dentry to be committed: " << *this;
-      ceph_abort("detected newly corrupt dentry"); /* avoid writing out newly corrupted dn */
+      dir->mdcache->mds->abort("detected newly corrupt dentry"); /* avoid writing out newly corrupted dn */
     }
     return true;
   }

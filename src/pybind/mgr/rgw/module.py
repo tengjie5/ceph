@@ -28,7 +28,7 @@ if TYPE_CHECKING:
         from typing_extensions import Protocol
 
     class MgrModuleProtocol(Protocol):
-        def tool_exec(self, args: List[str]) -> Tuple[int, str, str]:
+        def tool_exec(self, args: List[str], timeout: int = 10, stdin: Optional[bytes] = None) -> Tuple[int, str, str]:
             ...
 
         def apply_rgw(self, spec: RGWSpec) -> OrchResult[str]:
@@ -66,9 +66,9 @@ class RGWAMOrchMgr(RGWAMEnvMgr):
     def __init__(self, mgr: MgrModuleProtocol):
         self.mgr = mgr
 
-    def tool_exec(self, prog: str, args: List[str]) -> Tuple[List[str], int, str, str]:
+    def tool_exec(self, prog: str, args: List[str], stdin: Optional[bytes] = None) -> Tuple[List[str], int, str, str]:
         cmd = [prog] + args
-        rc, stdout, stderr = self.mgr.tool_exec(args=cmd)
+        rc, stdout, stderr = self.mgr.tool_exec(args=cmd, stdin=stdin)
         return cmd, rc, stdout, stderr
 
     def apply_rgw(self, spec: RGWSpec) -> None:
@@ -286,6 +286,18 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             self.log.error('cmd run exception: (%d) %s' % (e.retcode, e.message))
             return HandleCommandResult(retval=e.retcode, stdout=e.stdout, stderr=e.stderr)
 
+    @CLICommand('rgw zonegroup modify', perm='rw')
+    def update_zonegroup_info(self, realm_name: str, zonegroup_name: str, zone_name: str, hostnames: List[str]) -> HandleCommandResult:
+        try:
+            retval, out, err = RGWAM(self.env).zonegroup_modify(realm_name,
+                                                                zonegroup_name,
+                                                                zone_name,
+                                                                hostnames)
+            return HandleCommandResult(retval, 'Zonegroup updated successfully', '')
+        except RGWAMException as e:
+            self.log.error('cmd run exception: (%d) %s' % (e.retcode, e.message))
+            return HandleCommandResult(retval=e.retcode, stdout=e.stdout, stderr=e.stderr)
+
     @CLICommand('rgw zone create', perm='rw')
     @check_orchestrator
     def _cmd_rgw_zone_create(self,
@@ -307,10 +319,11 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                         zone_name: Optional[str] = None,
                         realm_token: Optional[str] = None,
                         port: Optional[int] = None,
-                        placement: Optional[str] = None,
+                        placement: Optional[Union[str, Dict[str, Any]]] = None,
                         start_radosgw: Optional[bool] = True,
                         zone_endpoints: Optional[str] = None,
                         inbuf: Optional[str] = None) -> Any:
+
         if inbuf:
             try:
                 rgw_specs = self._parse_rgw_specs(inbuf)
@@ -318,7 +331,10 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                 return HandleCommandResult(retval=-errno.EINVAL, stderr=f'{e}')
         elif (zone_name and realm_token):
             token = RealmToken.from_base64_str(realm_token)
-            placement_spec = PlacementSpec.from_string(placement) if placement else None
+            if isinstance(placement, dict):
+                placement_spec = PlacementSpec.from_json(placement) if placement else None
+            elif isinstance(placement, str):
+                placement_spec = PlacementSpec.from_string(placement) if placement else None
             rgw_specs = [RGWSpec(rgw_realm=token.realm_name,
                                  rgw_zone=zone_name,
                                  rgw_realm_token=realm_token,
@@ -371,8 +387,9 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                            zone_name: Optional[str] = None,
                            realm_token: Optional[str] = None,
                            port: Optional[int] = None,
-                           placement: Optional[str] = None,
+                           placement: Optional[dict] = None,
                            start_radosgw: Optional[bool] = True,
                            zone_endpoints: Optional[str] = None) -> None:
-        self.rgw_zone_create(zone_name, realm_token, port, placement, start_radosgw,
+        placement_spec = placement.get('placement') if placement else None
+        self.rgw_zone_create(zone_name, realm_token, port, placement_spec, start_radosgw,
                              zone_endpoints)

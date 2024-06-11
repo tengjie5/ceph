@@ -38,7 +38,9 @@ from ceph.deployment.service_spec import (
     IscsiServiceSpec,
     MDSSpec,
     NFSServiceSpec,
+    NvmeofServiceSpec,
     RGWSpec,
+    SMBSpec,
     SNMPGatewaySpec,
     ServiceSpec,
     TunedProfileSpec,
@@ -358,7 +360,83 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def remove_host(self, host: str, force: bool, offline: bool) -> OrchResult[str]:
+    def hardware_light(self, light_type: str, action: str, hostname: str, device: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Light a chassis or device ident LED.
+
+        :param light_type: led type (chassis or device).
+        :param action: set or get status led.
+        :param hostname: the name of the host.
+        :param device: the device id (when light_type = 'device')
+        """
+        raise NotImplementedError()
+
+    def hardware_powercycle(self, hostname: str, yes_i_really_mean_it: bool = False) -> OrchResult[str]:
+        """
+        Reboot a host.
+
+        :param hostname: the name of the host being rebooted.
+        """
+        raise NotImplementedError()
+
+    def hardware_shutdown(self, hostname: str, force: Optional[bool] = False, yes_i_really_mean_it: bool = False) -> OrchResult[str]:
+        """
+        Shutdown a host.
+
+        :param hostname: the name of the host to shutdown.
+        """
+        raise NotImplementedError()
+
+    def hardware_status(self, hostname: Optional[str] = None, category: Optional[str] = 'summary') -> OrchResult[str]:
+        """
+        Display hardware status.
+
+        :param category: category
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_summary(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy summary
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_fullreport(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy full report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_firmwares(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy firmwares report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_criticals(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy criticals report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_common(self, category: str, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy generic report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def remove_host(self, host: str, force: bool, offline: bool, rm_crush_entry: bool) -> OrchResult[str]:
         """
         Remove a host from the orchestrator inventory.
 
@@ -366,7 +444,7 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def drain_host(self, hostname: str, force: bool = False) -> OrchResult[str]:
+    def drain_host(self, hostname: str, force: bool = False, keep_conf_keyring: bool = False, zap_osd_devices: bool = False) -> OrchResult[str]:
         """
         drain all daemons from a host
 
@@ -489,6 +567,7 @@ class Orchestrator(object):
             'crash': self.apply_crash,
             'grafana': self.apply_grafana,
             'iscsi': self.apply_iscsi,
+            'nvmeof': self.apply_nvmeof,
             'mds': self.apply_mds,
             'mgr': self.apply_mgr,
             'mon': self.apply_mon,
@@ -504,6 +583,7 @@ class Orchestrator(object):
             'ingress': self.apply_ingress,
             'snmp-gateway': self.apply_snmp_gateway,
             'host': self.add_host,
+            'smb': self.apply_smb,
         }
 
         def merge(l: OrchResult[List[str]], r: OrchResult[str]) -> OrchResult[List[str]]:  # noqa: E741
@@ -677,12 +757,36 @@ class Orchestrator(object):
         """Update iscsi cluster"""
         raise NotImplementedError()
 
+    def apply_nvmeof(self, spec: NvmeofServiceSpec) -> OrchResult[str]:
+        """Update nvmeof cluster"""
+        raise NotImplementedError()
+
     def apply_prometheus(self, spec: ServiceSpec) -> OrchResult[str]:
         """Update prometheus cluster"""
         raise NotImplementedError()
 
     def get_prometheus_access_info(self) -> OrchResult[Dict[str, str]]:
         """get prometheus access information"""
+        raise NotImplementedError()
+
+    def set_alertmanager_access_info(self, user: str, password: str) -> OrchResult[str]:
+        """set alertmanager access information"""
+        raise NotImplementedError()
+
+    def set_prometheus_access_info(self, user: str, password: str) -> OrchResult[str]:
+        """set prometheus access information"""
+        raise NotImplementedError()
+
+    def set_custom_prometheus_alerts(self, alerts_file: str) -> OrchResult[str]:
+        """set prometheus custom alerts files and schedule reconfig of prometheus"""
+        raise NotImplementedError()
+
+    def set_prometheus_target(self, url: str) -> OrchResult[str]:
+        """set prometheus target for multi-cluster"""
+        raise NotImplementedError()
+
+    def remove_prometheus_target(self, url: str) -> OrchResult[str]:
+        """remove prometheus target for multi-cluster"""
         raise NotImplementedError()
 
     def get_alertmanager_access_info(self) -> OrchResult[Dict[str, str]]:
@@ -719,6 +823,10 @@ class Orchestrator(object):
 
     def apply_snmp_gateway(self, spec: SNMPGatewaySpec) -> OrchResult[str]:
         """Update an existing snmp gateway service"""
+        raise NotImplementedError()
+
+    def apply_smb(self, spec: SMBSpec) -> OrchResult[str]:
+        """Update a smb gateway service"""
         raise NotImplementedError()
 
     def apply_tuned_profiles(self, specs: List[TunedProfileSpec], no_overwrite: bool) -> OrchResult[str]:
@@ -799,6 +907,7 @@ def daemon_type_to_service(dtype: str) -> str:
         'haproxy': 'ingress',
         'keepalived': 'ingress',
         'iscsi': 'iscsi',
+        'nvmeof': 'nvmeof',
         'rbd-mirror': 'rbd-mirror',
         'cephfs-mirror': 'cephfs-mirror',
         'nfs': 'nfs',
@@ -813,11 +922,13 @@ def daemon_type_to_service(dtype: str) -> str:
         'crashcollector': 'crash',  # Specific Rook Daemon
         'container': 'container',
         'agent': 'agent',
+        'node-proxy': 'node-proxy',
         'snmp-gateway': 'snmp-gateway',
         'elasticsearch': 'elasticsearch',
         'jaeger-agent': 'jaeger-agent',
         'jaeger-collector': 'jaeger-collector',
-        'jaeger-query': 'jaeger-query'
+        'jaeger-query': 'jaeger-query',
+        'smb': 'smb',
     }
     return mapping[dtype]
 
@@ -831,6 +942,7 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'osd': ['osd'],
         'ingress': ['haproxy', 'keepalived'],
         'iscsi': ['iscsi'],
+        'nvmeof': ['nvmeof'],
         'rbd-mirror': ['rbd-mirror'],
         'cephfs-mirror': ['cephfs-mirror'],
         'nfs': ['nfs'],
@@ -844,12 +956,14 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'crash': ['crash'],
         'container': ['container'],
         'agent': ['agent'],
+        'node-proxy': ['node-proxy'],
         'snmp-gateway': ['snmp-gateway'],
         'elasticsearch': ['elasticsearch'],
         'jaeger-agent': ['jaeger-agent'],
         'jaeger-collector': ['jaeger-collector'],
         'jaeger-query': ['jaeger-query'],
-        'jaeger-tracing': ['elasticsearch', 'jaeger-query', 'jaeger-collector', 'jaeger-agent']
+        'jaeger-tracing': ['elasticsearch', 'jaeger-query', 'jaeger-collector', 'jaeger-agent'],
+        'smb': ['smb'],
     }
     return mapping[stype]
 
@@ -1261,7 +1375,7 @@ class DaemonDescription(object):
         return DaemonDescription.from_json(self.to_json())
 
     @staticmethod
-    def yaml_representer(dumper: 'yaml.SafeDumper', data: 'DaemonDescription') -> Any:
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'DaemonDescription') -> yaml.Node:
         return dumper.represent_dict(cast(Mapping, data.to_json().items()))
 
 
@@ -1394,7 +1508,7 @@ class ServiceDescription(object):
         return cls(spec=spec, events=events, **c_status)
 
     @staticmethod
-    def yaml_representer(dumper: 'yaml.SafeDumper', data: 'ServiceDescription') -> Any:
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'ServiceDescription') -> yaml.Node:
         return dumper.represent_dict(cast(Mapping, data.to_json().items()))
 
 

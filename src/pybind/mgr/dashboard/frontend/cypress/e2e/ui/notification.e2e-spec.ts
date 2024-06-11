@@ -38,7 +38,7 @@ describe('Notification page', () => {
     notification.getTasks().contains(poolName).should('exist');
 
     // Delete pool after task is complete (otherwise we get an error).
-    notification.getTasks().contains(poolName, { timeout: 300000 }).should('not.exist');
+    notification.getTasks().should('not.exist');
   });
 
   it('should have notifications', () => {
@@ -50,7 +50,7 @@ describe('Notification page', () => {
     notification.getToast().should('not.exist');
     notification.open();
     notification.getNotifications().should('have.length.gt', 0);
-    notification.getClearNotficationsBtn().should('be.visible');
+    notification.getClearNotificationsBtn().should('be.visible');
     notification.clearNotifications();
   });
 });

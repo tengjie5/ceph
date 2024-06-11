@@ -290,6 +290,9 @@ struct ceph_mon_subscribe_ack {
 #define CEPH_MDSMAP_ALLOW_STANDBY_REPLAY         (1<<5)  /* cluster alllowed to enable MULTIMDS */
 #define CEPH_MDSMAP_REFUSE_CLIENT_SESSION        (1<<6)  /* cluster allowed to refuse client session
                                                             request */
+#define CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS (1<<7) /* fs is forbidden to use standby
+                                                            for another fs */
+#define CEPH_MDSMAP_BALANCE_AUTOMATE             (1<<8)  /* automate metadata balancing */
 #define CEPH_MDSMAP_DEFAULTS (CEPH_MDSMAP_ALLOW_SNAPS | \
 			      CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS)
 
@@ -330,18 +333,24 @@ extern const char *ceph_mds_state_name(int s);
  */
 #define CEPH_LOCK_DN          (1 << 0)
 #define CEPH_LOCK_DVERSION    (1 << 1)
-#define CEPH_LOCK_ISNAP       (1 << 4)  /* snapshot lock. MDS internal */
-#define CEPH_LOCK_IPOLICY     (1 << 5)  /* policy lock on dirs. MDS internal */
-#define CEPH_LOCK_IFILE       (1 << 6)
-#define CEPH_LOCK_INEST       (1 << 7)  /* mds internal */
-#define CEPH_LOCK_IDFT        (1 << 8)  /* dir frag tree */
-#define CEPH_LOCK_IAUTH       (1 << 9)
-#define CEPH_LOCK_ILINK       (1 << 10)
-#define CEPH_LOCK_IXATTR      (1 << 11)
-#define CEPH_LOCK_IFLOCK      (1 << 12)  /* advisory file locks */
-#define CEPH_LOCK_IVERSION    (1 << 13)  /* mds internal */
+#define CEPH_LOCK_IQUIESCE    (1 << 4)  /* mds internal */
+#define CEPH_LOCK_ISNAP       (1 << 5)  /* snapshot lock. MDS internal */
+#define CEPH_LOCK_IPOLICY     (1 << 6)  /* policy lock on dirs. MDS internal */
+#define CEPH_LOCK_IFILE       (1 << 7)
+#define CEPH_LOCK_INEST       (1 << 8)  /* mds internal */
+#define CEPH_LOCK_IDFT        (1 << 9)  /* dir frag tree */
+#define CEPH_LOCK_IAUTH       (1 << 10)
+#define CEPH_LOCK_ILINK       (1 << 11)
+#define CEPH_LOCK_IXATTR      (1 << 12)
+#define CEPH_LOCK_IFLOCK      (1 << 13)  /* advisory file locks */
+#define CEPH_LOCK_IVERSION    (1 << 14)  /* mds internal */
 
-#define CEPH_LOCK_IFIRST      CEPH_LOCK_ISNAP
+#define CEPH_LOCK_IFIRST      CEPH_LOCK_IQUIESCE
+#define CEPH_LOCK_ILAST       CEPH_LOCK_IVERSION
+
+static inline bool is_inode_lock(int l) {
+  return (CEPH_LOCK_IFIRST <= l && l <= CEPH_LOCK_ILAST);
+}
 
 
 /* client_session ops */
@@ -427,8 +436,16 @@ enum {
 	CEPH_MDS_OP_ENQUEUE_SCRUB  = 0x01503,
 	CEPH_MDS_OP_REPAIR_FRAGSTATS = 0x01504,
 	CEPH_MDS_OP_REPAIR_INODESTATS = 0x01505,
-	CEPH_MDS_OP_RDLOCK_FRAGSSTATS = 0x01507
+	CEPH_MDS_OP_RDLOCK_FRAGSSTATS = 0x01507,
+	CEPH_MDS_OP_QUIESCE_PATH = 0x01508,
+	CEPH_MDS_OP_QUIESCE_INODE = 0x01509,
+	CEPH_MDS_OP_LOCK_PATH = 0x0150a,
 };
+
+#define IS_CEPH_MDS_OP_NEWINODE(op) (op == CEPH_MDS_OP_CREATE     || \
+				     op == CEPH_MDS_OP_MKNOD      || \
+				     op == CEPH_MDS_OP_MKDIR      || \
+				     op == CEPH_MDS_OP_SYMLINK)
 
 extern const char *ceph_mds_op_name(int op);
 
@@ -633,7 +650,7 @@ union ceph_mds_request_args {
 	} __attribute__ ((packed)) snapdiff;
 } __attribute__ ((packed));
 
-#define CEPH_MDS_REQUEST_HEAD_VERSION	2
+#define CEPH_MDS_REQUEST_HEAD_VERSION	3
 
 /*
  * Note that any change to this structure must ensure that it is compatible
@@ -654,9 +671,12 @@ struct ceph_mds_request_head {
 
 	__le32 ext_num_retry;          /* new count retry attempts */
 	__le32 ext_num_fwd;            /* new count fwd attempts */
+
+	__le32 struct_len;             /* to store size of struct ceph_mds_request_head */
+	__le32 owner_uid, owner_gid;   /* used for OPs which create inodes */
 } __attribute__ ((packed));
 
-void inline encode(const struct ceph_mds_request_head& h, ceph::buffer::list& bl, bool old_version) {
+void inline encode(const struct ceph_mds_request_head& h, ceph::buffer::list& bl) {
   using ceph::encode;
   encode(h.version, bl);
   encode(h.oldest_client_tid, bl);
@@ -676,14 +696,30 @@ void inline encode(const struct ceph_mds_request_head& h, ceph::buffer::list& bl
   encode(h.ino, bl);
   bl.append((char*)&h.args, sizeof(h.args));
 
-  if (!old_version) {
+  if (h.version >= 2) {
     encode(h.ext_num_retry, bl);
     encode(h.ext_num_fwd, bl);
+  }
+
+  if (h.version >= 3) {
+    __u32 struct_len = sizeof(struct ceph_mds_request_head);
+    encode(struct_len, bl);
+    encode(h.owner_uid, bl);
+    encode(h.owner_gid, bl);
+
+    /*
+     * Please, add new fields handling here.
+     * You don't need to check h.version as we do it
+     * in decode(), because decode can properly skip
+     * all unsupported fields if h.version >= 3.
+     */
   }
 }
 
 void inline decode(struct ceph_mds_request_head& h, ceph::buffer::list::const_iterator& bl) {
   using ceph::decode;
+  unsigned struct_end = bl.get_off();
+
   decode(h.version, bl);
   decode(h.oldest_client_tid, bl);
   decode(h.mdsmap_epoch, bl);
@@ -703,6 +739,42 @@ void inline decode(struct ceph_mds_request_head& h, ceph::buffer::list::const_it
   } else {
     h.ext_num_retry = h.num_retry;
     h.ext_num_fwd = h.num_fwd;
+  }
+
+  if (h.version >= 3) {
+    decode(h.struct_len, bl);
+    struct_end += h.struct_len;
+
+    decode(h.owner_uid, bl);
+    decode(h.owner_gid, bl);
+  } else {
+    /*
+     * client is old: let's take caller_{u,g}id as owner_{u,g}id
+     * this is how it worked before adding of owner_{u,g}id fields.
+     */
+    h.owner_uid = h.caller_uid;
+    h.owner_gid = h.caller_gid;
+  }
+
+  /* add new fields handling here */
+
+  /*
+   * From version 3 we have struct_len field.
+   * It allows us to properly handle a case
+   * when client send struct ceph_mds_request_head
+   * bigger in size than MDS supports. In this
+   * case we just want to skip all remaining bytes
+   * at the end.
+   *
+   * See also DECODE_FINISH macro. Unfortunately,
+   * we can't start using it right now as it will be
+   * an incompatible protocol change.
+   */
+  if (h.version >= 3) {
+    if (bl.get_off() > struct_end)
+      throw ::ceph::buffer::malformed_input(DECODE_ERR_PAST(__PRETTY_FUNCTION__));
+    if (bl.get_off() < struct_end)
+      bl += struct_end - bl.get_off();
   }
 }
 

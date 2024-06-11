@@ -18,12 +18,11 @@ import { SummaryService } from '~/app/shared/services/summary.service';
 import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed } from '~/testing/unit-test-helper';
 import { PgCategoryService } from '../../shared/pg-category.service';
-import { CardRowComponent } from '../card-row/card-row.component';
-import { CardComponent } from '../card/card.component';
 import { DashboardPieComponent } from '../dashboard-pie/dashboard-pie.component';
 import { PgSummaryPipe } from '../pg-summary.pipe';
 import { DashboardV3Component } from './dashboard-v3.component';
 import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
+import { AlertClass } from '~/app/shared/enum/health-icon.enum';
 
 export class SummaryServiceMock {
   summaryDataSource = new BehaviorSubject({
@@ -138,23 +137,11 @@ describe('Dashbord Component', () => {
 
   configureTestBed({
     imports: [RouterTestingModule, HttpClientTestingModule, ToastrModule.forRoot(), SharedModule],
-    declarations: [
-      DashboardV3Component,
-      CardComponent,
-      DashboardPieComponent,
-      CardRowComponent,
-      PgSummaryPipe
-    ],
+    declarations: [DashboardV3Component, DashboardPieComponent, PgSummaryPipe],
     schemas: [NO_ERRORS_SCHEMA],
     providers: [
       { provide: SummaryService, useClass: SummaryServiceMock },
-      {
-        provide: PrometheusAlertService,
-        useValue: {
-          activeCriticalAlerts: 2,
-          activeWarningAlerts: 1
-        }
-      },
+      PrometheusAlertService,
       CssHelper,
       PgCategoryService
     ]
@@ -176,9 +163,14 @@ describe('Dashbord Component', () => {
     orchestratorService = TestBed.inject(OrchestratorService);
     getHealthSpy = spyOn(TestBed.inject(HealthService), 'getMinimalHealth');
     getHealthSpy.and.returnValue(of(healthPayload));
-    spyOn(TestBed.inject(PrometheusService), 'ifAlertmanagerConfigured').and.callFake((fn) => fn());
     getAlertsSpy = spyOn(TestBed.inject(PrometheusService), 'getAlerts');
     getAlertsSpy.and.returnValue(of(alertsPayload));
+    component.prometheusAlertService.alerts = alertsPayload;
+    component.isAlertmanagerConfigured = true;
+    let prometheusAlertService = TestBed.inject(PrometheusAlertService);
+    spyOn(prometheusAlertService, 'getAlerts').and.callFake(() => of([]));
+    prometheusAlertService.activeCriticalAlerts = 2;
+    prometheusAlertService.activeWarningAlerts = 1;
   });
 
   it('should create', () => {
@@ -248,7 +240,7 @@ describe('Dashbord Component', () => {
 
   it('should show the critical alerts window and its content', () => {
     const payload = _.cloneDeep(alertsPayload[0]);
-    component.toggleAlertsWindow('danger');
+    component.toggleAlertsWindow(AlertClass[0]);
     fixture.detectChanges();
 
     const cardTitle = fixture.debugElement.query(By.css('.tc_alerts h6.card-title'));
@@ -259,7 +251,7 @@ describe('Dashbord Component', () => {
 
   it('should show the warning alerts window and its content', () => {
     const payload = _.cloneDeep(alertsPayload[2]);
-    component.toggleAlertsWindow('warning');
+    component.toggleAlertsWindow(AlertClass.warning);
     fixture.detectChanges();
 
     const cardTitle = fixture.debugElement.query(By.css('.tc_alerts h6.card-title'));
@@ -269,8 +261,7 @@ describe('Dashbord Component', () => {
   });
 
   it('should only show the pills when the alerts are not empty', () => {
-    spyOn(TestBed.inject(PrometheusAlertService), 'activeCriticalAlerts').and.returnValue(0);
-    spyOn(TestBed.inject(PrometheusAlertService), 'activeWarningAlerts').and.returnValue(0);
+    spyOn(TestBed.inject(PrometheusAlertService), 'alerts').and.returnValue(0);
     fixture.detectChanges();
 
     const warningAlerts = fixture.debugElement.query(By.css('button[id=warningAlerts]'));

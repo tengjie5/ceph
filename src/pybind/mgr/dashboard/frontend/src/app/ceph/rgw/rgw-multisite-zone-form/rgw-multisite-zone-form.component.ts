@@ -1,5 +1,5 @@
 import { Component, OnInit } from '@angular/core';
-import { FormControl, Validators } from '@angular/forms';
+import { UntypedFormControl, Validators } from '@angular/forms';
 import { NgbActiveModal, NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
 import { RgwMultisiteService } from '~/app/shared/api/rgw-multisite.service';
@@ -74,7 +74,7 @@ export class RgwMultisiteZoneFormComponent implements OnInit {
 
   createForm() {
     this.multisiteZoneForm = new CdFormGroup({
-      zoneName: new FormControl(null, {
+      zoneName: new UntypedFormControl(null, {
         validators: [
           Validators.required,
           CdValidators.custom('uniqueName', (zoneName: string) => {
@@ -84,10 +84,10 @@ export class RgwMultisiteZoneFormComponent implements OnInit {
           })
         ]
       }),
-      default_zone: new FormControl(false),
-      master_zone: new FormControl(false),
-      selectedZonegroup: new FormControl(null),
-      zone_endpoints: new FormControl(null, {
+      default_zone: new UntypedFormControl(false),
+      master_zone: new UntypedFormControl(false),
+      selectedZonegroup: new UntypedFormControl(null),
+      zone_endpoints: new UntypedFormControl(null, {
         validators: [
           CdValidators.custom('endpoint', (value: string) => {
             if (_.isEmpty(value)) {
@@ -112,15 +112,15 @@ export class RgwMultisiteZoneFormComponent implements OnInit {
           Validators.required
         ]
       }),
-      access_key: new FormControl(null),
-      secret_key: new FormControl(null),
-      placementTarget: new FormControl(null),
-      placementDataPool: new FormControl(''),
-      placementIndexPool: new FormControl(null),
-      placementDataExtraPool: new FormControl(null),
-      storageClass: new FormControl(null),
-      storageDataPool: new FormControl(null),
-      storageCompression: new FormControl(null)
+      access_key: new UntypedFormControl('', {}),
+      secret_key: new UntypedFormControl('', {}),
+      placementTarget: new UntypedFormControl(null),
+      placementDataPool: new UntypedFormControl(''),
+      placementIndexPool: new UntypedFormControl(null),
+      placementDataExtraPool: new UntypedFormControl(null),
+      storageClass: new UntypedFormControl(null),
+      storageDataPool: new UntypedFormControl(null),
+      storageCompression: new UntypedFormControl(null)
     });
   }
 
@@ -324,15 +324,5 @@ export class RgwMultisiteZoneFormComponent implements OnInit {
           }
         );
     }
-  }
-
-  checkUrlArray(endpoints: string) {
-    let endpointsArray = [];
-    if (endpoints.includes(',')) {
-      endpointsArray = endpoints.split(',');
-    } else {
-      endpointsArray.push(endpoints);
-    }
-    return endpointsArray;
   }
 }

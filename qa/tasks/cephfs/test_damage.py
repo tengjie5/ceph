@@ -51,7 +51,7 @@ class TestDamage(CephFSTestCase):
         # to avoid waiting through reconnect on every MDS start.
         self.mount_a.umount_wait()
         for mds_name in self.fs.get_active_names():
-            self.fs.mds_asok(["flush", "journal"], mds_name)
+            self.fs.mds_asok(["flush", "journal"], mds_id=mds_name)
 
         self.fs.fail()
 
@@ -387,7 +387,7 @@ class TestDamage(CephFSTestCase):
 
         self.mount_a.umount_wait()
         for mds_name in self.fs.get_active_names():
-            self.fs.mds_asok(["flush", "journal"], mds_name)
+            self.fs.mds_asok(["flush", "journal"], mds_id=mds_name)
 
         self.fs.fail()
 
@@ -498,7 +498,7 @@ class TestDamage(CephFSTestCase):
 
         # Drop everything from the MDS cache
         self.fs.fail()
-        self.fs.journal_tool(['journal', 'reset'], 0)
+        self.fs.journal_tool(['journal', 'reset', '--yes-i-really-really-mean-it'], 0)
         self.fs.set_joinable()
         self.fs.wait_for_daemons()
 
@@ -609,8 +609,9 @@ class TestDamage(CephFSTestCase):
         self.fs.flush()
         self.config_set("mds", "mds_inject_rename_corrupt_dentry_first", "1.0")
         time.sleep(5) # for conf to percolate
-        p = self.mount_a.run_shell_payload("timeout 60 mv a/b a/z", wait=False)
-        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(), timeout=self.fs.beacon_timeout)
+        with self.assert_cluster_log("MDS abort because newly corrupt dentry"):
+            p = self.mount_a.run_shell_payload("timeout 60 mv a/b a/z", wait=False)
+            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(), timeout=self.fs.beacon_timeout)
         self.config_rm("mds", "mds_inject_rename_corrupt_dentry_first")
         self.fs.rank_freeze(False, rank=0)
         self.delete_mds_coredump(rank0['name'])
@@ -643,9 +644,10 @@ class TestDamage(CephFSTestCase):
         rank0 = self.fs.get_rank()
         self.fs.rank_freeze(True, rank=0)
         # so now we want to trigger commit but this will crash, so:
-        c = ['--connect-timeout=60', 'tell', f"mds.{fscid}:0", "flush", "journal"]
-        p = self.run_ceph_cmd(args=c, wait=False, timeoutcmd=30)
-        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(), timeout=self.fs.beacon_timeout)
+        with self.assert_cluster_log("MDS abort because newly corrupt dentry"):
+            c = ['--connect-timeout=60', 'tell', f"mds.{fscid}:0", "flush", "journal"]
+            p = self.run_ceph_cmd(args=c, wait=False, timeoutcmd=30)
+            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(), timeout=self.fs.beacon_timeout)
         self.config_rm("mds", "mds_inject_journal_corrupt_dentry_first")
         self.fs.rank_freeze(False, rank=0)
         self.delete_mds_coredump(rank0['name'])
