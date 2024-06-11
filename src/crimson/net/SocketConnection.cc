@@ -49,13 +49,24 @@ bool SocketConnection::is_connected() const
 }
 
 #ifdef UNIT_TESTS_BUILT
-bool SocketConnection::is_closed() const
+bool SocketConnection::is_protocol_ready() const
+{
+  assert(seastar::this_shard_id() == msgr_sid);
+  return protocol->is_ready();
+}
+
+bool SocketConnection::is_protocol_standby() const {
+  assert(seastar::this_shard_id() == msgr_sid);
+  return protocol->is_standby();
+}
+
+bool SocketConnection::is_protocol_closed() const
 {
   assert(seastar::this_shard_id() == msgr_sid);
   return protocol->is_closed();
 }
 
-bool SocketConnection::is_closed_clean() const
+bool SocketConnection::is_protocol_closed_clean() const
 {
   assert(seastar::this_shard_id() == msgr_sid);
   return protocol->is_closed_clean();
@@ -68,16 +79,13 @@ bool SocketConnection::peer_wins() const
   return (messenger.get_myaddr() > peer_addr || policy.server);
 }
 
-seastar::future<> SocketConnection::send(MessageURef _msg)
+seastar::future<> SocketConnection::send(MessageURef msg)
 {
-  // may be invoked from any core
-  MessageFRef msg = seastar::make_foreign(std::move(_msg));
   return io_handler->send(std::move(msg));
 }
 
 seastar::future<> SocketConnection::send_keepalive()
 {
-  // may be invoked from any core
   return io_handler->send_keepalive();
 }
 

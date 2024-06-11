@@ -14,6 +14,7 @@ import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
 import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { ToastrModule } from 'ngx-toastr';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { RouterTestingModule } from '@angular/router/testing';
 
 export class SummaryServiceMock {
   summaryDataSource = new BehaviorSubject({
@@ -33,6 +34,7 @@ describe('UpgradeComponent', () => {
   let fixture: ComponentFixture<UpgradeComponent>;
   let upgradeInfoSpy: jasmine.Spy;
   let getHealthSpy: jasmine.Spy;
+  let upgradeStatusSpy: jasmine.Spy;
 
   const healthPayload: Record<string, any> = {
     health: { status: 'HEALTH_OK' },
@@ -51,7 +53,13 @@ describe('UpgradeComponent', () => {
   };
 
   configureTestBed({
-    imports: [HttpClientTestingModule, SharedModule, NgbNavModule, ToastrModule.forRoot()],
+    imports: [
+      HttpClientTestingModule,
+      SharedModule,
+      NgbNavModule,
+      ToastrModule.forRoot(),
+      RouterTestingModule
+    ],
     declarations: [UpgradeComponent, LogsComponent],
     schemas: [NO_ERRORS_SCHEMA],
     providers: [UpgradeService, { provide: SummaryService, useClass: SummaryServiceMock }]
@@ -60,8 +68,11 @@ describe('UpgradeComponent', () => {
   beforeEach(() => {
     fixture = TestBed.createComponent(UpgradeComponent);
     component = fixture.componentInstance;
-    upgradeInfoSpy = spyOn(TestBed.inject(UpgradeService), 'list').and.callFake(() => of(null));
+    upgradeInfoSpy = spyOn(TestBed.inject(UpgradeService), 'listCached').and.callFake(() =>
+      of(null)
+    );
     getHealthSpy = spyOn(TestBed.inject(HealthService), 'getMinimalHealth');
+    upgradeStatusSpy = spyOn(TestBed.inject(UpgradeService), 'status');
     getHealthSpy.and.returnValue(of(healthPayload));
     const upgradeInfoPayload = {
       image: 'quay.io/ceph-test/ceph',
@@ -69,6 +80,8 @@ describe('UpgradeComponent', () => {
       versions: ['18.1.0', '18.1.1', '18.1.2']
     };
     upgradeInfoSpy.and.returnValue(of(upgradeInfoPayload));
+    upgradeStatusSpy.and.returnValue(of({}));
+    component.fetchStatus();
     spyOn(TestBed.inject(AuthStorageService), 'getPermissions').and.callFake(() => ({
       configOpt: { read: true }
     }));
@@ -167,5 +180,53 @@ describe('UpgradeComponent', () => {
     fixture.detectChanges();
     const loading = fixture.debugElement.nativeElement.querySelector('#upgrade-status-error');
     expect(loading.textContent).toContain('Failed to retrieve');
+  });
+
+  it('should show popover when health warning is present', () => {
+    const healthPayload: Record<string, any> = {
+      health: {
+        status: 'HEALTH_WARN',
+        checks: [
+          {
+            severity: 'HEALTH_WARN',
+            summary: { message: '1 pool(s) do not have an application enabled', count: 1 },
+            detail: [
+              { message: "application not enabled on pool 'scbench'" },
+              {
+                message:
+                  "use 'ceph osd pool application enable <pool-name> <app-name>', where <app-name> is 'cephfs', 'rbd', 'rgw', or freeform for custom applications."
+              }
+            ],
+            muted: false,
+            type: 'POOL_APP_NOT_ENABLED'
+          }
+        ],
+        mutes: []
+      }
+    };
+
+    getHealthSpy.and.returnValue(of(healthPayload));
+    component.ngOnInit();
+    fixture.detectChanges();
+
+    const popover = fixture.debugElement.nativeElement.querySelector(
+      '.info-card-content-clickable'
+    );
+    expect(popover).not.toBeNull();
+  });
+
+  it('should not show popover when health warning is not present', () => {
+    const healthPayload: Record<string, any> = {
+      health: {
+        status: 'HEALTH_OK'
+      }
+    };
+    getHealthSpy.and.returnValue(of(healthPayload));
+    component.ngOnInit();
+    fixture.detectChanges();
+    const popover = fixture.debugElement.nativeElement.querySelector(
+      '.info-card-content-clickable'
+    );
+    expect(popover).toBeNull();
   });
 });

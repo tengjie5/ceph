@@ -47,14 +47,43 @@ public:
 
   bool is_failed() {
     std::scoped_lock locker(m_lock);
-    return m_init_failed ||
-           m_instance_watcher->is_failed() ||
-           m_mirror_watcher->is_failed();
+    bool failed = m_init_failed;
+    if (m_instance_watcher) {
+      failed |= m_instance_watcher->is_failed();
+    }
+    if (m_mirror_watcher) {
+      failed |= m_mirror_watcher->is_failed();
+    }
+    return failed;
+  }
+
+  monotime get_failed_ts() {
+    std::scoped_lock locker(m_lock);
+    if (m_instance_watcher) {
+      return m_instance_watcher->get_failed_ts();
+    }
+    if (m_mirror_watcher) {
+      return m_mirror_watcher->get_failed_ts();
+    }
+
+    return clock::now();
   }
 
   bool is_blocklisted() {
     std::scoped_lock locker(m_lock);
     return is_blocklisted(locker);
+  }
+
+  monotime get_blocklisted_ts() {
+    std::scoped_lock locker(m_lock);
+    if (m_instance_watcher) {
+      return m_instance_watcher->get_blocklisted_ts();
+    }
+    if (m_mirror_watcher) {
+      return m_mirror_watcher->get_blocklisted_ts();
+    }
+
+    return clock::now();
   }
 
   Peers get_peers() {
@@ -129,6 +158,8 @@ private:
   MirrorAdminSocketHook *m_asok_hook = nullptr;
 
   MountRef m_mount;
+
+  PerfCounters *m_perf_counters;
 
   int init_replayer(PeerReplayer *peer_replayer);
   void shutdown_replayer(PeerReplayer *peer_replayer);

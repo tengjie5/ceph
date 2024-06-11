@@ -20,6 +20,7 @@
 #include "crimson/net/Connection.h"
 #include "crimson/net/Dispatcher.h"
 #include "crimson/net/Messenger.h"
+#include "test/crimson/ctest_utils.h"
 
 using namespace std::chrono_literals;
 namespace bpo = boost::program_options;
@@ -136,17 +137,17 @@ class SyntheticDispatcher final
 
   void ms_handle_accept(
       crimson::net::ConnectionRef conn,
-      seastar::shard_id new_shard,
+      seastar::shard_id prv_shard,
       bool is_replace) final {
     logger().info("{} - Connection:{}", __func__, *conn);
-    assert(new_shard == seastar::this_shard_id());
+    assert(prv_shard == seastar::this_shard_id());
   }
 
   void ms_handle_connect(
       crimson::net::ConnectionRef conn,
-      seastar::shard_id new_shard) final {
+      seastar::shard_id prv_shard) final {
     logger().info("{} - Connection:{}", __func__, *conn);
-    assert(new_shard == seastar::this_shard_id());
+    assert(prv_shard == seastar::this_shard_id());
   }
 
   void ms_handle_reset(crimson::net::ConnectionRef con, bool is_replace) final;
@@ -364,12 +365,11 @@ class SyntheticWorkload {
      return msgr->bind(entity_addrvec_t{addr}).safe_then(
          [this, msgr] {
        return msgr->start({&dispatcher});
-     }, crimson::net::Messenger::bind_ertr::all_same_way(
+     }, crimson::net::Messenger::bind_ertr::assert_all_func(
          [addr] (const std::error_code& e) {
        logger().error("{} test_messenger_thrash(): "
                       "there is another instance running at {}",
                        __func__, addr);
-       ceph_abort();
      }));
    }
 
@@ -632,8 +632,11 @@ seastar::future<int> do_test(seastar::app_template& app)
                                               CEPH_ENTITY_TYPE_CLIENT,
                                               &cluster,
                                               &conf_file_list);
-  return crimson::common::sharded_conf().start(init_params.name, cluster)
-  .then([conf_file_list] {
+  return crimson::common::sharded_conf().start(
+    init_params.name, cluster
+  ).then([] {
+    return local_conf().start();
+  }).then([conf_file_list] {
     return local_conf().parse_config_files(conf_file_list);
   }).then([&app] {
     auto&& config = app.configuration();
@@ -659,7 +662,7 @@ seastar::future<int> do_test(seastar::app_template& app)
 
 int main(int argc, char** argv)
 {
-  seastar::app_template app;
+  seastar::app_template app{get_smp_opts_from_ctest()};
   app.add_options()
     ("verbose,v", bpo::value<bool>()->default_value(false),
      "chatty if true");

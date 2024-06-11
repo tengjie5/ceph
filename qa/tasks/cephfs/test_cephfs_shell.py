@@ -864,18 +864,18 @@ class TestQuota(TestCephFSShell):
 
     def test_set(self):
         self.create_dir()
-        set_values = ('4096', '2')
+        set_values = ('6', '2')
         self.assertTupleEqual(self.set_and_get_quota_vals(set_values),
                               set_values)
 
     def test_replace_values(self):
         self.test_set()
-        set_values = ('8192', '4')
+        set_values = ('20', '4')
         self.assertTupleEqual(self.set_and_get_quota_vals(set_values),
                               set_values)
 
     def test_set_invalid_dir(self):
-        set_values = ('4096', '5')
+        set_values = ('5', '5')
         try:
             self.assertTupleEqual(self.set_and_get_quota_vals(
                 set_values, False), set_values)
@@ -920,8 +920,9 @@ class TestQuota(TestCephFSShell):
         filename = 'test_file'
         file_abspath = path.join(dir_abspath, filename)
         try:
-            # Write should fail as bytes quota is set to 4096
-            self.mount_a.write_n_mb(file_abspath, 1)
+            # Write should fail as bytes quota is set to 6
+            self.mount_a.client_remote.write_file(file_abspath,
+                                                  'Disk raise Exception')
             raise Exception("Write should have failed")
         except CommandFailedError:
             # Test should pass only when write command fails
@@ -1107,11 +1108,13 @@ class TestShellOpts(TestCephFSShell):
         # output of following command -
         # editor - was: 'vim'
         # now: '?'
-        # editor: '?'
+        # Name    Value                           Description
+        # ====================================================================================================
+        # editor  ?                               Program used by 'edit'
         self.editor_val = self.get_cephfs_shell_cmd_output(
-            'set editor ?, set editor').split('\n')[2]
-        self.editor_val = self.editor_val.split(':')[1]. \
-            replace("'", "", 2).strip()
+            'set editor ?, set editor').split('\n')[4]
+        self.editor_val = self.editor_val.split()[1].strip(). \
+            replace("'", "", 2)
 
     def write_tempconf(self, confcontents):
         self.tempconfpath = self.mount_a.client_remote.mktemp(
@@ -1124,28 +1127,34 @@ class TestShellOpts(TestCephFSShell):
 
         # output of following command -
         # CephFS:~/>>> set editor
-        # editor: 'vim'
+        # Name    Value                           Description
+        # ====================================================================================================
+        # editor  ???                             Program used by 'edit'
         final_editor_val = self.get_cephfs_shell_cmd_output(
             cmd='set editor', shell_conf_path=self.tempconfpath)
-        final_editor_val = final_editor_val.split(': ')[1]
-        final_editor_val = final_editor_val.replace("'", "", 2)
+        final_editor_val = final_editor_val.split('\n')[2]
+        final_editor_val = final_editor_val.split()[1].strip(). \
+            replace("'", "", 2)
 
         self.assertNotEqual(self.editor_val, final_editor_val)
 
     def test_reading_conf_with_dup_opt(self):
         """
-        Read conf without duplicate sections/options.
+        Read conf with duplicate sections/options.
         """
         self.write_tempconf("[cephfs-shell]\neditor = ???\neditor = " +
                             self.editor_val)
 
         # output of following command -
         # CephFS:~/>>> set editor
-        # editor: 'vim'
+        # Name    Value                           Description
+        # ====================================================================================================
+        # editor  ?                               Program used by 'edit'
         final_editor_val = self.get_cephfs_shell_cmd_output(
             cmd='set editor', shell_conf_path=self.tempconfpath)
-        final_editor_val = final_editor_val.split(': ')[1]
-        final_editor_val = final_editor_val.replace("'", "", 2)
+        final_editor_val = final_editor_val.split('\n')[2]
+        final_editor_val = final_editor_val.split()[1].strip(). \
+            replace("'", "", 2)
 
         self.assertEqual(self.editor_val, final_editor_val)
 
@@ -1153,14 +1162,16 @@ class TestShellOpts(TestCephFSShell):
         self.write_tempconf("[cephfs-shell]\neditor = ???")
 
         # output of following command -
-        # editor - was: vim
-        # now: vim
-        # editor: vim
+        # editor - was: ???
+        # now: ?
+        # Name    Value                           Description
+        # ====================================================================================================
+        # editor  ?                               Program used by 'edit'
         final_editor_val = self.get_cephfs_shell_cmd_output(
             cmd='set editor %s, set editor' % self.editor_val,
             shell_conf_path=self.tempconfpath)
-        final_editor_val = final_editor_val.split('\n')[2]
-        final_editor_val = final_editor_val.split(': ')[1]
-        final_editor_val = final_editor_val.replace("'", "", 2)
+        final_editor_val = final_editor_val.split('\n')[4]
+        final_editor_val = final_editor_val.split()[1].strip(). \
+            replace("'", "", 2)
 
         self.assertEqual(self.editor_val, final_editor_val)

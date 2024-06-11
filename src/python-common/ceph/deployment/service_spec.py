@@ -6,8 +6,21 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from functools import wraps
 from ipaddress import ip_network, ip_address
-from typing import Optional, Dict, Any, List, Union, Callable, Iterable, Type, TypeVar, cast, \
-    NamedTuple, Mapping, Iterator
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import yaml
 
@@ -127,17 +140,120 @@ class HostPlacementSpec(NamedTuple):
         assert_valid_host(self.hostname)
 
 
+HostPatternType = Union[str, None, Dict[str, Union[str, bool, None]], "HostPattern"]
+
+
+class PatternType(enum.Enum):
+    fnmatch = 'fnmatch'
+    regex = 'regex'
+
+
+class HostPattern():
+    def __init__(self,
+                 pattern: Optional[str] = None,
+                 pattern_type: PatternType = PatternType.fnmatch) -> None:
+        self.pattern: Optional[str] = pattern
+        self.pattern_type: PatternType = pattern_type
+        self.compiled_regex = None
+        if self.pattern_type == PatternType.regex and self.pattern:
+            self.compiled_regex = re.compile(self.pattern)
+
+    def filter_hosts(self, hosts: List[str]) -> List[str]:
+        if not self.pattern:
+            return []
+        if not self.pattern_type or self.pattern_type == PatternType.fnmatch:
+            return fnmatch.filter(hosts, self.pattern)
+        elif self.pattern_type == PatternType.regex:
+            if not self.compiled_regex:
+                self.compiled_regex = re.compile(self.pattern)
+            return [h for h in hosts if re.match(self.compiled_regex, h)]
+        raise SpecValidationError(f'Got unexpected pattern_type: {self.pattern_type}')
+
+    @classmethod
+    def to_host_pattern(cls, arg: HostPatternType) -> "HostPattern":
+        if arg is None:
+            return cls()
+        elif isinstance(arg, str):
+            return cls(arg)
+        elif isinstance(arg, cls):
+            return arg
+        elif isinstance(arg, dict):
+            if 'pattern' not in arg:
+                raise SpecValidationError("Got dict for host pattern "
+                                          f"with no pattern field: {arg}")
+            pattern = arg['pattern']
+            if not pattern:
+                raise SpecValidationError("Got dict for host pattern"
+                                          f"with empty pattern: {arg}")
+            assert isinstance(pattern, str)
+            if 'pattern_type' in arg:
+                pattern_type = arg['pattern_type']
+                if not pattern_type or pattern_type == 'fnmatch':
+                    return cls(pattern, pattern_type=PatternType.fnmatch)
+                elif pattern_type == 'regex':
+                    return cls(pattern, pattern_type=PatternType.regex)
+                else:
+                    raise SpecValidationError("Got dict for host pattern "
+                                              f"with unknown pattern type: {arg}")
+            return cls(pattern)
+        raise SpecValidationError(f"Cannot convert {type(arg)} object to HostPattern")
+
+    def __eq__(self, other: Any) -> bool:
+        try:
+            other_hp = self.to_host_pattern(other)
+        except SpecValidationError:
+            return False
+        return self.pattern == other_hp.pattern and self.pattern_type == other_hp.pattern_type
+
+    def pretty_str(self) -> str:
+        # Placement specs must be able to be converted between the Python object
+        # representation and a pretty str both ways. So we need a corresponding
+        # function for HostPattern to convert it to a pretty str that we can
+        # convert back later.
+        res = self.pattern if self.pattern else ''
+        if self.pattern_type == PatternType.regex:
+            res = 'regex:' + res
+        return res
+
+    @classmethod
+    def from_pretty_str(cls, val: str) -> "HostPattern":
+        if 'regex:' in val:
+            return cls(val[6:], pattern_type=PatternType.regex)
+        else:
+            return cls(val)
+
+    def __repr__(self) -> str:
+        return f'HostPattern(pattern=\'{self.pattern}\', pattern_type={str(self.pattern_type)})'
+
+    def to_json(self) -> Union[str, Dict[str, Any], None]:
+        if self.pattern_type and self.pattern_type != PatternType.fnmatch:
+            return {
+                'pattern': self.pattern,
+                'pattern_type': self.pattern_type.name
+            }
+        return self.pattern
+
+    @classmethod
+    def from_json(self, val: Dict[str, Any]) -> "HostPattern":
+        return self.to_host_pattern(val)
+
+    def __bool__(self) -> bool:
+        if self.pattern:
+            return True
+        return False
+
+
 class PlacementSpec(object):
     """
     For APIs that need to specify a host subset
     """
 
     def __init__(self,
-                 label=None,  # type: Optional[str]
-                 hosts=None,  # type: Union[List[str],List[HostPlacementSpec], None]
-                 count=None,  # type: Optional[int]
-                 count_per_host=None,  # type: Optional[int]
-                 host_pattern=None,  # type: Optional[str]
+                 label: Optional[str] = None,
+                 hosts: Union[List[str], List[HostPlacementSpec], None] = None,
+                 count: Optional[int] = None,
+                 count_per_host: Optional[int] = None,
+                 host_pattern: HostPatternType = None,
                  ):
         # type: (...) -> None
         self.label = label
@@ -150,7 +266,7 @@ class PlacementSpec(object):
         self.count_per_host = count_per_host   # type: Optional[int]
 
         #: fnmatch patterns to select hosts. Can also be a single host.
-        self.host_pattern = host_pattern  # type: Optional[str]
+        self.host_pattern: HostPattern = HostPattern.to_host_pattern(host_pattern)
 
         self.validate()
 
@@ -190,10 +306,11 @@ class PlacementSpec(object):
             all_hosts = [hs.hostname for hs in hostspecs]
             return [h.hostname for h in self.hosts if h.hostname in all_hosts]
         if self.label:
-            return [hs.hostname for hs in hostspecs if self.label in hs.labels]
-        all_hosts = [hs.hostname for hs in hostspecs]
+            all_hosts = [hs.hostname for hs in hostspecs if self.label in hs.labels]
+        else:
+            all_hosts = [hs.hostname for hs in hostspecs]
         if self.host_pattern:
-            return fnmatch.filter(all_hosts, self.host_pattern)
+            return self.host_pattern.filter_hosts(all_hosts)
         return all_hosts
 
     def get_target_count(self, hostspecs: Iterable[HostSpec]) -> int:
@@ -217,7 +334,7 @@ class PlacementSpec(object):
         if self.label:
             kv.append('label:%s' % self.label)
         if self.host_pattern:
-            kv.append(self.host_pattern)
+            kv.append(self.host_pattern.pretty_str())
         return ';'.join(kv)
 
     def __repr__(self) -> str:
@@ -258,7 +375,7 @@ class PlacementSpec(object):
         if self.count_per_host:
             r['count_per_host'] = self.count_per_host
         if self.host_pattern:
-            r['host_pattern'] = self.host_pattern
+            r['host_pattern'] = self.host_pattern.to_json()
         return r
 
     def validate(self) -> None:
@@ -302,8 +419,9 @@ class PlacementSpec(object):
                 "count-per-host cannot be combined explicit placement with names or networks"
             )
         if self.host_pattern:
-            if not isinstance(self.host_pattern, str):
-                raise SpecValidationError('host_pattern must be of type string')
+            # if we got an invalid type for the host_pattern, it would have
+            # triggered a SpecValidationError when attemptying to convert it
+            # to a HostPattern type, so no type checking is needed here.
             if self.hosts:
                 raise SpecValidationError('cannot combine host patterns and hosts')
 
@@ -341,10 +459,17 @@ tPlacementSpec(hostname='host2', network='', name='')])
         >>> PlacementSpec.from_string('3 label:mon')
         PlacementSpec(count=3, label='mon')
 
-        fnmatch is also supported:
+        You can specify a regex to match with `regex:<regex>`
+
+        >>> PlacementSpec.from_string('regex:Foo[0-9]|Bar[0-9]')
+        PlacementSpec(host_pattern=HostPattern(pattern='Foo[0-9]|Bar[0-9]', \
+pattern_type=PatternType.regex))
+
+        fnmatch is the default for a single string if "regex:" is not provided:
 
         >>> PlacementSpec.from_string('data[1-3]')
-        PlacementSpec(host_pattern='data[1-3]')
+        PlacementSpec(host_pattern=HostPattern(pattern='data[1-3]', \
+pattern_type=PatternType.fnmatch))
 
         >>> PlacementSpec.from_string(None)
         PlacementSpec()
@@ -394,7 +519,8 @@ tPlacementSpec(hostname='host2', network='', name='')])
 
         advanced_hostspecs = [h for h in strings if
                               (':' in h or '=' in h or not any(c in '[]?*:=' for c in h)) and
-                              'label:' not in h]
+                              'label:' not in h and
+                              'regex:' not in h]
         for a_h in advanced_hostspecs:
             strings.remove(a_h)
 
@@ -406,15 +532,20 @@ tPlacementSpec(hostname='host2', network='', name='')])
         label = labels[0][6:] if labels else None
 
         host_patterns = strings
+        host_pattern: Optional[HostPattern] = None
         if len(host_patterns) > 1:
             raise SpecValidationError(
                 'more than one host pattern provided: {}'.format(host_patterns))
+        if host_patterns:
+            # host_patterns is a list not > 1, and not empty, so we should
+            # be guaranteed just a single string here
+            host_pattern = HostPattern.from_pretty_str(host_patterns[0])
 
         ps = PlacementSpec(count=count,
                            count_per_host=count_per_host,
                            hosts=advanced_hostspecs,
                            label=label,
-                           host_pattern=host_patterns[0] if host_patterns else None)
+                           host_pattern=host_pattern)
         return ps
 
 
@@ -622,11 +753,54 @@ class ServiceSpec(object):
     This structure is supposed to be enough information to
     start the services.
     """
-    KNOWN_SERVICE_TYPES = 'alertmanager crash grafana iscsi nvmeof loki promtail mds mgr mon nfs ' \
-                          'node-exporter osd prometheus rbd-mirror rgw agent ceph-exporter ' \
-                          'container ingress cephfs-mirror snmp-gateway jaeger-tracing ' \
-                          'elasticsearch jaeger-agent jaeger-collector jaeger-query'.split()
-    REQUIRES_SERVICE_ID = 'iscsi nvmeof mds nfs rgw container ingress '.split()
+
+    # list of all service type names that a ServiceSpec can be cast info
+    KNOWN_SERVICE_TYPES = [
+        'agent',
+        'alertmanager',
+        'ceph-exporter',
+        'cephfs-mirror',
+        'container',
+        'crash',
+        'elasticsearch',
+        'grafana',
+        'ingress',
+        'iscsi',
+        'jaeger-agent',
+        'jaeger-collector',
+        'jaeger-query',
+        'jaeger-tracing',
+        'loki',
+        'mds',
+        'mgr',
+        'mon',
+        'nfs',
+        'node-exporter',
+        'node-proxy',
+        'nvmeof',
+        'osd',
+        'prometheus',
+        'promtail',
+        'rbd-mirror',
+        'rgw',
+        'smb',
+        'snmp-gateway',
+    ]
+
+    # list of all service type names that require/get assigned a service_id value.
+    # if a service is not listed here it *will not* be assigned a service_id even
+    # if it is present in the JSON/YAML input
+    REQUIRES_SERVICE_ID = [
+        'container',
+        'ingress',
+        'iscsi',
+        'mds',
+        'nfs',
+        'nvmeof',
+        'rgw',
+        'smb',
+    ]
+
     MANAGED_CONFIG_OPTIONS = [
         'mds_join_fs',
     ]
@@ -658,6 +832,7 @@ class ServiceSpec(object):
             'jaeger-collector': TracingSpec,
             'jaeger-query': TracingSpec,
             'jaeger-tracing': TracingSpec,
+            SMBSpec.service_type: SMBSpec,
         }.get(service_type, cls)
         if ret == ServiceSpec and not service_type:
             raise SpecValidationError('Spec needs a "service_type" key.')
@@ -687,6 +862,7 @@ class ServiceSpec(object):
                  unmanaged: bool = False,
                  preview_only: bool = False,
                  networks: Optional[List[str]] = None,
+                 targets: Optional[List[str]] = None,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
@@ -723,6 +899,7 @@ class ServiceSpec(object):
         #: :ref:`cephadm-monitoring-networks-ports`,
         #: :ref:`cephadm-rgw-networks` and :ref:`cephadm-mgr-networks`.
         self.networks: List[str] = networks or []
+        self.targets: List[str] = targets or []
 
         self.config: Optional[Dict[str, str]] = None
         if config:
@@ -959,9 +1136,11 @@ class NFSServiceSpec(ServiceSpec):
                  networks: Optional[List[str]] = None,
                  port: Optional[int] = None,
                  virtual_ip: Optional[str] = None,
+                 enable_nlm: bool = False,
                  enable_haproxy_protocol: bool = False,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 idmap_conf: Optional[Dict[str, Dict[str, str]]] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'nfs'
@@ -974,6 +1153,8 @@ class NFSServiceSpec(ServiceSpec):
         self.port = port
         self.virtual_ip = virtual_ip
         self.enable_haproxy_protocol = enable_haproxy_protocol
+        self.idmap_conf = idmap_conf
+        self.enable_nlm = enable_nlm
 
     def get_port_start(self) -> List[int]:
         if self.port:
@@ -1037,7 +1218,12 @@ class RGWSpec(ServiceSpec):
                  custom_configs: Optional[List[CustomConfig]] = None,
                  rgw_realm_token: Optional[str] = None,
                  update_endpoints: Optional[bool] = False,
-                 zone_endpoints: Optional[str] = None  # commad separated endpoints list
+                 zone_endpoints: Optional[str] = None,  # comma separated endpoints list
+                 zonegroup_hostnames: Optional[str] = None,
+                 rgw_user_counters_cache: Optional[bool] = False,
+                 rgw_user_counters_cache_size: Optional[int] = None,
+                 rgw_bucket_counters_cache: Optional[bool] = False,
+                 rgw_bucket_counters_cache_size: Optional[int] = None,
                  ):
         assert service_type == 'rgw', service_type
 
@@ -1077,6 +1263,16 @@ class RGWSpec(ServiceSpec):
         self.rgw_realm_token = rgw_realm_token
         self.update_endpoints = update_endpoints
         self.zone_endpoints = zone_endpoints
+        self.zonegroup_hostnames = zonegroup_hostnames
+
+        #: To track op metrics by user config value rgw_user_counters_cache must be set to true
+        self.rgw_user_counters_cache = rgw_user_counters_cache
+        #: Used to set number of entries in each cache of user counters
+        self.rgw_user_counters_cache_size = rgw_user_counters_cache_size
+        #: To track op metrics by bucket config value rgw_bucket_counters_cache must be set to true
+        self.rgw_bucket_counters_cache = rgw_bucket_counters_cache
+        #: Used to set number of entries in each cache of bucket counters
+        self.rgw_bucket_counters_cache_size = rgw_bucket_counters_cache_size
 
     def get_port_start(self) -> List[int]:
         return [self.get_port()]
@@ -1118,18 +1314,45 @@ class NvmeofServiceSpec(ServiceSpec):
                  port: Optional[int] = None,
                  pool: Optional[str] = None,
                  enable_auth: bool = False,
+                 state_update_notify: Optional[bool] = True,
+                 state_update_interval_sec: Optional[int] = 5,
+                 enable_spdk_discovery_controller: Optional[bool] = False,
+                 omap_file_lock_duration: Optional[int] = 20,
+                 omap_file_lock_retries: Optional[int] = 30,
+                 omap_file_lock_retry_sleep_interval: Optional[float] = 1.0,
+                 omap_file_update_reloads: Optional[int] = 10,
+                 enable_prometheus_exporter: Optional[bool] = True,
+                 bdevs_per_cluster: Optional[int] = 32,
+                 verify_nqns: Optional[bool] = True,
+                 allowed_consecutive_spdk_ping_failures: Optional[int] = 1,
+                 spdk_ping_interval_in_seconds: Optional[float] = 2.0,
+                 ping_spdk_under_lock: Optional[bool] = False,
                  server_key: Optional[str] = None,
                  server_cert: Optional[str] = None,
                  client_key: Optional[str] = None,
                  client_cert: Optional[str] = None,
                  spdk_path: Optional[str] = None,
                  tgt_path: Optional[str] = None,
-                 timeout: Optional[int] = 60,
+                 spdk_timeout: Optional[float] = 60.0,
+                 spdk_log_level: Optional[str] = 'WARNING',
+                 rpc_socket_dir: Optional[str] = '/var/tmp/',
+                 rpc_socket_name: Optional[str] = 'spdk.sock',
                  conn_retries: Optional[int] = 10,
                  transports: Optional[str] = 'tcp',
                  transport_tcp_options: Optional[Dict[str, int]] =
                  {"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr": 7},
                  tgt_cmd_extra_args: Optional[str] = None,
+                 discovery_port: Optional[int] = None,
+                 log_level: Optional[str] = 'INFO',
+                 log_files_enabled: Optional[bool] = True,
+                 log_files_rotation_enabled: Optional[bool] = True,
+                 verbose_log_messages: Optional[bool] = True,
+                 max_log_file_size_in_mb: Optional[int] = 10,
+                 max_log_files_count: Optional[int] = 20,
+                 max_log_directory_backups: Optional[int] = 10,
+                 log_directory: Optional[str] = '/var/log/ceph/',
+                 monitor_timeout: Optional[float] = 1.0,
+                 enable_monitor_client: bool = False,
                  placement: Optional[PlacementSpec] = None,
                  unmanaged: bool = False,
                  preview_only: bool = False,
@@ -1158,6 +1381,32 @@ class NvmeofServiceSpec(ServiceSpec):
         self.group = group
         #: ``enable_auth`` enables user authentication on nvmeof gateway
         self.enable_auth = enable_auth
+        #: ``state_update_notify`` enables automatic update from OMAP in nvmeof gateway
+        self.state_update_notify = state_update_notify
+        #: ``state_update_interval_sec`` number of seconds to check for updates in OMAP
+        self.state_update_interval_sec = state_update_interval_sec
+        #: ``enable_spdk_discovery_controller`` SPDK or ceph-nvmeof discovery service
+        self.enable_spdk_discovery_controller = enable_spdk_discovery_controller
+        #: ``enable_prometheus_exporter`` enables Prometheus exporter
+        self.enable_prometheus_exporter = enable_prometheus_exporter
+        #: ``verify_nqns`` enables verification of subsystem and host NQNs for validity
+        self.verify_nqns = verify_nqns
+        #: ``omap_file_lock_duration`` number of seconds before automatically unlock OMAP file lock
+        self.omap_file_lock_duration = omap_file_lock_duration
+        #: ``omap_file_lock_retries`` number of retries to lock OMAP file before giving up
+        self.omap_file_lock_retries = omap_file_lock_retries
+        #: ``omap_file_lock_retry_sleep_interval`` seconds to wait before retrying to lock OMAP
+        self.omap_file_lock_retry_sleep_interval = omap_file_lock_retry_sleep_interval
+        #: ``omap_file_update_reloads`` number of attempt to reload OMAP when it differs from local
+        self.omap_file_update_reloads = omap_file_update_reloads
+        #: ``allowed_consecutive_spdk_ping_failures`` # of ping failures before aborting gateway
+        self.allowed_consecutive_spdk_ping_failures = allowed_consecutive_spdk_ping_failures
+        #: ``spdk_ping_interval_in_seconds`` sleep interval in seconds between SPDK pings
+        self.spdk_ping_interval_in_seconds = spdk_ping_interval_in_seconds
+        #: ``ping_spdk_under_lock`` whether or not we should perform SPDK ping under the RPC lock
+        self.ping_spdk_under_lock = ping_spdk_under_lock
+        #: ``bdevs_per_cluster`` number of bdevs per cluster
+        self.bdevs_per_cluster = bdevs_per_cluster
         #: ``server_key`` gateway server key
         self.server_key = server_key or './server.key'
         #: ``server_cert`` gateway server certificate
@@ -1170,8 +1419,14 @@ class NvmeofServiceSpec(ServiceSpec):
         self.spdk_path = spdk_path or '/usr/local/bin/nvmf_tgt'
         #: ``tgt_path`` nvmeof target path
         self.tgt_path = tgt_path or '/usr/local/bin/nvmf_tgt'
-        #: ``timeout`` ceph connectivity timeout
-        self.timeout = timeout
+        #: ``spdk_timeout`` SPDK connectivity timeout
+        self.spdk_timeout = spdk_timeout
+        #: ``spdk_log_level`` the SPDK log level
+        self.spdk_log_level = spdk_log_level or 'WARNING'
+        #: ``rpc_socket_dir`` the SPDK socket file directory
+        self.rpc_socket_dir = rpc_socket_dir or '/var/tmp/'
+        #: ``rpc_socket_name`` the SPDK socket file name
+        self.rpc_socket_name = rpc_socket_name or 'spdk.sock'
         #: ``conn_retries`` ceph connection retries number
         self.conn_retries = conn_retries
         #: ``transports`` tcp
@@ -1180,6 +1435,28 @@ class NvmeofServiceSpec(ServiceSpec):
         self.transport_tcp_options: Optional[Dict[str, int]] = transport_tcp_options
         #: ``tgt_cmd_extra_args`` extra arguments for the nvmf_tgt process
         self.tgt_cmd_extra_args = tgt_cmd_extra_args
+        #: ``discovery_port`` port of the discovery service
+        self.discovery_port = discovery_port or 8009
+        #: ``log_level`` the nvmeof gateway log level
+        self.log_level = log_level or 'INFO'
+        #: ``log_files_enabled`` enables the usage of files to keep the nameof gateway log
+        self.log_files_enabled = log_files_enabled
+        #: ``log_files_rotation_enabled`` enables rotation of log files when pass the size limit
+        self.log_files_rotation_enabled = log_files_rotation_enabled
+        #: ``verbose_log_messages`` add more details to the nvmeof gateway log message
+        self.verbose_log_messages = verbose_log_messages
+        #: ``max_log_file_size_in_mb`` max size in MB before starting a new log file
+        self.max_log_file_size_in_mb = max_log_file_size_in_mb
+        #: ``max_log_files_count`` max log files to keep before overriding them
+        self.max_log_files_count = max_log_files_count
+        #: ``max_log_directory_backups`` max directories for old gateways with same name to keep
+        self.max_log_directory_backups = max_log_directory_backups
+        #: ``log_directory`` directory for keeping nameof gateway log files
+        self.log_directory = log_directory or '/var/log/ceph/'
+        #: ``monitor_timeout`` monitor connectivity timeout
+        self.monitor_timeout = monitor_timeout
+        #: ``enable_monitor_client`` whether to connect to the ceph monitor or not
+        self.enable_monitor_client = enable_monitor_client
 
     def get_port_start(self) -> List[int]:
         return [5500, 4420, 8009]
@@ -1198,6 +1475,102 @@ class NvmeofServiceSpec(ServiceSpec):
 
         if self.transports not in ['tcp']:
             raise SpecValidationError('Invalid transport. Valid values are tcp')
+
+        if self.log_level:
+            if self.log_level not in ['debug', 'DEBUG',
+                                      'info', 'INFO',
+                                      'warning', 'WARNING',
+                                      'error', 'ERROR',
+                                      'critical', 'CRITICAL']:
+                raise SpecValidationError(
+                    'Invalid log level. Valid values are: debug, info, warning, error, critial')
+
+        if self.spdk_log_level:
+            if self.spdk_log_level not in ['debug', 'DEBUG',
+                                           'info', 'INFO',
+                                           'warning', 'WARNING',
+                                           'error', 'ERROR',
+                                           'notice', 'NOTICE']:
+                raise SpecValidationError(
+                    'Invalid SPDK log level. Valid values are: DEBUG, INFO, WARNING, ERROR, NOTICE')
+
+        if (
+            self.spdk_ping_interval_in_seconds
+            and self.spdk_ping_interval_in_seconds < 1.0
+        ):
+            raise SpecValidationError("SPDK ping interval should be at least 1 second")
+
+        if (
+            self.allowed_consecutive_spdk_ping_failures
+            and self.allowed_consecutive_spdk_ping_failures < 1
+        ):
+            raise SpecValidationError("Allowed consecutive SPDK ping failures should be at least 1")
+
+        if (
+            self.state_update_interval_sec
+            and self.state_update_interval_sec < 0
+        ):
+            raise SpecValidationError("State update interval can't be negative")
+
+        if (
+            self.omap_file_lock_duration
+            and self.omap_file_lock_duration < 0
+        ):
+            raise SpecValidationError("OMAP file lock duration can't be negative")
+
+        if (
+            self.omap_file_lock_retries
+            and self.omap_file_lock_retries < 0
+        ):
+            raise SpecValidationError("OMAP file lock retries can't be negative")
+
+        if (
+            self.omap_file_update_reloads
+            and self.omap_file_update_reloads < 0
+        ):
+            raise SpecValidationError("OMAP file reloads can't be negative")
+
+        if (
+            self.spdk_timeout
+            and self.spdk_timeout < 0.0
+        ):
+            raise SpecValidationError("SPDK timeout can't be negative")
+
+        if (
+            self.conn_retries
+            and self.conn_retries < 0
+        ):
+            raise SpecValidationError("Connection retries can't be negative")
+
+        if (
+            self.max_log_file_size_in_mb
+            and self.max_log_file_size_in_mb < 0
+        ):
+            raise SpecValidationError("Log file size can't be negative")
+
+        if (
+            self.max_log_files_count
+            and self.max_log_files_count < 0
+        ):
+            raise SpecValidationError("Log files count can't be negative")
+
+        if (
+            self.max_log_directory_backups
+            and self.max_log_directory_backups < 0
+        ):
+            raise SpecValidationError("Log file directory backups can't be negative")
+
+        if (
+            self.monitor_timeout
+            and self.monitor_timeout < 0.0
+        ):
+            raise SpecValidationError("Monitor timeout can't be negative")
+
+        if self.port and self.port < 0:
+            raise SpecValidationError("Port can't be negative")
+
+        if self.discovery_port and self.discovery_port < 0:
+            raise SpecValidationError("Discovery port can't be negative")
 
 
 yaml.add_representer(NvmeofServiceSpec, ServiceSpec.yaml_representer)
@@ -1305,6 +1678,7 @@ class IngressSpec(ServiceSpec):
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
+                 health_check_interval: Optional[str] = None,
                  ):
         assert service_type == 'ingress'
 
@@ -1337,6 +1711,8 @@ class IngressSpec(ServiceSpec):
         self.ssl = ssl
         self.keepalive_only = keepalive_only
         self.enable_haproxy_protocol = enable_haproxy_protocol
+        self.health_check_interval = health_check_interval.strip(
+        ) if health_check_interval else None
 
     def get_port_start(self) -> List[int]:
         ports = []
@@ -1367,9 +1743,113 @@ class IngressSpec(ServiceSpec):
         if self.virtual_ip is not None and self.virtual_ips_list is not None:
             raise SpecValidationError(
                 'Cannot add ingress: Single and multiple virtual IPs specified')
+        if self.health_check_interval:
+            valid_units = ['s', 'm', 'h']
+            m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", self.health_check_interval)
+            if not m:
+                raise SpecValidationError(
+                    f'Cannot add ingress: Invalid health_check_interval specified. '
+                    f'Valid units are: {valid_units}')
 
 
 yaml.add_representer(IngressSpec, ServiceSpec.yaml_representer)
+
+
+class InitContainerSpec(object):
+    """An init container is not a service that lives on its own, but rather
+    is used to run and exit prior to a service container starting in order
+    to help initialize some aspect of the container environment.
+    For example: a command to pre-populate a DB file with expected values
+    before the server starts.
+    """
+
+    _basic_fields = [
+        'image',
+        'entrypoint',
+        'volume_mounts',
+        'envs',
+        'privileged',
+    ]
+    _fields = _basic_fields + ['entrypoint_args']
+
+    def __init__(
+        self,
+        image: Optional[str] = None,
+        entrypoint: Optional[str] = None,
+        entrypoint_args: Optional[GeneralArgList] = None,
+        volume_mounts: Optional[Dict[str, str]] = None,
+        envs: Optional[List[str]] = None,
+        privileged: Optional[bool] = None,
+    ):
+        self.image = image
+        self.entrypoint = entrypoint
+        self.entrypoint_args: Optional[ArgumentList] = None
+        if entrypoint_args:
+            self.entrypoint_args = ArgumentSpec.from_general_args(
+                entrypoint_args
+            )
+        self.volume_mounts = volume_mounts
+        self.envs = envs
+        self.privileged = privileged
+        self.validate()
+
+    def validate(self) -> None:
+        if all(getattr(self, key) is None for key in self._fields):
+            raise SpecValidationError(
+                'At least one parameter must be set (no values were specified)'
+            )
+
+    def to_json(self, flatten_args: bool = False) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        for key in self._basic_fields:
+            value = getattr(self, key, None)
+            if value is not None:
+                data[key] = value
+        if self.entrypoint_args and flatten_args:
+            data['entrypoint_args'] = sum(
+                (ea.to_args() for ea in self.entrypoint_args), []
+            )
+        elif self.entrypoint_args:
+            data['entrypoint_args'] = ArgumentSpec.map_json(
+                self.entrypoint_args
+            )
+        return data
+
+    def __repr__(self) -> str:
+        vals = ((key, getattr(self, key)) for key in self._fields)
+        contents = ", ".join(f'{key}={val!r}' for key, val in vals if val)
+        return f'InitContainerSpec({contents})'
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any]) -> 'InitContainerSpec':
+        return cls(
+            image=data.get('image'),
+            entrypoint=data.get('entrypoint'),
+            entrypoint_args=data.get('entrypoint_args'),
+            volume_mounts=data.get('volume_mounts'),
+            envs=data.get('envs'),
+            privileged=data.get('privileged'),
+        )
+
+    @classmethod
+    def import_values(
+        cls, values: List[Union['InitContainerSpec', Dict[str, Any]]]
+    ) -> List['InitContainerSpec']:
+        out: List[InitContainerSpec] = []
+        for value in values:
+            if isinstance(value, dict):
+                out.append(cls.from_json(value))
+            elif isinstance(value, cls):
+                out.append(value)
+            elif hasattr(value, 'to_json'):
+                # This is a workaround for silly ceph mgr object/type identity
+                # mismatches due to multiple python interpreters in use.
+                out.append(cls.from_json(value.to_json()))
+            else:
+                raise SpecValidationError(
+                    f"Unknown type for InitContainerSpec: {type(value)}"
+                )
+        return out
 
 
 class CustomContainerSpec(ServiceSpec):
@@ -1397,6 +1877,7 @@ class CustomContainerSpec(ServiceSpec):
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
+                 init_containers: Optional[List[Union['InitContainerSpec', Dict[str, Any]]]] = None,
                  ):
         assert service_type == 'container'
         assert service_id is not None
@@ -1422,6 +1903,11 @@ class CustomContainerSpec(ServiceSpec):
         self.ports = ports
         self.dirs = dirs
         self.files = files
+        self.init_containers: Optional[List['InitContainerSpec']] = None
+        if init_containers:
+            self.init_containers = InitContainerSpec.import_values(
+                init_containers
+            )
 
     def config_json(self) -> Dict[str, Any]:
         """
@@ -1454,6 +1940,15 @@ class CustomContainerSpec(ServiceSpec):
                 '"files" and "custom_configs" are mutually exclusive '
                 '(and both serve the same purpose)')
 
+    # use quotes for OrderedDict, getting this to work across py 3.6, 3.7
+    # and 3.7+ is suprisingly difficult
+    def to_json(self) -> "OrderedDict[str, Any]":
+        data = super().to_json()
+        ics = data.get('spec', {}).get('init_containers')
+        if ics:
+            data['spec']['init_containers'] = [ic.to_json() for ic in ics]
+        return data
+
 
 yaml.add_representer(CustomContainerSpec, ServiceSpec.yaml_representer)
 
@@ -1468,6 +1963,7 @@ class MonitoringSpec(ServiceSpec):
                  unmanaged: bool = False,
                  preview_only: bool = False,
                  port: Optional[int] = None,
+                 targets: Optional[List[str]] = None,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
@@ -1481,7 +1977,7 @@ class MonitoringSpec(ServiceSpec):
             preview_only=preview_only, config=config,
             networks=networks, extra_container_args=extra_container_args,
             extra_entrypoint_args=extra_entrypoint_args,
-            custom_configs=custom_configs)
+            custom_configs=custom_configs, targets=targets)
 
         self.service_type = service_type
         self.port = port
@@ -1568,10 +2064,11 @@ class GrafanaSpec(MonitoringSpec):
                  preview_only: bool = False,
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
+                 only_bind_port_on_networks: bool = False,
                  port: Optional[int] = None,
                  protocol: Optional[str] = 'https',
                  initial_admin_password: Optional[str] = None,
-                 anonymous_access: Optional[bool] = True,
+                 anonymous_access: bool = True,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
@@ -1588,6 +2085,12 @@ class GrafanaSpec(MonitoringSpec):
         self.anonymous_access = anonymous_access
         self.protocol = protocol
 
+        # whether ports daemons for this service bind to should
+        # bind to only hte networks listed in networks param, or
+        # to all networks. Defaults to false which is saying to bind
+        # on all networks.
+        self.only_bind_port_on_networks = only_bind_port_on_networks
+
     def validate(self) -> None:
         super(GrafanaSpec, self).validate()
         if self.protocol not in ['http', 'https']:
@@ -1599,6 +2102,24 @@ class GrafanaSpec(MonitoringSpec):
                        'must be set to true. Otherwise the grafana dashboard will '
                        'be inaccessible.')
             raise SpecValidationError(err_msg)
+
+    def to_json(self) -> "OrderedDict[str, Any]":
+        json_dict = super(GrafanaSpec, self).to_json()
+        if not self.anonymous_access:
+            # This field was added as a boolean that defaults
+            # to True, which makes it get dropped when the user
+            # sets it to False and it is converted to json. This means
+            # the in memory version of the spec will have the option set
+            # correctly, but the persistent version we store in the config-key
+            # store will always drop this option. It's already been backported to
+            # some release versions, or we'd probably just rename it to
+            # no_anonymous_access and default it to False. This block is to
+            # handle this option specially and in the future, we should avoid
+            # boolean fields that default to True.
+            if 'spec' not in json_dict:
+                json_dict['spec'] = {}
+            json_dict['spec']['anonymous_access'] = False
+        return json_dict
 
 
 yaml.add_representer(GrafanaSpec, ServiceSpec.yaml_representer)
@@ -1613,9 +2134,11 @@ class PrometheusSpec(MonitoringSpec):
                  preview_only: bool = False,
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
+                 only_bind_port_on_networks: bool = False,
                  port: Optional[int] = None,
                  retention_time: Optional[str] = None,
                  retention_size: Optional[str] = None,
+                 targets: Optional[List[str]] = None,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
@@ -1624,12 +2147,13 @@ class PrometheusSpec(MonitoringSpec):
         super(PrometheusSpec, self).__init__(
             'prometheus', service_id=service_id,
             placement=placement, unmanaged=unmanaged,
-            preview_only=preview_only, config=config, networks=networks, port=port,
+            preview_only=preview_only, config=config, networks=networks, port=port, targets=targets,
             extra_container_args=extra_container_args, extra_entrypoint_args=extra_entrypoint_args,
             custom_configs=custom_configs)
 
         self.retention_time = retention_time.strip() if retention_time else None
         self.retention_size = retention_size.strip() if retention_size else None
+        self.only_bind_port_on_networks = only_bind_port_on_networks
 
     def validate(self) -> None:
         super(PrometheusSpec, self).validate()
@@ -2041,3 +2565,92 @@ class CephExporterSpec(ServiceSpec):
 
 
 yaml.add_representer(CephExporterSpec, ServiceSpec.yaml_representer)
+
+
+class SMBSpec(ServiceSpec):
+    service_type = 'smb'
+    _valid_features = {'domain'}
+
+    def __init__(
+        self,
+        # --- common service spec args ---
+        service_type: str = 'smb',
+        service_id: Optional[str] = None,
+        placement: Optional[PlacementSpec] = None,
+        count: Optional[int] = None,
+        config: Optional[Dict[str, str]] = None,
+        unmanaged: bool = False,
+        preview_only: bool = False,
+        networks: Optional[List[str]] = None,
+        # --- smb specific values ---
+        # cluster_id - a name identifying the smb "cluster" this daemon
+        # is part of. A cluster may be made up of one or more services
+        # sharing a common configuration.
+        cluster_id: str = '',
+        # features - a list of terms enabling specific deployment features.
+        # terms include: 'domain' to enable Active Dir. Domain membership.
+        features: Optional[List[str]] = None,
+        # config_uri - a pseudo-uri that resolves to a configuration source
+        # that the samba-container can load. A ceph based samba container will
+        # be typically storing configuration in rados (rados:// prefix)
+        config_uri: str = '',
+        # join_sources - a list of pseudo-uris that resolve to a (JSON) blob
+        # containing data the samba-container can use to join a domain. A ceph
+        # based samba container may typically use a rados uri or a mon
+        # config-key store uri (example:
+        # `rados:mon-config-key:smb/config/mycluster/join1.json`).
+        join_sources: Optional[List[str]] = None,
+        # user_sources - a list of pseudo-uris that resolve to a (JSON) blob
+        # containing data the samba-container can use to create users (and/or
+        # groups). A ceph based samba container may typically use a rados uri
+        # or a mon config-key store uri (example:
+        # `rados:mon-config-key:smb/config/mycluster/join1.json`).
+        user_sources: Optional[List[str]] = None,
+        # custom_dns -  a list of IP addresses that will be set up as custom
+        # dns servers for the samba container.
+        custom_dns: Optional[List[str]] = None,
+        # include_ceph_users - A list of ceph auth entity names that will be
+        # automatically added to the ceph keyring provided to the samba
+        # container.
+        include_ceph_users: Optional[List[str]] = None,
+        # --- genearal tweaks ---
+        extra_container_args: Optional[GeneralArgList] = None,
+        extra_entrypoint_args: Optional[GeneralArgList] = None,
+        custom_configs: Optional[List[CustomConfig]] = None,
+    ) -> None:
+        if service_type != self.service_type:
+            raise ValueError(f'invalid service_type: {service_type!r}')
+        super().__init__(
+            self.service_type,
+            service_id=service_id,
+            placement=placement,
+            count=count,
+            config=config,
+            unmanaged=unmanaged,
+            preview_only=preview_only,
+            networks=networks,
+            extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs,
+        )
+        self.cluster_id = cluster_id
+        self.features = features or []
+        self.config_uri = config_uri
+        self.join_sources = join_sources or []
+        self.user_sources = user_sources or []
+        self.custom_dns = custom_dns or []
+        self.include_ceph_users = include_ceph_users or []
+        self.validate()
+
+    def validate(self) -> None:
+        if not self.cluster_id:
+            raise ValueError('a valid cluster_id is required')
+        if not self.config_uri:
+            raise ValueError('a valid config_uri is required')
+        if self.features:
+            invalid = set(self.features).difference(self._valid_features)
+            if invalid:
+                raise ValueError(f'invalid feature flags: {", ".join(invalid)}')
+
+
+yaml.add_representer(SMBSpec, ServiceSpec.yaml_representer)

@@ -3,7 +3,7 @@ import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { RouterModule, Routes } from '@angular/router';
 
-import { NgbNavModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
+import { NgbNavModule, NgbPopoverModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
 import { NgxPipeFunctionModule } from 'ngx-pipe-function';
 
 import { ActionLabels, URLVerbs } from '~/app/shared/constants/app.constants';
@@ -28,8 +28,6 @@ import { RgwUserTabsComponent } from './rgw-user-tabs/rgw-user-tabs.component';
 import { RgwMultisiteDetailsComponent } from './rgw-multisite-details/rgw-multisite-details.component';
 import { TreeModule } from '@circlon/angular-tree-component';
 import { DataTableModule } from '~/app/shared/datatable/datatable.module';
-import { FeatureTogglesGuardService } from '~/app/shared/services/feature-toggles-guard.service';
-import { ModuleStatusGuardService } from '~/app/shared/services/module-status-guard.service';
 import { RgwMultisiteRealmFormComponent } from './rgw-multisite-realm-form/rgw-multisite-realm-form.component';
 import { RgwMultisiteZonegroupFormComponent } from './rgw-multisite-zonegroup-form/rgw-multisite-zonegroup-form.component';
 import { RgwMultisiteZoneFormComponent } from './rgw-multisite-zone-form/rgw-multisite-zone-form.component';
@@ -43,6 +41,10 @@ import { RgwMultisiteExportComponent } from './rgw-multisite-export/rgw-multisit
 import { CreateRgwServiceEntitiesComponent } from './create-rgw-service-entities/create-rgw-service-entities.component';
 import { RgwOverviewDashboardComponent } from './rgw-overview-dashboard/rgw-overview-dashboard.component';
 import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
+import { RgwSyncPrimaryZoneComponent } from './rgw-sync-primary-zone/rgw-sync-primary-zone.component';
+import { RgwSyncMetadataInfoComponent } from './rgw-sync-metadata-info/rgw-sync-metadata-info.component';
+import { RgwSyncDataInfoComponent } from './rgw-sync-data-info/rgw-sync-data-info.component';
+import { BucketTagModalComponent } from './bucket-tag-modal/bucket-tag-modal.component';
 
 @NgModule({
   imports: [
@@ -54,6 +56,7 @@ import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
     NgbNavModule,
     RouterModule,
     NgbTooltipModule,
+    NgbPopoverModule,
     NgxPipeFunctionModule,
     TreeModule,
     DataTableModule,
@@ -95,14 +98,20 @@ import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
     RgwMultisiteImportComponent,
     RgwMultisiteExportComponent,
     CreateRgwServiceEntitiesComponent,
-    RgwOverviewDashboardComponent
+    RgwOverviewDashboardComponent,
+    RgwSyncPrimaryZoneComponent,
+    RgwSyncMetadataInfoComponent,
+    RgwSyncDataInfoComponent,
+    BucketTagModalComponent
   ]
 })
 export class RgwModule {}
 
 const routes: Routes = [
   {
-    path: '' // Required for a clean reload on daemon selection.
+    path: '',
+    redirectTo: 'rbd',
+    pathMatch: 'full' // Required for a clean reload on daemon selection.
   },
   { path: 'daemon', component: RgwDaemonListComponent, data: { breadcrumbs: 'Gateways' } },
   {
@@ -149,6 +158,13 @@ const routes: Routes = [
         data: {
           breadcrumbs: ActionLabels.CREATE
         }
+      },
+      {
+        path: URLVerbs.EDIT,
+        component: CrudFormComponent,
+        data: {
+          breadcrumbs: ActionLabels.EDIT
+        }
       }
     ]
   },
@@ -176,22 +192,7 @@ const routes: Routes = [
   },
   {
     path: 'multisite',
-    canActivate: [FeatureTogglesGuardService, ModuleStatusGuardService],
-    data: {
-      moduleStatusGuardConfig: {
-        uiApiPath: 'rgw/multisite',
-        redirectTo: 'error',
-        header: 'Multi-site not configured',
-        button_name: 'Add Multi-site Configuration',
-        button_route: '/rgw/multisite/create',
-        button_title: 'Add multi-site configuration (realms/zonegroups/zones)',
-        secondary_button_name: 'Import Multi-site Configuration',
-        secondary_button_route: 'rgw/multisite/import',
-        secondary_button_title:
-          'Import multi-site configuration (import realm token from a secondary cluster)'
-      },
-      breadcrumbs: 'Multisite'
-    },
+    data: { breadcrumbs: 'Multi-site' },
     children: [{ path: '', component: RgwMultisiteDetailsComponent }]
   }
 ];

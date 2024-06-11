@@ -23,7 +23,6 @@ security fixes.
 
    Reef (v18.2.*) <reef>
    Quincy (v17.2.*) <quincy>
-   Pacific (v16.2.*) <pacific>
 
 .. ceph_releases:: releases.yml current
 
@@ -40,6 +39,7 @@ receive bug fixes or backports).
    :maxdepth: 1
    :hidden:
 
+   Pacific (v16.2.*) <pacific>
    Octopus (v15.2.*) <octopus>
    Nautilus (v14.2.*) <nautilus>
    Mimic (v13.2.*) <mimic>
@@ -59,11 +59,13 @@ receive bug fixes or backports).
 Release timeline
 ----------------
 
-.. ceph_timeline_gantt:: releases.yml reef quincy 
-.. ceph_timeline:: releases.yml reef quincy 
+.. ceph_timeline_gantt:: releases.yml reef quincy
+.. ceph_timeline:: releases.yml reef quincy
 
 .. _Reef: reef
 .. _18.2.0: reef#v18-2-0-reef
+.. _18.2.1: reef#v18-2-1-reef
+.. _18.2.2: reef#v18-2-2-reef
 
 .. _Quincy: quincy
 .. _17.2.0: quincy#v17-2-0-quincy
@@ -73,8 +75,11 @@ Release timeline
 .. _17.2.4: quincy#v17-2-4-quincy
 .. _17.2.5: quincy#v17-2-5-quincy
 .. _17.2.6: quincy#v17-2-6-quincy
+.. _17.2.7: quincy#v17-2-7-quincy
 
 .. _Pacific: pacific
+.. _16.2.15: pacific#v16-2-15-pacific
+.. _16.2.14: pacific#v16-2-14-pacific
 .. _16.2.13: pacific#v16-2-13-pacific
 .. _16.2.12: pacific#v16-2-12-pacific
 .. _16.2.11: pacific#v16-2-11-pacific

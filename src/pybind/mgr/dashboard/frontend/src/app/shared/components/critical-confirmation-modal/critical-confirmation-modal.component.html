@@ -10,6 +10,12 @@
           [formGroup]="deletionForm"
           novalidate>
       <div class="modal-body">
+        <cd-alert-panel *ngIf="infoMessage"
+                        type="info"
+                        spacingClass="mb-3"
+                        i18n>
+          <p>{{ infoMessage }}</p>
+        </cd-alert-panel>
         <ng-container *ngTemplateOutlet="bodyTemplate; context: bodyContext"></ng-container>
         <div class="question">
           <span *ngIf="itemNames; else noNames">
@@ -43,6 +49,7 @@
       </div>
       <div class="modal-footer">
         <cd-form-button-panel (submitActionEvent)="callSubmitAction()"
+                              (backActionEvent)="backAction ? callBackAction() : hideModal()"
                               [form]="deletionForm"
                               [submitText]="(actionDescription | titlecase) + ' ' + itemDescription"></cd-form-button-panel>
       </div>

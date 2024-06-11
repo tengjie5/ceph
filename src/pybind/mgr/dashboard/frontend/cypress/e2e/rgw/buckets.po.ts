@@ -10,6 +10,11 @@ export class BucketsPageHelper extends PageHelper {
 
   pages = pages;
 
+  columnIndex = {
+    name: 3,
+    owner: 4
+  };
+
   versioningStateEnabled = 'Enabled';
   versioningStateSuspended = 'Suspended';
 
@@ -17,26 +22,18 @@ export class BucketsPageHelper extends PageHelper {
     return this.selectOption('owner', owner);
   }
 
-  private selectPlacementTarget(placementTarget: string) {
-    return this.selectOption('placement-target', placementTarget);
-  }
-
   private selectLockMode(lockMode: string) {
     return this.selectOption('lock_mode', lockMode);
   }
 
   @PageHelper.restrictTo(pages.create.url)
-  create(name: string, owner: string, placementTarget: string, isLocking = false) {
+  create(name: string, owner: string, isLocking = false) {
     // Enter in bucket name
     cy.get('#bid').type(name);
 
     // Select bucket owner
     this.selectOwner(owner);
     cy.get('#owner').should('have.class', 'ng-valid');
-
-    // Select bucket placement target:
-    this.selectPlacementTarget(placementTarget);
-    cy.get('#placement-target').should('have.class', 'ng-valid');
 
     if (isLocking) {
       cy.get('#lock_enabled').click({ force: true });
@@ -54,7 +51,6 @@ export class BucketsPageHelper extends PageHelper {
 
   @PageHelper.restrictTo(pages.create.url)
   checkForDefaultEncryption() {
-    cy.get("cd-helper[aria-label='toggle encryption helper']").click();
     cy.get("a[aria-label='click here']").click();
     cy.get('cd-modal').within(() => {
       cy.get('input[id=s3Enabled]').should('be.checked');
@@ -65,7 +61,9 @@ export class BucketsPageHelper extends PageHelper {
   edit(name: string, new_owner: string, isLocking = false) {
     this.navigateEdit(name);
 
-    cy.get('input[name=placement-target]').should('have.value', 'default-placement');
+    // Placement target is not allowed to be edited and should be hidden
+    cy.get('input[name=placement-target]').should('not.exist');
+
     this.selectOwner(new_owner);
 
     // If object locking is enabled versioning shouldn't be visible
@@ -73,18 +71,22 @@ export class BucketsPageHelper extends PageHelper {
       cy.get('input[id=versioning]').should('be.disabled');
       cy.contains('button', 'Edit Bucket').click();
 
+      this.getTableCell(this.columnIndex.name, name)
+        .parent()
+        .find(`datatable-body-cell:nth-child(${this.columnIndex.owner})`)
+        .should(($elements) => {
+          const bucketName = $elements.text();
+          expect(bucketName).to.eq(new_owner);
+        });
+
       // wait to be back on buckets page with table visible and click
       this.getExpandCollapseElement(name).click();
 
       // check its details table for edited owner field
-      cy.get('.table.table-striped.table-bordered')
-        .first()
-        .should('contains.text', new_owner)
-        .as('bucketDataTable');
+      cy.get('.table.table-striped.table-bordered').first().as('bucketDataTable');
 
       // Check versioning enabled:
-      cy.get('@bucketDataTable').find('tr').its(2).find('td').last().should('have.text', new_owner);
-      cy.get('@bucketDataTable').find('tr').its(11).find('td').last().as('versioningValueCell');
+      cy.get('@bucketDataTable').find('tr').its(0).find('td').last().as('versioningValueCell');
 
       return cy.get('@versioningValueCell').should('have.text', this.versioningStateEnabled);
     }
@@ -92,21 +94,23 @@ export class BucketsPageHelper extends PageHelper {
     cy.get('input[id=versioning]').should('not.be.checked');
     cy.get('label[for=versioning]').click();
     cy.get('input[id=versioning]').should('be.checked');
-
     cy.contains('button', 'Edit Bucket').click();
+
+    // Check if the owner is updated
+    this.getTableCell(this.columnIndex.name, name)
+      .parent()
+      .find(`datatable-body-cell:nth-child(${this.columnIndex.owner})`)
+      .should(($elements) => {
+        const bucketName = $elements.text();
+        expect(bucketName).to.eq(new_owner);
+      });
 
     // wait to be back on buckets page with table visible and click
     this.getExpandCollapseElement(name).click();
 
-    // check its details table for edited owner field
-    cy.get('.table.table-striped.table-bordered')
-      .first()
-      .should('contains.text', new_owner)
-      .as('bucketDataTable');
-
     // Check versioning enabled:
-    cy.get('@bucketDataTable').find('tr').its(2).find('td').last().should('have.text', new_owner);
-    cy.get('@bucketDataTable').find('tr').its(11).find('td').last().as('versioningValueCell');
+    cy.get('.table.table-striped.table-bordered').first().as('bucketDataTable');
+    cy.get('@bucketDataTable').find('tr').its(0).find('td').last().as('versioningValueCell');
 
     cy.get('@versioningValueCell').should('have.text', this.versioningStateEnabled);
 
@@ -159,15 +163,6 @@ export class BucketsPageHelper extends PageHelper {
 
     // Check that error message was printed under owner drop down field
     cy.get('#owner + .invalid-feedback').should('have.text', 'This field is required.');
-
-    // Check invalid placement target input
-    this.selectOwner(BucketsPageHelper.USERS[1]);
-    // The drop down error message will not appear unless a valid option is previsously selected.
-    this.selectPlacementTarget('default-placement');
-    this.selectPlacementTarget('-- Select a placement target --');
-    cy.get('@nameInputField').click(); // Trigger validation
-    cy.get('#placement-target').should('have.class', 'ng-invalid');
-    cy.get('#placement-target + .invalid-feedback').should('have.text', 'This field is required.');
 
     // Clicks the Create Bucket button but the page doesn't move.
     // Done by testing for the breadcrumb

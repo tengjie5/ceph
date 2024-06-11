@@ -103,9 +103,10 @@
         </button>
         <div ngbDropdownMenu>
           <ng-container *ngFor="let column of columns">
-            <button ngbDropdownItem
-                    *ngIf="column.name !== ''"
-                    (click)="toggleColumn(column); false;">
+            <ng-container *ngIf="!column?.isInvisible">
+              <button ngbDropdownItem
+                      *ngIf="column.name !== ''"
+                      (click)="toggleColumn(column); false;">
               <div class="custom-control custom-checkbox py-0">
                 <input class="custom-control-input"
                        type="checkbox"
@@ -116,6 +117,7 @@
                        for="{{ column.prop }}{{ tableName }}">{{ column.name }}</label>
               </div>
             </button>
+            </ng-container>
           </ng-container>
         </div>
       </div>
@@ -230,8 +232,10 @@
           </span>
 
           <ng-template #serverSideTpl>
-            {{ data?.length || 0 }} <ng-container i18n="X found">found</ng-container> /
-            {{ rowCount }} <ng-container i18n="X total">total</ng-container>
+            <span>
+              {{ data?.length || 0 }} <ng-container i18n="X found">found</ng-container> /
+              {{ rowCount }} <ng-container i18n="X total">total</ng-container>
+            </span>
           </ng-template>
         </div>
         <cd-table-pagination [page]="curPage"
@@ -345,7 +349,8 @@
   <span data-toggle="tooltip"
         [title]="value"
         class="font-monospace">{{ value | path }}
-    <cd-copy-2-clipboard-button [source]="value"
+    <cd-copy-2-clipboard-button *ngIf="value"
+                                [source]="value"
                                 [byId]="false"
                                 [showIconOnly]="true">
     </cd-copy-2-clipboard-button>

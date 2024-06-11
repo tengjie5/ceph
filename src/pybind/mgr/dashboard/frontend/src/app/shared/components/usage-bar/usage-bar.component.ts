@@ -13,9 +13,9 @@ export class UsageBarComponent implements OnChanges {
   @Input()
   used: any;
   @Input()
-  warningThreshold: number;
+  warningThreshold?: number;
   @Input()
-  errorThreshold: number;
+  errorThreshold?: number;
   @Input()
   isBinary = true;
   @Input()
@@ -28,6 +28,10 @@ export class UsageBarComponent implements OnChanges {
   customLegend?: string;
   @Input()
   customLegendValue?: string;
+  @Input()
+  showFreeToolTip = true;
+  @Input()
+  showMultisiteTooltip = false;
 
   usedPercentage: number;
   freePercentage: number;

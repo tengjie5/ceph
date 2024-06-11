@@ -39,6 +39,8 @@ public:
    * Fetches mappings for laddr_t in range [offset, offset + len)
    *
    * Future will not resolve until all pins have resolved (set_paddr called)
+   * For indirect lba mappings, get_mappings will always retrieve the original
+   * lba value.
    */
   using get_mappings_iertr = base_iertr;
   using get_mappings_ret = get_mappings_iertr::future<lba_pin_list_t>;
@@ -50,6 +52,8 @@ public:
    * Fetches mappings for a list of laddr_t in range [offset, offset + len)
    *
    * Future will not resolve until all pins have resolved (set_paddr called)
+   * For indirect lba mappings, get_mappings will always retrieve the original
+   * lba value.
    */
   virtual get_mappings_ret get_mappings(
     Transaction &t,
@@ -59,6 +63,8 @@ public:
    * Fetches the mapping for laddr_t
    *
    * Future will not resolve until the pin has resolved (set_paddr called)
+   * For indirect lba mappings, get_mapping will always retrieve the original
+   * lba value.
    */
   using get_mapping_iertr = base_iertr::extend<
     crimson::ct_error::enoent>;
@@ -79,13 +85,32 @@ public:
   virtual alloc_extent_ret alloc_extent(
     Transaction &t,
     laddr_t hint,
+    LogicalCachedExtent &nextent,
+    extent_ref_count_t refcount = EXTENT_DEFAULT_REF_COUNT) = 0;
+
+  using alloc_extents_ret = alloc_extent_iertr::future<
+    std::vector<LBAMappingRef>>;
+  virtual alloc_extents_ret alloc_extents(
+    Transaction &t,
+    laddr_t hint,
+    std::vector<LogicalCachedExtentRef> extents,
+    extent_ref_count_t refcount) = 0;
+
+  virtual alloc_extent_ret clone_mapping(
+    Transaction &t,
+    laddr_t hint,
     extent_len_t len,
-    paddr_t addr,
-    LogicalCachedExtent *nextent) = 0;
+    laddr_t intermediate_key,
+    laddr_t intermediate_base) = 0;
+
+  virtual alloc_extent_ret reserve_region(
+    Transaction &t,
+    laddr_t hint,
+    extent_len_t len) = 0;
 
   struct ref_update_result_t {
-    unsigned refcount = 0;
-    paddr_t addr;
+    extent_ref_count_t refcount = 0;
+    pladdr_t addr;
     extent_len_t length = 0;
   };
   using ref_iertr = base_iertr::extend<
@@ -109,6 +134,35 @@ public:
   virtual ref_ret incref_extent(
     Transaction &t,
     laddr_t addr) = 0;
+
+  struct remap_entry {
+    extent_len_t offset;
+    extent_len_t len;
+    remap_entry(extent_len_t _offset, extent_len_t _len) {
+      offset = _offset;
+      len = _len;
+    }
+  };
+  struct lba_remap_ret_t {
+    ref_update_result_t ruret;
+    std::vector<LBAMappingRef> remapped_mappings;
+  };
+  using remap_iertr = ref_iertr;
+  using remap_ret = remap_iertr::future<lba_remap_ret_t>;
+
+  /**
+   * remap_mappings
+   *
+   * Remap an original mapping into new ones
+   * Return the old mapping's info and new mappings
+   */
+  virtual remap_ret remap_mappings(
+    Transaction &t,
+    LBAMappingRef orig_mapping,
+    std::vector<remap_entry> remaps,
+    std::vector<LogicalCachedExtentRef> extents  // Required if and only
+						 // if pin isn't indirect
+    ) = 0;
 
   /**
    * Should be called after replay on each cached extent.
@@ -157,12 +211,15 @@ public:
    * update lba mapping for a delayed allocated extent
    */
   using update_mapping_iertr = base_iertr;
-  using update_mapping_ret = base_iertr::future<>;
+  using update_mapping_ret = base_iertr::future<extent_ref_count_t>;
   virtual update_mapping_ret update_mapping(
     Transaction& t,
     laddr_t laddr,
+    extent_len_t prev_len,
     paddr_t prev_addr,
+    extent_len_t len,
     paddr_t paddr,
+    uint32_t checksum,
     LogicalCachedExtent *nextent) = 0;
 
   /**
@@ -171,7 +228,7 @@ public:
    * update lba mappings for delayed allocated extents
    */
   using update_mappings_iertr = update_mapping_iertr;
-  using update_mappings_ret = update_mapping_ret;
+  using update_mappings_ret = update_mappings_iertr::future<>;
   update_mappings_ret update_mappings(
     Transaction& t,
     const std::list<LogicalCachedExtentRef>& extents);

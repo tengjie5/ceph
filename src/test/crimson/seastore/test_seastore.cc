@@ -56,8 +56,7 @@ ghobject_t make_temp_oid(int i) {
 
 struct seastore_test_t :
   public seastar_test_suite_t,
-  SeaStoreTestState,
-  ::testing::WithParamInterface<const char*> {
+  SeaStoreTestState {
 
   coll_t coll_name{spg_t{pg_t{0, 0}}};
   CollectionRef coll;
@@ -65,16 +64,7 @@ struct seastore_test_t :
   seastore_test_t() {}
 
   seastar::future<> set_up_fut() final {
-    std::string j_type = GetParam();
-    journal_type_t journal;
-    if (j_type == "segmented") {
-      journal = journal_type_t::SEGMENTED;
-    } else if (j_type == "circularbounded") {
-      journal = journal_type_t::RANDOM_BLOCK;
-    } else {
-      ceph_assert(0 == "no support");
-    }
-    return tm_setup(journal
+    return tm_setup(
     ).then([this] {
       return sharded_seastore->create_new_collection(coll_name);
     }).then([this](auto coll_ref) {
@@ -116,6 +106,8 @@ struct seastore_test_t :
 
     std::map<string, bufferlist> omap;
     bufferlist contents;
+
+    std::map<snapid_t, bufferlist> clone_contents;
 
     void touch(
       CTransaction &t) {
@@ -244,6 +236,45 @@ struct seastore_test_t :
 	coll,
 	std::move(t)).get0();
     }
+
+    void clone(
+      SeaStoreShard &sharded_seastore,
+      snapid_t snap) {
+      ghobject_t coid = oid;
+      coid.hobj.snap = snap;
+      CTransaction t;
+      t.clone(cid, oid, coid);
+      sharded_seastore.do_transaction(
+	coll,
+	std::move(t)).get0();
+      clone_contents[snap].reserve(contents.length());
+      auto it = contents.begin();
+      it.copy_all(clone_contents[snap]);
+    }
+
+    object_state_t get_clone(snapid_t snap) {
+      auto coid = oid;
+      coid.hobj.snap = snap;
+      auto clone_obj = object_state_t{cid, coll, coid};
+      clone_obj.contents.reserve(clone_contents[snap].length());
+      auto it = clone_contents[snap].begin();
+      it.copy_all(clone_obj.contents);
+      return clone_obj;
+    }
+
+    void rename(
+      SeaStoreShard &sharded_seastore,
+      object_state_t &other) {
+      CTransaction t;
+      t.collection_move_rename(cid, oid, cid, other.oid);
+      sharded_seastore.do_transaction(
+	coll,
+	std::move(t)).get0();
+      other.contents = contents;
+      other.omap = omap;
+      other.clone_contents = clone_contents;
+    }
+
     void write(
       SeaStoreShard &sharded_seastore,
       uint64_t offset,
@@ -308,10 +339,12 @@ struct seastore_test_t :
       uint64_t offset,
       uint64_t len) {
       bufferlist to_check;
-      to_check.substr_of(
-	contents,
-	offset,
-	len);
+      if (contents.length() >= offset) {
+	to_check.substr_of(
+	  contents,
+	  offset,
+	  std::min(len, (uint64_t)contents.length()));
+      }
       auto ret = sharded_seastore.read(
 	coll,
 	oid,
@@ -361,17 +394,18 @@ struct seastore_test_t :
     SeaStoreShard::attrs_t get_attrs(
       SeaStoreShard &sharded_seastore) {
       return sharded_seastore.get_attrs(coll, oid)
-		     .handle_error(SeaStoreShard::get_attrs_ertr::discard_all{})
-		     .get();
+	.handle_error(
+	  SeaStoreShard::get_attrs_ertr::assert_all{"unexpected error"})
+	.get();
     }
 
     ceph::bufferlist get_attr(
       SeaStoreShard& sharded_seastore,
       std::string_view name) {
       return sharded_seastore.get_attr(coll, oid, name)
-		      .handle_error(
-			SeaStoreShard::get_attr_errorator::discard_all{})
-		      .get();
+	.handle_error(
+	  SeaStoreShard::get_attr_errorator::assert_all{"unexpected error"})
+	.get();
     }
 
     void check_omap_key(
@@ -572,7 +606,7 @@ struct seastore_test_t :
 	  EXPECT_GE(next, right_bound);
 	} else {
 	  // next <= *correct_end since *correct_end is the next object to list
-	  EXPECT_LE(next, *correct_end);
+	  EXPECT_LE(listed.back(), *correct_end);
 	  // next > *(correct_end - 1) since we already listed it
 	  EXPECT_GT(next, *(correct_end - 1));
 	}
@@ -767,6 +801,86 @@ TEST_P(seastore_test_t, omap_test_simple)
   });
 }
 
+TEST_P(seastore_test_t, rename)
+{
+  run_async([this] {
+    auto &test_obj = get_object(make_oid(0));
+    test_obj.write(*sharded_seastore, 0, 4096, 'a');
+    test_obj.set_omap(
+      *sharded_seastore,
+      "asdf",
+      make_bufferlist(128));
+    auto test_other = object_state_t{
+      test_obj.cid, 
+      test_obj.coll,
+      ghobject_t(hobject_t(sobject_t(std::string("object_1"), CEPH_NOSNAP)))};
+    test_obj.rename(*sharded_seastore, test_other);
+    test_other.read(*sharded_seastore, 0, 4096);
+    test_other.check_omap(*sharded_seastore);
+  });
+}
+
+TEST_P(seastore_test_t, clone_aligned_extents)
+{
+  run_async([this] {
+    auto &test_obj = get_object(make_oid(0));
+    test_obj.write(*sharded_seastore, 0, 4096, 'a');
+
+    test_obj.clone(*sharded_seastore, 10);
+    test_obj.read(*sharded_seastore, 0, 4096);
+    test_obj.write(*sharded_seastore, 0, 4096, 'b');
+    test_obj.write(*sharded_seastore, 4096, 4096, 'c');
+    test_obj.read(*sharded_seastore, 0, 8192);
+    auto clone_obj10 = test_obj.get_clone(10);
+    clone_obj10.read(*sharded_seastore, 0, 8192);
+
+    test_obj.clone(*sharded_seastore, 20);
+    test_obj.read(*sharded_seastore, 0, 4096);
+    test_obj.write(*sharded_seastore, 0, 4096, 'd');
+    test_obj.write(*sharded_seastore, 4096, 4096, 'e');
+    test_obj.write(*sharded_seastore, 8192, 4096, 'f');
+    test_obj.read(*sharded_seastore, 0, 12288);
+    auto clone_obj20 = test_obj.get_clone(20);
+    clone_obj10.read(*sharded_seastore, 0, 12288);
+    clone_obj20.read(*sharded_seastore, 0, 12288);
+  });
+}
+
+TEST_P(seastore_test_t, clone_unaligned_extents)
+{
+  run_async([this] {
+    auto &test_obj = get_object(make_oid(0));
+    test_obj.write(*sharded_seastore, 0, 8192, 'a');
+    test_obj.write(*sharded_seastore, 8192, 8192, 'b');
+    test_obj.write(*sharded_seastore, 16384, 8192, 'c');
+
+    test_obj.clone(*sharded_seastore, 10);
+    test_obj.write(*sharded_seastore, 4096, 12288, 'd');
+    test_obj.read(*sharded_seastore, 0, 24576);
+
+    auto clone_obj10 = test_obj.get_clone(10);
+    clone_obj10.read(*sharded_seastore, 0, 24576);
+
+    test_obj.clone(*sharded_seastore, 20);
+    test_obj.write(*sharded_seastore, 8192, 12288, 'e');
+    test_obj.read(*sharded_seastore, 0, 24576);
+
+    auto clone_obj20 = test_obj.get_clone(20);
+    clone_obj10.read(*sharded_seastore, 0, 24576);
+    clone_obj20.read(*sharded_seastore, 0, 24576);
+
+    test_obj.write(*sharded_seastore, 0, 24576, 'f');
+    test_obj.clone(*sharded_seastore, 30);
+    test_obj.write(*sharded_seastore, 8192, 4096, 'g');
+    test_obj.read(*sharded_seastore, 0, 24576);
+
+    auto clone_obj30 = test_obj.get_clone(30);
+    clone_obj10.read(*sharded_seastore, 0, 24576);
+    clone_obj20.read(*sharded_seastore, 0, 24576);
+    clone_obj30.read(*sharded_seastore, 0, 24576);
+  });
+}
+
 TEST_P(seastore_test_t, attr)
 {
   run_async([this] {
@@ -816,7 +930,6 @@ TEST_P(seastore_test_t, attr)
     EXPECT_EQ(attrs.find(SS_ATTR), attrs.end());
     EXPECT_EQ(attrs.find("test_key"), attrs.end());
 
-    std::cout << "test_key passed" << std::endl;
     //create OI_ATTR with len > onode_layout_t::MAX_OI_LENGTH, rm OI_ATTR
     //create SS_ATTR with len > onode_layout_t::MAX_SS_LENGTH, rm SS_ATTR
     char oi_array[onode_layout_t::MAX_OI_LENGTH + 1] = {'a'};
@@ -1168,8 +1281,13 @@ TEST_P(seastore_test_t, zero)
 INSTANTIATE_TEST_SUITE_P(
   seastore_test,
   seastore_test_t,
-  ::testing::Values (
-    "segmented",
-    "circularbounded"
+  ::testing::Combine(
+    ::testing::Values (
+      "segmented",
+      "circularbounded"
+    ),
+    ::testing::Values(
+      integrity_check_t::FULL_CHECK,
+      integrity_check_t::NONFULL_CHECK)
   )
 );

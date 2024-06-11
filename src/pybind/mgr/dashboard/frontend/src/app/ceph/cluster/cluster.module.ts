@@ -10,6 +10,7 @@ import {
   NgbDropdownModule,
   NgbNavModule,
   NgbPopoverModule,
+  NgbProgressbarModule,
   NgbTimepickerModule,
   NgbTooltipModule,
   NgbTypeaheadModule
@@ -59,6 +60,11 @@ import { ServicesComponent } from './services/services.component';
 import { TelemetryComponent } from './telemetry/telemetry.component';
 import { UpgradeComponent } from './upgrade/upgrade.component';
 import { UpgradeStartModalComponent } from './upgrade/upgrade-form/upgrade-start-modal.component';
+import { UpgradeProgressComponent } from './upgrade/upgrade-progress/upgrade-progress.component';
+import { MultiClusterComponent } from './multi-cluster/multi-cluster.component';
+import { MultiClusterFormComponent } from './multi-cluster/multi-cluster-form/multi-cluster-form.component';
+import { MultiClusterListComponent } from './multi-cluster/multi-cluster-list/multi-cluster-list.component';
+import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
 
 @NgModule({
   imports: [
@@ -78,7 +84,9 @@ import { UpgradeStartModalComponent } from './upgrade/upgrade-form/upgrade-start
     NgbDatepickerModule,
     NgbPopoverModule,
     NgbDropdownModule,
-    NgxPipeFunctionModule
+    NgxPipeFunctionModule,
+    NgbProgressbarModule,
+    DashboardV3Module
   ],
   declarations: [
     HostsComponent,
@@ -120,7 +128,11 @@ import { UpgradeStartModalComponent } from './upgrade/upgrade-form/upgrade-start
     CreateClusterComponent,
     CreateClusterReviewComponent,
     UpgradeComponent,
-    UpgradeStartModalComponent
+    UpgradeStartModalComponent,
+    UpgradeProgressComponent,
+    MultiClusterComponent,
+    MultiClusterFormComponent,
+    MultiClusterListComponent
   ],
   providers: [NgbActiveModal]
 })

@@ -135,7 +135,7 @@ public:
     return 0;
   }
   void send_response_begin(bool has_buckets) override;
-  void send_response_data(rgw::sal::BucketList& buckets) override;
+  void send_response_data(std::span<const RGWBucketEnt> buckets) override;
   void send_response_end() override;
 };
 
@@ -355,7 +355,8 @@ public:
   RGWPutACLs_ObjStore_S3() {}
   ~RGWPutACLs_ObjStore_S3() override {}
 
-  int get_policy_from_state(rgw::sal::Driver* driver, req_state *s, std::stringstream& ss) override;
+  int get_policy_from_state(const ACLOwner& owner,
+                            RGWAccessControlPolicy& p) override;
   void send_response() override;
   int get_params(optional_yield y) override;
 };
@@ -517,8 +518,8 @@ public:
   void send_status() override;
   void begin_response() override;
   void send_partial_response(const rgw_obj_key& key, bool delete_marker,
-                             const std::string& marker_version_id, int ret,
-                             boost::asio::deadline_timer *formatter_flush_cond) override;
+                             const std::string& marker_version_id,
+                             int ret) override;
   void end_response() override;
 };
 
@@ -882,7 +883,7 @@ inline int valid_s3_bucket_name(const std::string& name, bool relaxed=false)
       continue;
 
     if (c == '.') {
-      if (!relaxed && s && *s) {
+      if (!relaxed) {
 	// name cannot have consecutive periods or dashes
 	// adjacent to periods
 	// ensure s is neither the first nor the last character
