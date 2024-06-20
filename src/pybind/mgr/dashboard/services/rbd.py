@@ -3,7 +3,6 @@
 import errno
 import json
 import math
-import time
 from enum import IntEnum
 
 import cherrypy
@@ -635,16 +634,8 @@ class RbdService(object):
 
         image = RbdService.get_image(image_spec)
         snapshots = image['snapshots']
-        if len(snapshots) > 0:
-            count = 0
-            for snap in snapshots:
-                RbdSnapshotService.remove_snapshot(image_spec, snap['name'], snap['is_protected'])
-            while True:
-                image = RbdService.get_image(image_spec)
-                if len(image['snapshots']) < 1 or count > 30:
-                    break
-                time.sleep(1)
-                count += 1
+        for snap in snapshots:
+            RbdSnapshotService.remove_snapshot(image_spec, snap['name'], snap['is_protected'])
         rbd_inst = rbd.RBD()
         return rbd_call(pool_name, namespace, rbd_inst.remove, image_name)
 
