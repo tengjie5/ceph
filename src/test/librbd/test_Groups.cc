@@ -70,6 +70,42 @@ TEST_F(TestGroup, group_createPP)
   ASSERT_EQ(0U, groups.size());
 }
 
+TEST_F(TestGroup, group_get_id)
+{
+  rados_ioctx_t ioctx;
+  rados_ioctx_create(_cluster, _pool_name.c_str(), &ioctx);
+  BOOST_SCOPE_EXIT(ioctx) {
+    rados_ioctx_destroy(ioctx);
+  } BOOST_SCOPE_EXIT_END;
+
+  ASSERT_EQ(0, rbd_group_create(ioctx, "group_get_id"));
+  
+  size_t size = 0;
+  ASSERT_EQ(-ERANGE, rbd_group_get_id(ioctx, "group_get_id", NULL, &size));
+  ASSERT_GT(size, 0);
+
+  char group_id[32];
+  ASSERT_EQ(0, rbd_group_get_id(ioctx, "group_get_id", group_id, &size));
+  ASSERT_EQ(strlen(group_id) + 1, size);
+
+  ASSERT_EQ(0, rbd_group_remove(ioctx, "group_get_id"));
+}
+
+TEST_F(TestGroup, group_get_idPP)
+{
+  librados::IoCtx ioctx;
+  ASSERT_EQ(0, _rados.ioctx_create(_pool_name.c_str(), ioctx));
+
+  librbd::RBD rbd;
+  ASSERT_EQ(0, rbd.group_create(ioctx, "group_get_idPP"));
+
+  std::string group_id;
+  ASSERT_EQ(0, rbd.group_get_id(ioctx, "group_get_idPP", &group_id));
+  ASSERT_FALSE(group_id.empty());
+
+  ASSERT_EQ(0, rbd.group_remove(ioctx, "group_get_idPP"));
+}
+
 TEST_F(TestGroup, add_image)
 {
   REQUIRE_FORMAT_V2();
@@ -309,10 +345,12 @@ TEST_F(TestGroup, add_snapshot)
 
   ASSERT_STREQ(snap_name, snaps[0].name);
 
-  ASSERT_EQ(10, rbd_write(image, 11, 10, test_data));
-  ASSERT_EQ(10, rbd_read(image, 11, 10, read_data));
+  ASSERT_EQ(10, rbd_write(image, 9, 10, test_data));
+  ASSERT_EQ(10, rbd_read(image, 9, 10, read_data));
   ASSERT_EQ(0, memcmp(test_data, read_data, 10));
 
+  ASSERT_EQ(10, rbd_read(image, 0, 10, read_data));
+  ASSERT_NE(0, memcmp(orig_data, read_data, 10));
   ASSERT_EQ(0, rbd_group_snap_rollback(ioctx, group_name, snap_name));
   ASSERT_EQ(10, rbd_read(image, 0, 10, read_data));
   ASSERT_EQ(0, memcmp(orig_data, read_data, 10));
@@ -399,14 +437,13 @@ TEST_F(TestGroup, add_snapshotPP)
 
   bufferlist write_bl;
   write_bl.append(std::string(1024, '2'));
-  ASSERT_EQ(1024, image.write(513, write_bl.length(), write_bl));
-
-  read_bl.clear();
-  ASSERT_EQ(1024, image.read(513, 1024, read_bl));
+  ASSERT_EQ(1024, image.write(256, write_bl.length(), write_bl));
+  ASSERT_EQ(1024, image.read(256, 1024, read_bl));
   ASSERT_TRUE(write_bl.contents_equal(read_bl));
 
+  ASSERT_EQ(512, image.read(0, 512, read_bl));
+  ASSERT_FALSE(expect_bl.contents_equal(read_bl));
   ASSERT_EQ(0, rbd.group_snap_rollback(ioctx, group_name, snap_name));
-
   ASSERT_EQ(512, image.read(0, 512, read_bl));
   ASSERT_TRUE(expect_bl.contents_equal(read_bl));
 
