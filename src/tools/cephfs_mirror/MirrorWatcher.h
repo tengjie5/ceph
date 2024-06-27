@@ -10,6 +10,7 @@
 #include "include/Context.h"
 #include "include/rados/librados.hpp"
 #include "Watcher.h"
+#include "Types.h"
 
 class ContextWQ;
 class Messenger;
@@ -47,9 +48,19 @@ public:
     return m_blocklisted;
   }
 
+  monotime get_blocklisted_ts() {
+    std::scoped_lock locker(m_lock);
+    return m_blocklisted_ts;
+  }
+
   bool is_failed() {
     std::scoped_lock locker(m_lock);
     return m_failed;
+  }
+
+  monotime get_failed_ts() {
+    std::scoped_lock locker(m_lock);
+    return m_failed_ts;
   }
 
 private:
@@ -65,6 +76,9 @@ private:
 
   bool m_blocklisted = false;
   bool m_failed = false;
+
+  monotime m_blocklisted_ts;
+  monotime m_failed_ts;
 
   void register_watcher();
   void handle_register_watcher(int r);

@@ -32,6 +32,7 @@
 #include "include/unordered_set.h"
 #include "include/cephfs/metrics/Types.h"
 #include "mds/mdstypes.h"
+#include "mds/MDSAuthCaps.h"
 #include "include/cephfs/types.h"
 #include "msg/Dispatcher.h"
 #include "msg/MessageRef.h"
@@ -95,8 +96,10 @@ class MDSCommandOp : public CommandOp
 {
   public:
   mds_gid_t     mds_gid;
+  bool          one_shot = false;
 
   explicit MDSCommandOp(ceph_tid_t t) : CommandOp(t) {}
+  explicit MDSCommandOp(ceph_tid_t t, ceph_tid_t multi_id) : CommandOp(t, multi_id) {}
 };
 
 /* error code for ceph_fuse */
@@ -161,7 +164,7 @@ struct dir_result_t {
   };
 
 
-  explicit dir_result_t(Inode *in, const UserPerm& perms);
+  explicit dir_result_t(Inode *in, const UserPerm& perms, int fd);
 
 
   static uint64_t make_fpos(unsigned h, unsigned l, bool hash) {
@@ -238,6 +241,8 @@ struct dir_result_t {
 
   std::vector<dentry> buffer;
   struct dirent de;
+
+  int fd;                // fd attached using fdopendir (-1 if none)
 };
 
 class Client : public Dispatcher, public md_config_obs_t {
@@ -331,7 +336,7 @@ public:
     const std::string &mds_spec,
     const std::vector<std::string>& cmd,
     const bufferlist& inbl,
-    bufferlist *poutbl, std::string *prs, Context *onfinish);
+    bufferlist *poutbl, std::string *prs, Context *onfinish, bool one_shot = false);
 
   // these should (more or less) mirror the actual system calls.
   int statfs(const char *path, struct statvfs *stbuf, const UserPerm& perms);
@@ -483,7 +488,6 @@ public:
   int preadv(int fd, const struct iovec *iov, int iovcnt, loff_t offset=-1);
   int write(int fd, const char *buf, loff_t size, loff_t offset=-1);
   int pwritev(int fd, const struct iovec *iov, int iovcnt, loff_t offset=-1);
-  int fake_write_size(int fd, loff_t size);
   int ftruncate(int fd, loff_t size, const UserPerm& perms);
   int fsync(int fd, bool syncdataonly);
   int fstat(int fd, struct stat *stbuf, const UserPerm& perms,
@@ -549,6 +553,9 @@ public:
   int mksnap(const char *path, const char *name, const UserPerm& perm,
              mode_t mode=0, const std::map<std::string, std::string> &metadata={});
   int rmsnap(const char *path, const char *name, const UserPerm& perm, bool check_perms=false);
+
+  // cephx mds auth caps checking
+  int mds_check_access(std::string& path, const UserPerm& perms, int mask);
 
   // Inode permission checking
   int inode_permission(Inode *in, const UserPerm& perms, unsigned want);
@@ -700,6 +707,7 @@ public:
 
   client_t get_nodeid() { return whoami; }
 
+  inodeno_t _get_root_ino(bool fake=true);
   inodeno_t get_root_ino();
   Inode *get_root();
 
@@ -707,6 +715,27 @@ public:
   virtual void shutdown();
 
   // messaging
+  int cancel_commands_if(std::regular_invocable<MDSCommandOp const&> auto && error_for_op)
+  {
+    std::vector<ceph_tid_t> cancel_ops;
+
+    std::scoped_lock cmd_lock(command_lock);
+    auto& commands = command_table.get_commands();
+    for (const auto &[tid, op]: commands) {
+      int rc = static_cast<int>(error_for_op(op));
+      if (rc) {
+        cancel_ops.push_back(tid);
+        if (op.on_finish)
+          op.on_finish->complete(rc);
+      }
+    }
+
+    for (const auto& tid : cancel_ops)
+      command_table.erase(tid);
+
+    return cancel_ops.size();
+  }
+
   void cancel_commands(const MDSMap& newmap);
   void handle_mds_map(const MConstRef<MMDSMap>& m);
   void handle_fs_map(const MConstRef<MFSMap>& m);
@@ -1021,6 +1050,9 @@ protected:
     return it->second;
   }
   int get_fd_inode(int fd, InodeRef *in);
+  bool _ll_fh_exists(Fh *f) {
+    return ll_unclosed_fh_set.count(f);
+  }
 
   // helpers
   void wake_up_session_caps(MetaSession *s, bool reconnect);
@@ -1536,9 +1568,9 @@ private:
   };
 
   enum {
-    MAY_EXEC = 1,
-    MAY_WRITE = 2,
-    MAY_READ = 4,
+    CLIENT_MAY_EXEC = 1,
+    CLIENT_MAY_WRITE = 2,
+    CLIENT_MAY_READ = 4,
   };
 
   typedef std::function<void(dir_result_t*, MetaRequest*, InodeRef&, frag_t)> fill_readdir_args_cb_t;
@@ -1558,7 +1590,7 @@ private:
 
   void fill_dirent(struct dirent *de, const char *name, int type, uint64_t ino, loff_t next_off);
 
-  int _opendir(Inode *in, dir_result_t **dirpp, const UserPerm& perms);
+  int _opendir(Inode *in, dir_result_t **dirpp, const UserPerm& perms, int fd = -1);
   void _readdir_drop_dirp_buffer(dir_result_t *dirp);
   bool _readdir_have_frag(dir_result_t *dirp);
   void _readdir_next_frag(dir_result_t *dirp);
@@ -1619,6 +1651,7 @@ private:
 	       const UserPerm& perms, std::string alternate_name, InodeRef *inp = 0);
   int _mknod(Inode *dir, const char *name, mode_t mode, dev_t rdev,
 	     const UserPerm& perms, InodeRef *inp = 0);
+  bool make_absolute_path_string(Inode *in, std::string& path);
   int _do_setattr(Inode *in, struct ceph_statx *stx, int mask,
 		  const UserPerm& perms, InodeRef *inp,
 		  std::vector<uint8_t>* aux=nullptr);
@@ -1671,12 +1704,12 @@ private:
           const struct iovec *iov, int iovcnt, Context *onfinish = nullptr,
           bool do_fsync = false, bool syncdataonly = false);
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
-                                 unsigned iovcnt, int64_t offset,
+                                 int iovcnt, int64_t offset,
                                  bool write, bool clamp_to_int,
                                  Context *onfinish = nullptr,
                                  bufferlist *blp = nullptr,
                                  bool do_fsync = false, bool syncdataonly = false);
-  int _preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt,
+  int _preadv_pwritev(int fd, const struct iovec *iov, int iovcnt,
                       int64_t offset, bool write, Context *onfinish = nullptr,
                       bufferlist *blp = nullptr);
   int _flush(Fh *fh);
@@ -1901,6 +1934,10 @@ private:
   uint64_t nr_metadata_request = 0;
   uint64_t nr_read_request = 0;
   uint64_t nr_write_request = 0;
+
+  std::vector<MDSCapAuth> cap_auths;
+
+  feature_bitset_t myfeatures;
 };
 
 /**

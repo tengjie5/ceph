@@ -7,7 +7,7 @@ import {
   TemplateRef,
   ViewChild
 } from '@angular/core';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 
 import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
@@ -20,6 +20,7 @@ import { OsdService } from '~/app/shared/api/osd.service';
 import { ConfirmationModalComponent } from '~/app/shared/components/confirmation-modal/confirmation-modal.component';
 import { ActionLabelsI18n, AppConstants, URLVerbs } from '~/app/shared/constants/app.constants';
 import { NotificationType } from '~/app/shared/enum/notification-type.enum';
+import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
 import { FinishedTask } from '~/app/shared/models/finished-task';
 import { DeploymentOptions } from '~/app/shared/models/osd-deployment-options';
 import { Permissions } from '~/app/shared/models/permissions';
@@ -67,7 +68,8 @@ export class CreateClusterComponent implements OnInit, OnDestroy {
     private clusterService: ClusterService,
     private modalService: ModalService,
     private taskWrapper: TaskWrapperService,
-    private osdService: OsdService
+    private osdService: OsdService,
+    private route: ActivatedRoute
   ) {
     this.permissions = this.authStorageService.getPermissions();
     this.currentStepSub = this.wizardStepsService
@@ -79,6 +81,14 @@ export class CreateClusterComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
+    this.route.queryParams.subscribe((params) => {
+      // reading 'welcome' value true/false to toggle expand-cluster wizand view and welcome view
+      const showWelcomeScreen = params['welcome'];
+      if (showWelcomeScreen) {
+        this.startClusterCreation = showWelcomeScreen;
+      }
+    });
+
     this.osdService.getDeploymentOptions().subscribe((options) => {
       this.deploymentOption = options;
       this.selectedOption = { option: options.recommended_option, encrypted: false };
@@ -90,7 +100,7 @@ export class CreateClusterComponent implements OnInit, OnDestroy {
   }
 
   createCluster() {
-    this.startClusterCreation = true;
+    this.startClusterCreation = false;
   }
 
   skipClusterCreation() {
@@ -119,7 +129,8 @@ export class CreateClusterComponent implements OnInit, OnDestroy {
 
   onSubmit() {
     if (!this.stepsToSkip['Add Hosts']) {
-      this.hostService.list('false').subscribe((hosts) => {
+      const hostContext = new CdTableFetchDataContext(() => undefined);
+      this.hostService.list(hostContext.toParams(), 'false').subscribe((hosts) => {
         hosts.forEach((host) => {
           const index = host['labels'].indexOf('_no_schedule', 0);
           if (index > -1) {
@@ -242,5 +253,6 @@ export class CreateClusterComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.currentStepSub.unsubscribe();
+    this.osdService.selectedFormValues = null;
   }
 }

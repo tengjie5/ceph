@@ -1,9 +1,12 @@
 import errno
+import ipaddress
 import logging
 import os
 import subprocess
 import tempfile
 from typing import Dict, Tuple, Any, List, cast, Optional
+from configparser import ConfigParser
+from io import StringIO
 
 from mgr_module import HandleCommandResult
 from mgr_module import NFS_POOL_NAME as POOL_NAME
@@ -78,6 +81,8 @@ class NFSService(CephService):
 
         nodeid = f'{daemon_spec.service_name}.{daemon_spec.rank}'
 
+        nfs_idmap_conf = '/etc/ganesha/idmap.conf'
+
         # create the RADOS recovery pool keyring
         rados_user = f'{daemon_type}.{daemon_id}'
         rados_keyring = self.create_keyring(daemon_spec)
@@ -114,22 +119,27 @@ class NFSService(CephService):
                 "port": daemon_spec.ports[0] if daemon_spec.ports else 2049,
                 "bind_addr": bind_addr,
                 "haproxy_hosts": [],
+                "nfs_idmap_conf": nfs_idmap_conf,
+                "enable_nlm": str(spec.enable_nlm).lower(),
             }
             if spec.enable_haproxy_protocol:
-                # NB: Ideally, we would limit the list to IPs on hosts running
-                # haproxy/ingress only, but due to the nature of cephadm today
-                # we'd "only know the set of haproxy hosts after they've been
-                # deployed" (quoth @adk7398). As it is today we limit the list
-                # of hosts we know are managed by cephadm. That ought to be
-                # good enough to prevent acceping haproxy protocol messages
-                # from "rouge" systems that are not under our control. At
-                # least until we learn otherwise.
-                context["haproxy_hosts"] = [
-                    self.mgr.inventory.get_addr(h)
-                    for h in self.mgr.inventory.keys()
-                ]
+                context["haproxy_hosts"] = self._haproxy_hosts()
                 logger.debug("selected haproxy_hosts: %r", context["haproxy_hosts"])
             return self.mgr.template.render('services/nfs/ganesha.conf.j2', context)
+
+        # generate the idmap config
+        def get_idmap_conf() -> str:
+            idmap_conf = spec.idmap_conf
+            output = ''
+            if idmap_conf is not None:
+                cp = ConfigParser()
+                out = StringIO()
+                cp.read_dict(idmap_conf)
+                cp.write(out)
+                out.seek(0)
+                output = out.read()
+                out.close()
+            return output
 
         # generate the cephadm config json
         def get_cephadm_config() -> Dict[str, Any]:
@@ -140,6 +150,7 @@ class NFSService(CephService):
             config['extra_args'] = ['-N', 'NIV_EVENT']
             config['files'] = {
                 'ganesha.conf': get_ganesha_conf(),
+                'idmap.conf': get_idmap_conf()
             }
             config.update(
                 self.get_config_and_keyring(
@@ -311,3 +322,31 @@ class NFSService(CephService):
             stderr=subprocess.PIPE,
             timeout=10
         )
+
+    def _haproxy_hosts(self) -> List[str]:
+        # NB: Ideally, we would limit the list to IPs on hosts running
+        # haproxy/ingress only, but due to the nature of cephadm today
+        # we'd "only know the set of haproxy hosts after they've been
+        # deployed" (quoth @adk7398). As it is today we limit the list
+        # of hosts we know are managed by cephadm. That ought to be
+        # good enough to prevent acceping haproxy protocol messages
+        # from "rouge" systems that are not under our control. At
+        # least until we learn otherwise.
+        cluster_ips: List[str] = []
+        for host in self.mgr.inventory.keys():
+            default_addr = self.mgr.inventory.get_addr(host)
+            cluster_ips.append(default_addr)
+            nets = self.mgr.cache.networks.get(host)
+            if not nets:
+                continue
+            for subnet, iface in nets.items():
+                ip_subnet = ipaddress.ip_network(subnet)
+                if ipaddress.ip_address(default_addr) in ip_subnet:
+                    continue  # already present
+                if ip_subnet.is_loopback or ip_subnet.is_link_local:
+                    continue  # ignore special subnets
+                addrs: List[str] = sum((addr_list for addr_list in iface.values()), [])
+                if addrs:
+                    # one address per interface/subnet is enough
+                    cluster_ips.append(addrs[0])
+        return cluster_ips

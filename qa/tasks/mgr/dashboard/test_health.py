@@ -58,10 +58,14 @@ class HealthTest(DashboardTestCase):
             'allow_snaps': bool,
             'allow_multimds_snaps': bool,
             'allow_standby_replay': bool,
-            'refuse_client_session': bool
+            'refuse_client_session': bool,
+            'refuse_standby_for_another_fs': bool,
+            'balance_automate': bool,
         }),
         'ever_allowed_features': int,
-        'root': int
+        'root': int,
+        'qdb_leader': int,
+        'qdb_cluster': JList(int)
     })
 
     def test_minimal_health(self):
@@ -182,6 +186,7 @@ class HealthTest(DashboardTestCase):
                 })
             }),
             'fs_map': JObj({
+                'btime': str,
                 'compat': JObj({
                     'compat': JObj({}, allow_unknown=True, unknown_schema=str),
                     'incompat': JObj(
@@ -264,7 +269,8 @@ class HealthTest(DashboardTestCase):
                 'state': str,
                 # @TODO: What type should be expected here?
                 'sync_provider': JList(JAny(none=True)),
-                'stretch_mode': bool
+                'stretch_mode': bool,
+                'uptime': int,
             }),
             'osd_map': JObj({
                 # @TODO: define schema for crush map and osd_metadata, among

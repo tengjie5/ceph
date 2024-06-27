@@ -12,6 +12,7 @@ import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed, PermissionHelper } from '~/testing/unit-test-helper';
 import { RgwBucketDetailsComponent } from '../rgw-bucket-details/rgw-bucket-details.component';
 import { RgwBucketListComponent } from './rgw-bucket-list.component';
+import { ToastrModule } from 'ngx-toastr';
 
 describe('RgwBucketListComponent', () => {
   let component: RgwBucketListComponent;
@@ -26,7 +27,8 @@ describe('RgwBucketListComponent', () => {
       RouterTestingModule,
       SharedModule,
       NgbNavModule,
-      HttpClientTestingModule
+      HttpClientTestingModule,
+      ToastrModule.forRoot()
     ]
   });
 
@@ -87,7 +89,7 @@ describe('RgwBucketListComponent', () => {
     });
   });
 
-  it('should test if bucket data is tranformed correctly', () => {
+  it('should test if bucket data is transformed correctly', () => {
     rgwBucketServiceListSpy.and.returnValue(
       of([
         {

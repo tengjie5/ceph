@@ -120,7 +120,7 @@ class ControllerTestCase(helper.CPWebCase):
             inst = ctrl()
 
             # We need to cache the controller endpoints because
-            # BaseController#endpoints method is not idempontent
+            # BaseController#endpoints method is not idempotent
             # and a controller might be needed by more than one
             # unit test.
             if ctrl not in cls._endpoints_cache:
@@ -302,6 +302,7 @@ class RgwStub(Stub):
                     'id': 'daemon1',
                     'realm_name': 'realm1',
                     'zonegroup_name': 'zonegroup1',
+                    'zonegroup_id': 'zonegroup1-id',
                     'zone_name': 'zone1',
                     'hostname': 'daemon1.server.lan'
                 }
@@ -313,6 +314,7 @@ class RgwStub(Stub):
                     'id': 'daemon2',
                     'realm_name': 'realm2',
                     'zonegroup_name': 'zonegroup2',
+                    'zonegroup_id': 'zonegroup2-id',
                     'zone_name': 'zone2',
                     'hostname': 'daemon2.server.lan'
                 }

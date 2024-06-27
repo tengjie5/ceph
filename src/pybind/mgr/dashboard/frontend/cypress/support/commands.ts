@@ -27,6 +27,7 @@ const fillAuth = () => {
   window.localStorage.setItem('user_pwd_expiration_date', auth.pwdExpirationDate);
   window.localStorage.setItem('user_pwd_update_required', auth.pwdUpdateRequired);
   window.localStorage.setItem('sso', auth.sso);
+  window.localStorage.setItem('telemetry_notification_hidden', 'true'); // disable telemetry notification in e2e
 };
 
 Cypress.Commands.add('login', (username, password) => {
@@ -68,6 +69,7 @@ Cypress.Commands.add('ceph2Login', (username, password) => {
           window.localStorage.setItem('user_pwd_expiration_date', pwdExpirationDate);
           window.localStorage.setItem('user_pwd_update_required', pwdUpdateRequired);
           window.localStorage.setItem('sso', sso);
+          window.localStorage.setItem('telemetry_notification_hidden', 'true'); // disable telemetry notification in e2e
         }
       );
     });
@@ -86,8 +88,14 @@ function requestAuth(username: string, password: string, url = '') {
 }
 
 // @ts-ignore
-Cypress.Commands.add('text', { prevSubject: true }, (subject: any) => {
-  return subject.text();
+Cypress.Commands.add('text', { prevSubject: true }, ($element: JQuery<HTMLElement>) => {
+  cy.wrap($element).scrollIntoView();
+  return cy
+    .wrap($element)
+    .invoke('text')
+    .then((text: string) => {
+      return text.toString();
+    });
 });
 
 Cypress.Commands.add('logToConsole', (message: string, optional?: any) => {

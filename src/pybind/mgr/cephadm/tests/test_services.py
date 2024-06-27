@@ -17,10 +17,25 @@ from cephadm.services.nvmeof import NvmeofService
 from cephadm.services.osd import OSDService
 from cephadm.services.monitoring import GrafanaService, AlertmanagerService, PrometheusService, \
     NodeExporterService, LokiService, PromtailService
+from cephadm.services.smb import SMBSpec
 from cephadm.module import CephadmOrchestrator
-from ceph.deployment.service_spec import IscsiServiceSpec, MonitoringSpec, AlertManagerSpec, \
-    ServiceSpec, RGWSpec, GrafanaSpec, SNMPGatewaySpec, IngressSpec, PlacementSpec, TracingSpec, \
-    PrometheusSpec, CephExporterSpec, NFSServiceSpec, NvmeofServiceSpec
+from ceph.deployment.service_spec import (
+    AlertManagerSpec,
+    CephExporterSpec,
+    CustomContainerSpec,
+    GrafanaSpec,
+    IngressSpec,
+    IscsiServiceSpec,
+    MonitoringSpec,
+    NFSServiceSpec,
+    NvmeofServiceSpec,
+    PlacementSpec,
+    PrometheusSpec,
+    RGWSpec,
+    SNMPGatewaySpec,
+    ServiceSpec,
+    TracingSpec,
+)
 from cephadm.tests.fixtures import with_host, with_service, _run_cephadm, async_side_effect
 
 from ceph.utils import datetime_now
@@ -330,6 +345,7 @@ log_to_file = False"""
                             },
                         }
                     }),
+                    use_current_daemon_image=False,
                 )
 
 
@@ -354,13 +370,14 @@ class TestNVMEOFService:
     def test_nvmeof_dashboard_config(self, mock_resolve_ip):
         pass
 
-    @patch("cephadm.module.CephadmOrchestrator.get_mgr_ip", lambda _: '192.168.100.100')
+    @patch("cephadm.inventory.Inventory.get_addr", lambda _, __: '192.168.100.100')
     @patch("cephadm.serve.CephadmServe._run_cephadm")
     @patch("cephadm.module.CephadmOrchestrator.get_unique_name")
     def test_nvmeof_config(self, _get_name, _run_cephadm, cephadm_module: CephadmOrchestrator):
 
         nvmeof_daemon_id = 'testpool.test.qwert'
         pool = 'testpool'
+        tgt_cmd_extra_args = '--cpumask=0xFF --msg-mempool-size=524288'
         default_port = 5500
         group = 'mygroup'
         _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
@@ -375,10 +392,38 @@ port = {default_port}
 enable_auth = False
 state_update_notify = True
 state_update_interval_sec = 5
+enable_spdk_discovery_controller = False
+enable_prometheus_exporter = True
+prometheus_exporter_ssl = False
+prometheus_port = 10008
+verify_nqns = True
+omap_file_lock_duration = 20
+omap_file_lock_retries = 30
+omap_file_lock_retry_sleep_interval = 1.0
+omap_file_update_reloads = 10
+allowed_consecutive_spdk_ping_failures = 1
+spdk_ping_interval_in_seconds = 2.0
+ping_spdk_under_lock = False
+enable_monitor_client = False
+
+[gateway-logs]
+log_level = INFO
+log_files_enabled = True
+log_files_rotation_enabled = True
+verbose_log_messages = True
+max_log_file_size_in_mb = 10
+max_log_files_count = 20
+max_log_directory_backups = 10
+log_directory = /var/log/ceph/
+
+[discovery]
+addr = 192.168.100.100
+port = 8009
 
 [ceph]
 pool = {pool}
 config_file = /etc/ceph/ceph.conf
+id = nvmeof.{nvmeof_daemon_id}
 
 [mtls]
 server_key = ./server.key
@@ -388,15 +433,22 @@ client_cert = ./client.crt
 
 [spdk]
 tgt_path = /usr/local/bin/nvmf_tgt
-rpc_socket = /var/tmp/spdk.sock
-timeout = 60
-log_level = WARN
+rpc_socket_dir = /var/tmp/
+rpc_socket_name = spdk.sock
+timeout = 60.0
+bdevs_per_cluster = 32
+log_level = WARNING
 conn_retries = 10
 transports = tcp
-transport_tcp_options = {{"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr": 7}}\n"""
+transport_tcp_options = {{"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr": 7}}
+tgt_cmd_extra_args = {tgt_cmd_extra_args}
+
+[monitor]
+timeout = 1.0\n"""
 
         with with_host(cephadm_module, 'test'):
             with with_service(cephadm_module, NvmeofServiceSpec(service_id=pool,
+                                                                tgt_cmd_extra_args=tgt_cmd_extra_args,
                                                                 group=group,
                                                                 pool=pool)):
                 _run_cephadm.assert_called_with(
@@ -430,6 +482,7 @@ transport_tcp_options = {{"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr
                             }
                         }
                     }),
+                    use_current_daemon_image=False,
                 )
 
 
@@ -540,6 +593,7 @@ class TestMonitoring:
                             "peers": [],
                         }
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -635,6 +689,7 @@ class TestMonitoring:
                             'web_config': '/etc/alertmanager/web.yml',
                         }
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -643,6 +698,12 @@ class TestMonitoring:
         _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
         s = RGWSpec(service_id="foo", placement=PlacementSpec(count=1), rgw_frontend_type='beast')
         with with_host(cephadm_module, 'test'):
+            # host "test" needs to have networks for keepalive to be placed
+            cephadm_module.cache.update_host_networks('test', {
+                '1.2.3.0/24': {
+                    'if0': ['1.2.3.1']
+                },
+            })
             with with_service(cephadm_module, MonitoringSpec('node-exporter')) as _, \
                     with_service(cephadm_module, CephExporterSpec('ceph-exporter')) as _, \
                     with_service(cephadm_module, s) as _, \
@@ -655,13 +716,18 @@ class TestMonitoring:
                                                              keepalived_password='12345',
                                                              virtual_ip="1.2.3.4/32",
                                                              backend_service='rgw.foo')) as _, \
-                    with_service(cephadm_module, PrometheusSpec('prometheus')) as _:
+                    with_service(cephadm_module, PrometheusSpec('prometheus',
+                                                                networks=['1.2.3.0/24'],
+                                                                only_bind_port_on_networks=True)) as _:
 
                 y = dedent("""
                 # This file is generated by cephadm.
                 global:
                   scrape_interval: 10s
                   evaluation_interval: 10s
+                  external_labels:
+                    cluster: fsid
+
                 rule_files:
                   - /etc/prometheus/alerting/*
 
@@ -674,21 +740,57 @@ class TestMonitoring:
                 scrape_configs:
                   - job_name: 'ceph'
                     honor_labels: true
+                    relabel_configs:
+                    - source_labels: [__address__]
+                      target_label: cluster
+                      replacement: fsid
+                    - source_labels: [instance]
+                      target_label: instance
+                      replacement: 'ceph_cluster'
                     http_sd_configs:
                     - url: http://[::1]:8765/sd/prometheus/sd-config?service=mgr-prometheus
 
                   - job_name: 'node'
                     http_sd_configs:
                     - url: http://[::1]:8765/sd/prometheus/sd-config?service=node-exporter
+                    relabel_configs:
+                    - source_labels: [__address__]
+                      target_label: cluster
+                      replacement: fsid
 
                   - job_name: 'haproxy'
                     http_sd_configs:
                     - url: http://[::1]:8765/sd/prometheus/sd-config?service=haproxy
+                    relabel_configs:
+                    - source_labels: [__address__]
+                      target_label: cluster
+                      replacement: fsid
 
                   - job_name: 'ceph-exporter'
                     honor_labels: true
+                    relabel_configs:
+                    - source_labels: [__address__]
+                      target_label: cluster
+                      replacement: fsid
                     http_sd_configs:
                     - url: http://[::1]:8765/sd/prometheus/sd-config?service=ceph-exporter
+
+                  - job_name: 'nvmeof'
+                    http_sd_configs:
+                    - url: http://[::1]:8765/sd/prometheus/sd-config?service=nvmeof
+
+                  - job_name: 'federate'
+                    scrape_interval: 15s
+                    honor_labels: true
+                    metrics_path: '/federate'
+                    params:
+                      'match[]':
+                        - '{job="ceph"}'
+                        - '{job="node"}'
+                        - '{job="haproxy"}'
+                        - '{job="ceph-exporter"}'
+                    static_configs:
+                    - targets: []
                 """).lstrip()
 
                 _run_cephadm.assert_called_with(
@@ -703,11 +805,12 @@ class TestMonitoring:
                         "deploy_arguments": [],
                         "params": {
                             'tcp_ports': [9095],
+                            'port_ips': {'8765': '1.2.3.1'}
                         },
                         "meta": {
                             'service_name': 'prometheus',
                             'ports': [9095],
-                            'ip': None,
+                            'ip': '1.2.3.1',
                             'deployed_by': [],
                             'rank': None,
                             'rank_generation': None,
@@ -721,8 +824,10 @@ class TestMonitoring:
                             },
                             'retention_time': '15d',
                             'retention_size': '0',
+                            'ip_to_bind_to': '1.2.3.1',
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -745,6 +850,12 @@ class TestMonitoring:
             cephadm_module.http_server.service_discovery.password = 'sd_password'
             cephadm_module.http_server.service_discovery.ssl_certs.generate_cert = MagicMock(
                 side_effect=gen_cert)
+            # host "test" needs to have networks for keepalive to be placed
+            cephadm_module.cache.update_host_networks('test', {
+                '1.2.3.0/24': {
+                    'if0': ['1.2.3.1']
+                },
+            })
             with with_service(cephadm_module, MonitoringSpec('node-exporter')) as _, \
                     with_service(cephadm_module, s) as _, \
                     with_service(cephadm_module, AlertManagerSpec('alertmanager')) as _, \
@@ -770,6 +881,7 @@ class TestMonitoring:
                 global:
                   scrape_interval: 10s
                   evaluation_interval: 10s
+
                 rule_files:
                   - /etc/prometheus/alerting/*
 
@@ -795,6 +907,10 @@ class TestMonitoring:
                     tls_config:
                       ca_file: mgr_prometheus_cert.pem
                     honor_labels: true
+                    relabel_configs:
+                    - source_labels: [instance]
+                      target_label: instance
+                      replacement: 'ceph_cluster'
                     http_sd_configs:
                     - url: https://[::1]:8765/sd/prometheus/sd-config?service=mgr-prometheus
                       basic_auth:
@@ -839,6 +955,20 @@ class TestMonitoring:
                         password: sd_password
                       tls_config:
                         ca_file: root_cert.pem
+
+                  - job_name: 'nvmeof'
+                    honor_labels: true
+                    scheme: https
+                    tls_config:
+                      ca_file: root_cert.pem
+                    http_sd_configs:
+                    - url: https://[::1]:8765/sd/prometheus/sd-config?service=nvmeof
+                      basic_auth:
+                        username: sd_user
+                        password: sd_password
+                      tls_config:
+                        ca_file: root_cert.pem
+
                 """).lstrip()
 
                 _run_cephadm.assert_called_with(
@@ -876,9 +1006,11 @@ class TestMonitoring:
                             },
                             'retention_time': '15d',
                             'retention_size': '0',
+                            'ip_to_bind_to': '',
                             'web_config': '/etc/prometheus/web.yml',
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -916,6 +1048,13 @@ class TestMonitoring:
                       schema: v11
                       index:
                         prefix: index_
+                        period: 24h
+                    - from: 2024-05-03
+                      store: tsdb
+                      object_store: filesystem
+                      schema: v13
+                      index:
+                        prefix: index_
                         period: 24h""").lstrip()
 
                 _run_cephadm.assert_called_with(
@@ -947,6 +1086,7 @@ class TestMonitoring:
                             },
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -1005,6 +1145,7 @@ class TestMonitoring:
                             },
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -1073,6 +1214,20 @@ class TestMonitoring:
                         # generated by cephadm\n{grafana_cert}""").lstrip(),
                     'certs/cert_key': dedent(f"""
                         # generated by cephadm\n{grafana_key}""").lstrip(),
+                    'provisioning/dashboards/default.yml': dedent("""
+                        # This file is generated by cephadm.
+                        apiVersion: 1
+
+                        providers:
+                          - name: 'Ceph Dashboard'
+                            orgId: 1
+                            folder: ''
+                            type: file
+                            disableDeletion: false
+                            updateIntervalSeconds: 3
+                            editable: false
+                            options:
+                              path: '/etc/grafana/provisioning/dashboards'""").lstrip(),
                 }
 
                 _run_cephadm.assert_called_with(
@@ -1102,6 +1257,7 @@ class TestMonitoring:
                             "files": files,
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
@@ -1151,7 +1307,21 @@ class TestMonitoring:
                                     '    isDefault: false\n'
                                     '    editable: false',
                                 'certs/cert_file': ANY,
-                                'certs/cert_key': ANY}}, ['secure_monitoring_stack:False'])
+                                'certs/cert_key': ANY,
+                                'provisioning/dashboards/default.yml':
+                                    '# This file is generated by cephadm.\n'
+                                    'apiVersion: 1\n\n'
+                                    'providers:\n'
+                                    "  - name: 'Ceph Dashboard'\n"
+                                    '    orgId: 1\n'
+                                    "    folder: ''\n"
+                                    '    type: file\n'
+                                    '    disableDeletion: false\n'
+                                    '    updateIntervalSeconds: 3\n'
+                                    '    editable: false\n'
+                                    '    options:\n'
+                                    "      path: '/etc/grafana/provisioning/dashboards'"
+                            }}, ['secure_monitoring_stack:False'])
 
     @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     def test_grafana_no_anon_access(self, cephadm_module: CephadmOrchestrator):
@@ -1199,7 +1369,21 @@ class TestMonitoring:
                                     '    isDefault: false\n'
                                     '    editable: false',
                                 'certs/cert_file': ANY,
-                                'certs/cert_key': ANY}}, ['secure_monitoring_stack:False'])
+                                'certs/cert_key': ANY,
+                                'provisioning/dashboards/default.yml':
+                                    '# This file is generated by cephadm.\n'
+                                    'apiVersion: 1\n\n'
+                                    'providers:\n'
+                                    "  - name: 'Ceph Dashboard'\n"
+                                    '    orgId: 1\n'
+                                    "    folder: ''\n"
+                                    '    type: file\n'
+                                    '    disableDeletion: false\n'
+                                    '    updateIntervalSeconds: 3\n'
+                                    '    editable: false\n'
+                                    '    options:\n'
+                                    "      path: '/etc/grafana/provisioning/dashboards'"
+                            }}, ['secure_monitoring_stack:False'])
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
     def test_monitoring_ports(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
@@ -1248,6 +1432,7 @@ spec:
                             },
                             "config_blobs": {},
                         }),
+                        use_current_daemon_image=True,
                     )
 
 
@@ -1354,6 +1539,7 @@ class TestSNMPGateway:
                         },
                         "config_blobs": config,
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -1401,6 +1587,7 @@ class TestSNMPGateway:
                         },
                         "config_blobs": config,
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -1452,6 +1639,7 @@ class TestSNMPGateway:
                         },
                         "config_blobs": config,
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -1508,6 +1696,7 @@ class TestSNMPGateway:
                         },
                         "config_blobs": config,
                     }),
+                    use_current_daemon_image=False,
                 )
 
 
@@ -1617,7 +1806,7 @@ class TestIngressService:
         )
         if enable_haproxy_protocol:
             haproxy_txt += '    default-server send-proxy-v2\n'
-        haproxy_txt += '    server nfs.foo.0 192.168.122.111:12049\n'
+        haproxy_txt += '    server nfs.foo.0 192.168.122.111:12049 check\n'
         haproxy_expected_conf = {
             'files': {'haproxy.cfg': haproxy_txt}
         }
@@ -1657,7 +1846,7 @@ class TestIngressService:
         with with_host(cephadm_module, 'test', addr='1.2.3.7'):
             cephadm_module.cache.update_host_networks('test', {
                 '1.2.3.0/24': {
-                    'if0': ['1.2.3.4/32']
+                    'if0': ['1.2.3.4']
                 }
             })
 
@@ -1685,6 +1874,10 @@ class TestIngressService:
                         {
                             'keepalived.conf':
                                 '# This file is generated by cephadm.\n'
+                                'global_defs {\n    '
+                                'enable_script_security\n    '
+                                'script_user root\n'
+                                '}\n\n'
                                 'vrrp_script check_backend {\n    '
                                 'script "/usr/bin/curl http://1.2.3.7:8999/health"\n    '
                                 'weight -20\n    '
@@ -1701,7 +1894,7 @@ class TestIngressService:
                                 'auth_type PASS\n      '
                                 'auth_pass 12345\n  '
                                 '}\n  '
-                                'unicast_src_ip 1.2.3.7\n  '
+                                'unicast_src_ip 1.2.3.4\n  '
                                 'unicast_peer {\n  '
                                 '}\n  '
                                 'virtual_ipaddress {\n    '
@@ -1767,7 +1960,7 @@ class TestIngressService:
                                 'balance static-rr\n    '
                                 'option httpchk HEAD / HTTP/1.0\n    '
                                 'server '
-                                + haproxy_generated_conf[1][0] + ' 1.2.3.7:80 check weight 100\n'
+                                + haproxy_generated_conf[1][0] + ' 1.2.3.7:80 check weight 100 inter 2s\n'
                         }
                 }
 
@@ -1780,7 +1973,7 @@ class TestIngressService:
         with with_host(cephadm_module, 'test'):
             cephadm_module.cache.update_host_networks('test', {
                 '1.2.3.0/24': {
-                    'if0': ['1.2.3.4/32']
+                    'if0': ['1.2.3.1']
                 }
             })
 
@@ -1808,6 +2001,10 @@ class TestIngressService:
                         {
                             'keepalived.conf':
                                 '# This file is generated by cephadm.\n'
+                                'global_defs {\n    '
+                                'enable_script_security\n    '
+                                'script_user root\n'
+                                '}\n\n'
                                 'vrrp_script check_backend {\n    '
                                 'script "/usr/bin/curl http://[1::4]:8999/health"\n    '
                                 'weight -20\n    '
@@ -1824,7 +2021,7 @@ class TestIngressService:
                                 'auth_type PASS\n      '
                                 'auth_pass 12345\n  '
                                 '}\n  '
-                                'unicast_src_ip 1::4\n  '
+                                'unicast_src_ip 1.2.3.1\n  '
                                 'unicast_peer {\n  '
                                 '}\n  '
                                 'virtual_ipaddress {\n    '
@@ -1892,7 +2089,7 @@ class TestIngressService:
                                 'balance static-rr\n    '
                                 'option httpchk HEAD / HTTP/1.0\n    '
                                 'server '
-                                + haproxy_generated_conf[1][0] + ' 1::4:443 check weight 100\n'
+                                + haproxy_generated_conf[1][0] + ' 1::4:443 check weight 100 inter 2s\n'
                         }
                 }
 
@@ -1905,7 +2102,7 @@ class TestIngressService:
         with with_host(cephadm_module, 'test', addr='1.2.3.7'):
             cephadm_module.cache.update_host_networks('test', {
                 '1.2.3.0/24': {
-                    'if0': ['1.2.3.4/32']
+                    'if0': ['1.2.3.1']
                 }
             })
 
@@ -1934,6 +2131,10 @@ class TestIngressService:
                         {
                             'keepalived.conf':
                                 '# This file is generated by cephadm.\n'
+                                'global_defs {\n    '
+                                'enable_script_security\n    '
+                                'script_user root\n'
+                                '}\n\n'
                                 'vrrp_script check_backend {\n    '
                                 'script "/usr/bin/curl http://1.2.3.7:8999/health"\n    '
                                 'weight -20\n    '
@@ -1950,7 +2151,7 @@ class TestIngressService:
                                 'auth_type PASS\n      '
                                 'auth_pass 12345\n  '
                                 '}\n  '
-                                'unicast_src_ip 1.2.3.7\n  '
+                                'unicast_src_ip 1.2.3.1\n  '
                                 'unicast_peer {\n  '
                                 '}\n  '
                                 'virtual_ipaddress {\n    '
@@ -2000,7 +2201,7 @@ class TestIngressService:
                                 'maxconn                 8000\n'
                                 '\nfrontend stats\n    '
                                 'mode http\n    '
-                                'bind *:8999\n    '
+                                'bind [..]:8999\n    '
                                 'bind 1.2.3.7:8999\n    '
                                 'stats enable\n    '
                                 'stats uri /stats\n    '
@@ -2009,18 +2210,217 @@ class TestIngressService:
                                 'http-request use-service prometheus-exporter if { path /metrics }\n    '
                                 'monitor-uri /health\n'
                                 '\nfrontend frontend\n    '
-                                'bind *:8089\n    '
+                                'bind [..]:8089\n    '
                                 'default_backend backend\n\n'
                                 'backend backend\n    '
                                 'option forwardfor\n    '
                                 'balance static-rr\n    '
                                 'option httpchk HEAD / HTTP/1.0\n    '
                                 'server '
-                                + haproxy_generated_conf[1][0] + ' 1.2.3.7:80 check weight 100\n'
+                                + haproxy_generated_conf[1][0] + ' 1.2.3.7:80 check weight 100 inter 2s\n'
                         }
                 }
 
                 assert haproxy_generated_conf[0] == haproxy_expected_conf
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_keepalive_config_multi_interface_vips(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        with with_host(cephadm_module, 'test', addr='1.2.3.1'):
+            with with_host(cephadm_module, 'test2', addr='1.2.3.2'):
+                cephadm_module.cache.update_host_networks('test', {
+                    '1.2.3.0/24': {
+                        'if0': ['1.2.3.1']
+                    },
+                    '100.100.100.0/24': {
+                        'if1': ['100.100.100.1']
+                    }
+                })
+                cephadm_module.cache.update_host_networks('test2', {
+                    '1.2.3.0/24': {
+                        'if0': ['1.2.3.2']
+                    },
+                    '100.100.100.0/24': {
+                        'if1': ['100.100.100.2']
+                    }
+                })
+
+                # Check the ingress with multiple VIPs
+                s = RGWSpec(service_id="foo", placement=PlacementSpec(count=1),
+                            rgw_frontend_type='beast')
+
+                ispec = IngressSpec(service_type='ingress',
+                                    service_id='test',
+                                    placement=PlacementSpec(hosts=['test', 'test2']),
+                                    backend_service='rgw.foo',
+                                    frontend_port=8089,
+                                    monitor_port=8999,
+                                    monitor_user='admin',
+                                    monitor_password='12345',
+                                    keepalived_password='12345',
+                                    virtual_ips_list=["1.2.3.100/24", "100.100.100.100/24"])
+                with with_service(cephadm_module, s) as _, with_service(cephadm_module, ispec) as _:
+                    keepalived_generated_conf = cephadm_module.cephadm_services['ingress'].keepalived_generate_config(
+                        CephadmDaemonDeploySpec(host='test', daemon_id='ingress', service_name=ispec.service_name()))
+
+                    keepalived_expected_conf = {
+                        'files':
+                            {
+                                'keepalived.conf':
+                                    '# This file is generated by cephadm.\n'
+                                    'global_defs {\n    '
+                                    'enable_script_security\n    '
+                                    'script_user root\n'
+                                    '}\n\n'
+                                    'vrrp_script check_backend {\n    '
+                                    'script "/usr/bin/curl http://1.2.3.1:8999/health"\n    '
+                                    'weight -20\n    '
+                                    'interval 2\n    '
+                                    'rise 2\n    '
+                                    'fall 2\n}\n\n'
+                                    'vrrp_instance VI_0 {\n  '
+                                    'state MASTER\n  '
+                                    'priority 100\n  '
+                                    'interface if0\n  '
+                                    'virtual_router_id 50\n  '
+                                    'advert_int 1\n  '
+                                    'authentication {\n      '
+                                    'auth_type PASS\n      '
+                                    'auth_pass 12345\n  '
+                                    '}\n  '
+                                    'unicast_src_ip 1.2.3.1\n  '
+                                    'unicast_peer {\n    '
+                                    '1.2.3.2\n  '
+                                    '}\n  '
+                                    'virtual_ipaddress {\n    '
+                                    '1.2.3.100/24 dev if0\n  '
+                                    '}\n  '
+                                    'track_script {\n      '
+                                    'check_backend\n  }\n'
+                                    '}\n'
+                                    'vrrp_instance VI_1 {\n  '
+                                    'state BACKUP\n  '
+                                    'priority 90\n  '
+                                    'interface if1\n  '
+                                    'virtual_router_id 51\n  '
+                                    'advert_int 1\n  '
+                                    'authentication {\n      '
+                                    'auth_type PASS\n      '
+                                    'auth_pass 12345\n  '
+                                    '}\n  '
+                                    'unicast_src_ip 100.100.100.1\n  '
+                                    'unicast_peer {\n    '
+                                    '100.100.100.2\n  '
+                                    '}\n  '
+                                    'virtual_ipaddress {\n    '
+                                    '100.100.100.100/24 dev if1\n  '
+                                    '}\n  '
+                                    'track_script {\n      '
+                                    'check_backend\n  }\n'
+                                    '}\n'
+                            }
+                    }
+
+                    # check keepalived config
+                    assert keepalived_generated_conf[0] == keepalived_expected_conf
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_keepalive_interface_host_filtering(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
+        # we need to make sure keepalive daemons will have an interface
+        # on the hosts we deploy them on in order to set up their VIP.
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        with with_host(cephadm_module, 'test', addr='1.2.3.1'):
+            with with_host(cephadm_module, 'test2', addr='1.2.3.2'):
+                with with_host(cephadm_module, 'test3', addr='1.2.3.3'):
+                    with with_host(cephadm_module, 'test4', addr='1.2.3.3'):
+                        # setup "test" and "test4" to have all the necessary interfaces,
+                        # "test2" to have one of them (should still be filtered)
+                        # and "test3" to have none of them
+                        cephadm_module.cache.update_host_networks('test', {
+                            '1.2.3.0/24': {
+                                'if0': ['1.2.3.1']
+                            },
+                            '100.100.100.0/24': {
+                                'if1': ['100.100.100.1']
+                            }
+                        })
+                        cephadm_module.cache.update_host_networks('test2', {
+                            '1.2.3.0/24': {
+                                'if0': ['1.2.3.2']
+                            },
+                        })
+                        cephadm_module.cache.update_host_networks('test4', {
+                            '1.2.3.0/24': {
+                                'if0': ['1.2.3.4']
+                            },
+                            '100.100.100.0/24': {
+                                'if1': ['100.100.100.4']
+                            }
+                        })
+
+                        s = RGWSpec(service_id="foo", placement=PlacementSpec(count=1),
+                                    rgw_frontend_type='beast')
+
+                        ispec = IngressSpec(service_type='ingress',
+                                            service_id='test',
+                                            placement=PlacementSpec(hosts=['test', 'test2', 'test3', 'test4']),
+                                            backend_service='rgw.foo',
+                                            frontend_port=8089,
+                                            monitor_port=8999,
+                                            monitor_user='admin',
+                                            monitor_password='12345',
+                                            keepalived_password='12345',
+                                            virtual_ips_list=["1.2.3.100/24", "100.100.100.100/24"])
+                        with with_service(cephadm_module, s) as _, with_service(cephadm_module, ispec) as _:
+                            # since we're never actually going to refresh the host here,
+                            # check the tmp daemons to see what was placed during the apply
+                            daemons = cephadm_module.cache._get_tmp_daemons()
+                            keepalive_daemons = [d for d in daemons if d.daemon_type == 'keepalived']
+                            hosts_deployed_on = [d.hostname for d in keepalive_daemons]
+                            assert 'test' in hosts_deployed_on
+                            assert 'test2' not in hosts_deployed_on
+                            assert 'test3' not in hosts_deployed_on
+                            assert 'test4' in hosts_deployed_on
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_haproxy_port_ips(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        with with_host(cephadm_module, 'test', addr='1.2.3.7'):
+            cephadm_module.cache.update_host_networks('test', {
+                '1.2.3.0/24': {
+                    'if0': ['1.2.3.4/32']
+                }
+            })
+
+            # Check the ingress with multiple VIPs
+            s = RGWSpec(service_id="foo", placement=PlacementSpec(count=1),
+                        rgw_frontend_type='beast')
+
+            ip = '1.2.3.100'
+            frontend_port = 8089
+
+            ispec = IngressSpec(service_type='ingress',
+                                service_id='test',
+                                backend_service='rgw.foo',
+                                frontend_port=frontend_port,
+                                monitor_port=8999,
+                                monitor_user='admin',
+                                monitor_password='12345',
+                                keepalived_password='12345',
+                                virtual_ip=f"{ip}/24")
+            with with_service(cephadm_module, s) as _, with_service(cephadm_module, ispec) as _:
+                # generate the haproxy conf based on the specified spec
+                haproxy_daemon_spec = cephadm_module.cephadm_services['ingress'].prepare_create(
+                    CephadmDaemonDeploySpec(
+                        host='test',
+                        daemon_type='haproxy',
+                        daemon_id='ingress',
+                        service_name=ispec.service_name()))
+
+                assert haproxy_daemon_spec.port_ips == {str(frontend_port): ip}
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
     @patch("cephadm.services.nfs.NFSService.fence_old_ranks", MagicMock())
@@ -2033,7 +2433,7 @@ class TestIngressService:
         with with_host(cephadm_module, 'test', addr='1.2.3.7'):
             cephadm_module.cache.update_host_networks('test', {
                 '1.2.3.0/24': {
-                    'if0': ['1.2.3.4/32']
+                    'if0': ['1.2.3.1']
                 }
             })
 
@@ -2064,6 +2464,10 @@ class TestIngressService:
                         {
                             'keepalived.conf':
                                 '# This file is generated by cephadm.\n'
+                                'global_defs {\n    '
+                                'enable_script_security\n    '
+                                'script_user root\n'
+                                '}\n\n'
                                 'vrrp_script check_backend {\n    '
                                 'script "/usr/bin/false"\n    '
                                 'weight -20\n    '
@@ -2080,7 +2484,7 @@ class TestIngressService:
                                 'auth_type PASS\n      '
                                 'auth_pass 12345\n  '
                                 '}\n  '
-                                'unicast_src_ip 1.2.3.7\n  '
+                                'unicast_src_ip 1.2.3.1\n  '
                                 'unicast_peer {\n  '
                                 '}\n  '
                                 'virtual_ipaddress {\n    '
@@ -2140,6 +2544,7 @@ class TestIngressService:
                 hosts=['host1', 'host2']),
             port=12049,
             enable_haproxy_protocol=True,
+            enable_nlm=True,
         )
 
         ispec = IngressSpec(
@@ -2200,7 +2605,7 @@ class TestIngressService:
             '    balance     source\n'
             '    hash-type   consistent\n'
             '    default-server send-proxy-v2\n'
-            '    server nfs.foo.0 192.168.122.111:12049\n'
+            '    server nfs.foo.0 192.168.122.111:12049 check\n'
         )
         haproxy_expected_conf = {
             'files': {'haproxy.cfg': haproxy_txt}
@@ -2209,17 +2614,18 @@ class TestIngressService:
         nfs_ganesha_txt = (
             "# This file is generated by cephadm.\n"
             'NFS_CORE_PARAM {\n'
-            '        Enable_NLM = false;\n'
+            '        Enable_NLM = true;\n'
             '        Enable_RQUOTA = false;\n'
             '        Protocols = 4;\n'
             '        NFS_Port = 2049;\n'
-            '        HAProxy_Hosts = 192.168.122.111, 192.168.122.222;\n'
+            '        HAProxy_Hosts = 192.168.122.111, 10.10.2.20, 192.168.122.222;\n'
             '}\n'
             '\n'
             'NFSv4 {\n'
             '        Delegations = false;\n'
             "        RecoveryBackend = 'rados_cluster';\n"
             '        Minor_Versions = 1, 2;\n'
+            '        IdmapConf = "/etc/ganesha/idmap.conf";\n'
             '}\n'
             '\n'
             'RADOS_KV {\n'
@@ -2243,7 +2649,7 @@ class TestIngressService:
             "%url    rados://.nfs/foo/conf-nfs.foo"
         )
         nfs_expected_conf = {
-            'files': {'ganesha.conf': nfs_ganesha_txt},
+            'files': {'ganesha.conf': nfs_ganesha_txt, 'idmap.conf': ''},
             'config': '',
             'extra_args': ['-N', 'NIV_EVENT'],
             'keyring': (
@@ -2285,6 +2691,31 @@ class TestIngressService:
 
         ingress_svc = cephadm_module.cephadm_services['ingress']
         nfs_svc = cephadm_module.cephadm_services['nfs']
+
+        # add host network info to one host to test the behavior of
+        # adding all known-good addresses of the host to the list.
+        cephadm_module.cache.update_host_networks('host1', {
+            # this one is additional
+            '10.10.2.0/24': {
+                'eth1': ['10.10.2.20']
+            },
+            # this is redundant and will be skipped
+            '192.168.122.0/24': {
+                'eth0': ['192.168.122.111']
+            },
+            # this is a link-local address and will be ignored
+            "fe80::/64": {
+                "veth0": [
+                    "fe80::8cf5:25ff:fe1c:d963"
+                ],
+                "eth0": [
+                    "fe80::c7b:cbff:fef6:7370"
+                ],
+                "eth1": [
+                    "fe80::7201:25a7:390b:d9a7"
+                ]
+            },
+        })
 
         haproxy_generated_conf, _ = ingress_svc.haproxy_generate_config(
             CephadmDaemonDeploySpec(
@@ -2354,6 +2785,7 @@ class TestJaeger:
                         },
                         "config_blobs": config,
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -2393,6 +2825,7 @@ class TestJaeger:
                         },
                         "config_blobs": es_config,
                     }),
+                    use_current_daemon_image=False,
                 )
                 with with_service(cephadm_module, collector_spec):
                     _run_cephadm.assert_called_with(
@@ -2420,6 +2853,7 @@ class TestJaeger:
                             },
                             "config_blobs": collector_config,
                         }),
+                        use_current_daemon_image=False,
                     )
 
     @patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -2459,6 +2893,7 @@ class TestJaeger:
                         },
                         "config_blobs": collector_config,
                     }),
+                    use_current_daemon_image=False,
                 )
                 with with_service(cephadm_module, agent_spec):
                     _run_cephadm.assert_called_with(
@@ -2486,4 +2921,270 @@ class TestJaeger:
                             },
                             "config_blobs": agent_config,
                         }),
+                        use_current_daemon_image=False,
                     )
+
+
+class TestCustomContainer:
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_deploy_custom_container(
+        self, _run_cephadm, cephadm_module: CephadmOrchestrator
+    ):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        spec = CustomContainerSpec(
+            service_id='tsettinu',
+            image='quay.io/foobar/barbaz:latest',
+            entrypoint='/usr/local/bin/blat.sh',
+            ports=[9090],
+        )
+
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, spec):
+                _run_cephadm.assert_called_with(
+                    'test',
+                    "container.tsettinu.test",
+                    ['_orch', 'deploy'],
+                    [],
+                    stdin=json.dumps(
+                        {
+                            "fsid": "fsid",
+                            "name": 'container.tsettinu.test',
+                            "image": 'quay.io/foobar/barbaz:latest',
+                            "deploy_arguments": [],
+                            "params": {
+                                'tcp_ports': [9090],
+                            },
+                            "meta": {
+                                'service_name': 'container.tsettinu',
+                                'ports': [],
+                                'ip': None,
+                                'deployed_by': [],
+                                'rank': None,
+                                'rank_generation': None,
+                                'extra_container_args': None,
+                                'extra_entrypoint_args': None,
+                            },
+                            "config_blobs": {
+                                "image": "quay.io/foobar/barbaz:latest",
+                                "entrypoint": "/usr/local/bin/blat.sh",
+                                "args": [],
+                                "envs": [],
+                                "volume_mounts": {},
+                                "privileged": False,
+                                "ports": [9090],
+                                "dirs": [],
+                                "files": {},
+                            },
+                        }
+                    ),
+                    use_current_daemon_image=False,
+                )
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_deploy_custom_container_with_init_ctrs(
+        self, _run_cephadm, cephadm_module: CephadmOrchestrator
+    ):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        spec = CustomContainerSpec(
+            service_id='tsettinu',
+            image='quay.io/foobar/barbaz:latest',
+            entrypoint='/usr/local/bin/blat.sh',
+            ports=[9090],
+            init_containers=[
+                {'entrypoint': '/usr/local/bin/prepare.sh'},
+                {
+                    'entrypoint': '/usr/local/bin/optimize.sh',
+                    'entrypoint_args': [
+                        '--timeout=5m',
+                        '--cores=8',
+                        {'argument': '--title=Alpha One'},
+                    ],
+                },
+            ],
+        )
+
+        expected = {
+            'fsid': 'fsid',
+            'name': 'container.tsettinu.test',
+            'image': 'quay.io/foobar/barbaz:latest',
+            'deploy_arguments': [],
+            'params': {
+                'tcp_ports': [9090],
+                'init_containers': [
+                    {'entrypoint': '/usr/local/bin/prepare.sh'},
+                    {
+                        'entrypoint': '/usr/local/bin/optimize.sh',
+                        'entrypoint_args': [
+                            '--timeout=5m',
+                            '--cores=8',
+                            '--title=Alpha One',
+                        ],
+                    },
+                ],
+            },
+            'meta': {
+                'service_name': 'container.tsettinu',
+                'ports': [],
+                'ip': None,
+                'deployed_by': [],
+                'rank': None,
+                'rank_generation': None,
+                'extra_container_args': None,
+                'extra_entrypoint_args': None,
+                'init_containers': [
+                    {'entrypoint': '/usr/local/bin/prepare.sh'},
+                    {
+                        'entrypoint': '/usr/local/bin/optimize.sh',
+                        'entrypoint_args': [
+                            '--timeout=5m',
+                            '--cores=8',
+                            {'argument': '--title=Alpha One', 'split': False},
+                        ],
+                    },
+                ],
+            },
+            'config_blobs': {
+                'image': 'quay.io/foobar/barbaz:latest',
+                'entrypoint': '/usr/local/bin/blat.sh',
+                'args': [],
+                'envs': [],
+                'volume_mounts': {},
+                'privileged': False,
+                'ports': [9090],
+                'dirs': [],
+                'files': {},
+            },
+        }
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, spec):
+                _run_cephadm.assert_called_with(
+                    'test',
+                    'container.tsettinu.test',
+                    ['_orch', 'deploy'],
+                    [],
+                    stdin=json.dumps(expected),
+                    use_current_daemon_image=False,
+                )
+
+
+class TestSMB:
+    @patch("cephadm.module.CephadmOrchestrator.get_unique_name")
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_deploy_smb(
+        self, _run_cephadm, _get_uname, cephadm_module: CephadmOrchestrator
+    ):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+        _get_uname.return_value = 'tango.briskly'
+
+        spec = SMBSpec(
+            cluster_id='foxtrot',
+            config_uri='rados://.smb/foxtrot/config.json',
+        )
+
+        expected = {
+            'fsid': 'fsid',
+            'name': 'smb.tango.briskly',
+            'image': '',
+            'deploy_arguments': [],
+            'params': {},
+            'meta': {
+                'service_name': 'smb',
+                'ports': [],
+                'ip': None,
+                'deployed_by': [],
+                'rank': None,
+                'rank_generation': None,
+                'extra_container_args': None,
+                'extra_entrypoint_args': None,
+            },
+            'config_blobs': {
+                'cluster_id': 'foxtrot',
+                'features': [],
+                'config_uri': 'rados://.smb/foxtrot/config.json',
+                'config': '',
+                'keyring': '[client.smb.config.tango.briskly]\nkey = None\n',
+                'config_auth_entity': 'client.smb.config.tango.briskly',
+            },
+        }
+        with with_host(cephadm_module, 'hostx'):
+            with with_service(cephadm_module, spec):
+                _run_cephadm.assert_called_with(
+                    'hostx',
+                    'smb.tango.briskly',
+                    ['_orch', 'deploy'],
+                    [],
+                    stdin=json.dumps(expected),
+                    use_current_daemon_image=False,
+                )
+
+    @patch("cephadm.module.CephadmOrchestrator.get_unique_name")
+    @patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_deploy_smb_join_dns(
+        self, _run_cephadm, _get_uname, cephadm_module: CephadmOrchestrator
+    ):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+        _get_uname.return_value = 'tango.briskly'
+
+        spec = SMBSpec(
+            cluster_id='foxtrot',
+            features=['domain'],
+            config_uri='rados://.smb/foxtrot/config2.json',
+            join_sources=[
+                'rados://.smb/foxtrot/join1.json',
+                'rados:mon-config-key:smb/config/foxtrot/join2.json',
+            ],
+            custom_dns=['10.8.88.103'],
+            include_ceph_users=[
+                'client.smb.fs.cephfs.share1',
+                'client.smb.fs.cephfs.share2',
+                'client.smb.fs.fs2.share3',
+            ],
+        )
+
+        expected = {
+            'fsid': 'fsid',
+            'name': 'smb.tango.briskly',
+            'image': '',
+            'deploy_arguments': [],
+            'params': {},
+            'meta': {
+                'service_name': 'smb',
+                'ports': [],
+                'ip': None,
+                'deployed_by': [],
+                'rank': None,
+                'rank_generation': None,
+                'extra_container_args': None,
+                'extra_entrypoint_args': None,
+            },
+            'config_blobs': {
+                'cluster_id': 'foxtrot',
+                'features': ['domain'],
+                'config_uri': 'rados://.smb/foxtrot/config2.json',
+                'join_sources': [
+                    'rados://.smb/foxtrot/join1.json',
+                    'rados:mon-config-key:smb/config/foxtrot/join2.json',
+                ],
+                'custom_dns': ['10.8.88.103'],
+                'config': '',
+                'keyring': (
+                    '[client.smb.config.tango.briskly]\nkey = None\n\n'
+                    '[client.smb.fs.cephfs.share1]\nkey = None\n\n'
+                    '[client.smb.fs.cephfs.share2]\nkey = None\n\n'
+                    '[client.smb.fs.fs2.share3]\nkey = None\n'
+                ),
+                'config_auth_entity': 'client.smb.config.tango.briskly',
+            },
+        }
+        with with_host(cephadm_module, 'hostx'):
+            with with_service(cephadm_module, spec):
+                _run_cephadm.assert_called_with(
+                    'hostx',
+                    'smb.tango.briskly',
+                    ['_orch', 'deploy'],
+                    [],
+                    stdin=json.dumps(expected),
+                    use_current_daemon_image=False,
+                )

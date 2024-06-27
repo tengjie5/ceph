@@ -78,10 +78,9 @@ Heartbeat::start_messenger(crimson::net::Messenger& msgr,
 {
   return msgr.bind(addrs).safe_then([this, &msgr]() mutable {
     return msgr.start({this});
-  }, crimson::net::Messenger::bind_ertr::all_same_way(
+  }, crimson::net::Messenger::bind_ertr::assert_all_func(
       [addrs] (const std::error_code& e) {
     logger().error("heartbeat messenger bind({}): {}", addrs, e);
-    ceph_abort();
   }));
 }
 
@@ -238,9 +237,9 @@ void Heartbeat::ms_handle_reset(crimson::net::ConnectionRef conn, bool is_replac
 
 void Heartbeat::ms_handle_connect(
     crimson::net::ConnectionRef conn,
-    seastar::shard_id new_shard)
+    seastar::shard_id prv_shard)
 {
-  ceph_assert_always(seastar::this_shard_id() == new_shard);
+  ceph_assert_always(seastar::this_shard_id() == prv_shard);
   auto peer = conn->get_peer_id();
   if (conn->get_peer_type() != entity_name_t::TYPE_OSD ||
       peer == entity_name_t::NEW) {
@@ -254,10 +253,10 @@ void Heartbeat::ms_handle_connect(
 
 void Heartbeat::ms_handle_accept(
     crimson::net::ConnectionRef conn,
-    seastar::shard_id new_shard,
+    seastar::shard_id prv_shard,
     bool is_replace)
 {
-  ceph_assert_always(seastar::this_shard_id() == new_shard);
+  ceph_assert_always(seastar::this_shard_id() == prv_shard);
   auto peer = conn->get_peer_id();
   if (conn->get_peer_type() != entity_name_t::TYPE_OSD ||
       peer == entity_name_t::NEW) {
@@ -333,9 +332,8 @@ seastar::future<> Heartbeat::maybe_share_osdmap(
     return seastar::now();
   }
 
-  const epoch_t send_from = peer.get_projected_epoch();
-  logger().debug("{} sending peer {} peer maps from projected epoch {} through "
-		 "local osdmap epoch {}",
+  const epoch_t send_from = peer.get_projected_epoch() + 1;
+  logger().debug("{} sending peer {} peer maps ({}, {}]",
 		 __func__,
 		 from,
 		 send_from,

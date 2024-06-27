@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import re
-from io import StringIO
 
 from tasks.ceph_test_case import CephTestCase
 
@@ -11,6 +10,12 @@ from teuthology.orchestra import run
 from teuthology.exceptions import CommandFailedError
 
 log = logging.getLogger(__name__)
+
+def classhook(m):
+    def dec(cls):
+        getattr(cls, m)()
+        return cls
+    return dec
 
 def for_teuthology(f):
     """
@@ -48,32 +53,7 @@ class MountDetails():
         mntobj.hostfs_mntpt = self.hostfs_mntpt
 
 
-class RunCephCmd:
-
-    def run_ceph_cmd(self, *args, **kwargs):
-        if kwargs.get('args') is None and args:
-            if len(args) == 1:
-                args = args[0]
-            kwargs['args'] = args
-        return self.mon_manager.run_cluster_cmd(**kwargs)
-
-    def get_ceph_cmd_result(self, *args, **kwargs):
-        if kwargs.get('args') is None and args:
-            if len(args) == 1:
-                args = args[0]
-            kwargs['args'] = args
-        return self.run_ceph_cmd(**kwargs).exitstatus
-
-    def get_ceph_cmd_stdout(self, *args, **kwargs):
-        if kwargs.get('args') is None and args:
-            if len(args) == 1:
-                args = args[0]
-            kwargs['args'] = args
-        kwargs['stdout'] = kwargs.pop('stdout', StringIO())
-        return self.run_ceph_cmd(**kwargs).stdout.getvalue()
-
-
-class CephFSTestCase(CephTestCase, RunCephCmd):
+class CephFSTestCase(CephTestCase):
     """
     Test case for Ceph FS, requires caller to populate Filesystem and Mounts,
     into the fs, mount_a, mount_b class attributes (setting mount_b is optional)
@@ -100,6 +80,13 @@ class CephFSTestCase(CephTestCase, RunCephCmd):
     REQUIRE_BACKUP_FILESYSTEM = False
 
     LOAD_SETTINGS = [] # type: ignore
+
+    def _reqid_tostr(self, reqid):
+        """
+        Change a json reqid to a string representation.
+        """
+
+        return f"{reqid['entity']['type']}.{reqid['entity']['num']}:{reqid['tid']}"
 
     def _save_mount_details(self):
         """
@@ -131,21 +118,8 @@ class CephFSTestCase(CephTestCase, RunCephCmd):
                 for addr, blocklisted_at in blacklist.items():
                     self.run_ceph_cmd("osd", "blacklist", "rm", addr)
 
-    def _init_mon_manager(self):
-        # if vstart_runner.py has invoked this code
-        if 'Local' in str(type(self.ceph_cluster)):
-            from tasks.vstart_runner import LocalCephManager
-            self.mon_manager = LocalCephManager(ctx=self.ctx)
-        # else teuthology has invoked this code
-        else:
-            from tasks.ceph_manager import CephManager
-            self.mon_manager = CephManager(self.ceph_cluster.admin_remote,
-                ctx=self.ctx, logger=log.getChild('ceph_manager'))
-
     def setUp(self):
         super(CephFSTestCase, self).setUp()
-        self._init_mon_manager()
-        self.admin_remote = self.ceph_cluster.admin_remote
 
         self.config_set('mon', 'mon_allow_pool_delete', True)
 
@@ -227,7 +201,7 @@ class CephFSTestCase(CephTestCase, RunCephCmd):
         # Load an config settings of interest
         for setting in self.LOAD_SETTINGS:
             setattr(self, setting, float(self.fs.mds_asok(
-                ['config', 'get', setting], list(self.mds_cluster.mds_ids)[0]
+                ['config', 'get', setting], mds_id=list(self.mds_cluster.mds_ids)[0]
             )[setting]))
 
         self.configs_set = set()
@@ -372,6 +346,7 @@ class CephFSTestCase(CephTestCase, RunCephCmd):
                             subtrees = []
                             for r in self.fs.get_ranks(status=status):
                                 s = self.fs.rank_asok(["get", "subtrees"], status=status, rank=r['rank'])
+                                log.debug(f"{json.dumps(s, indent=2)}")
                                 s = filter(lambda s: s['auth_first'] == r['rank'] and s['auth_second'] == -2, s)
                                 subtrees += s
                         else:
@@ -417,11 +392,15 @@ class CephFSTestCase(CephTestCase, RunCephCmd):
             with contextutil.safe_while(sleep=5, tries=20) as proceed:
                 while proceed():
                     subtrees = self._get_subtrees(status=status, rank=rank, path=path)
-                    subtrees = list(filter(lambda s: s['distributed_ephemeral_pin'] == True and
-                                                     s['auth_first'] == s['export_pin_target'],
-                                           subtrees))
-                    log.info(f"len={len(subtrees)} {subtrees}")
+                    dist = list(filter(lambda s: s['distributed_ephemeral_pin'] == True and
+                                                 s['auth_first'] == s['export_pin_target'],
+                                       subtrees))
+                    log.info(f"len={len(dist)}\n{json.dumps(dist, indent=2)}")
+
                     if len(subtrees) >= count:
+                        if len(subtrees) > len(dist):
+                            # partial migration
+                            continue
                         return subtrees
         except contextutil.MaxWhileTries as e:
             raise RuntimeError("rank {0} failed to reach desired subtree state".format(rank)) from e
@@ -458,4 +437,4 @@ class CephFSTestCase(CephTestCase, RunCephCmd):
             cmd += ['mds', mdscap]
 
         self.run_ceph_cmd(*cmd)
-        return self.run_ceph_cmd(f'auth get {self.client_name}')
+        return self.get_ceph_cmd_stdout(f'auth get {self.client_name}')

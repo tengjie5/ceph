@@ -45,6 +45,7 @@ enum {
   l_mdssm_total_load,
   l_mdssm_avg_load,
   l_mdssm_avg_session_uptime,
+  l_mdssm_metadata_threshold_sessions_evicted,
   l_mdssm_last,
 };
 
@@ -594,7 +595,7 @@ protected:
 class SessionMap : public SessionMapStore {
 public:
   SessionMap() = delete;
-  explicit SessionMap(MDSRank *m) : mds(m) {}
+  explicit SessionMap(MDSRank *m);
 
   ~SessionMap() override
   {
@@ -680,6 +681,16 @@ public:
   void add_session(Session *s);
   void remove_session(Session *s);
   void touch_session(Session *session);
+
+  void add_to_broken_root_squash_clients(Session* s) {
+    broken_root_squash_clients.insert(s);
+  }
+  uint64_t num_broken_root_squash_clients() const {
+    return broken_root_squash_clients.size();
+  }
+  auto const& get_broken_root_squash_clients() const {
+    return broken_root_squash_clients;
+  }
 
   Session *get_oldest_session(int state) {
     auto by_state_entry = by_state.find(state);
@@ -843,6 +854,13 @@ private:
   }
 
   time avg_birth_time = clock::zero();
+
+  size_t mds_session_metadata_threshold;
+
+  bool validate_and_encode_session(MDSRank *mds, Session *session, bufferlist& bl);
+  void apply_blocklist(const std::set<entity_name_t>& victims);
+
+  std::set<Session*> broken_root_squash_clients;
 };
 
 std::ostream& operator<<(std::ostream &out, const Session &s);

@@ -1,6 +1,6 @@
 import { Component, OnInit, ViewChild } from '@angular/core';
 import { FormControl, Validators } from '@angular/forms';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import _ from 'lodash';
 
 import { NgbNav, NgbTooltip, NgbTypeahead } from '@ng-bootstrap/ng-bootstrap';
@@ -21,6 +21,7 @@ import { CdValidators } from '~/app/shared/forms/cd-validators';
 import { FinishedTask } from '~/app/shared/models/finished-task';
 import { Permission } from '~/app/shared/models/permissions';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
+import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
 
 @Component({
   selector: 'cd-cephfs-form',
@@ -49,6 +50,12 @@ export class CephfsVolumeFormComponent extends CdForm implements OnInit {
   hosts: any;
   labels: string[];
   hasOrchestrator: boolean;
+  currentVolumeName: string;
+  fsId: number;
+  disableRename: boolean = true;
+
+  fsFailCmd: string;
+  fsSetCmd: string;
 
   constructor(
     private router: Router,
@@ -57,12 +64,13 @@ export class CephfsVolumeFormComponent extends CdForm implements OnInit {
     private formBuilder: CdFormBuilder,
     public actionLabels: ActionLabelsI18n,
     private hostService: HostService,
-    private cephfsService: CephfsService
+    private cephfsService: CephfsService,
+    private route: ActivatedRoute
   ) {
     super();
-    this.editing = this.router.url.startsWith(`/pool/${URLVerbs.EDIT}`);
+    this.editing = this.router.url.startsWith(`/cephfs/fs/${URLVerbs.EDIT}`);
     this.action = this.editing ? this.actionLabels.EDIT : this.actionLabels.CREATE;
-    this.resource = $localize`volume`;
+    this.resource = $localize`File System`;
     this.hosts = {
       options: [],
       messages: new SelectMessages({
@@ -79,7 +87,10 @@ export class CephfsVolumeFormComponent extends CdForm implements OnInit {
     });
     this.form = this.formBuilder.group({
       name: new FormControl('', {
-        validators: [Validators.pattern(/^[.A-Za-z0-9_/-]+$/), Validators.required]
+        validators: [
+          Validators.pattern(/^(?:[.][A-Za-z0-9_-]+|[A-Za-z][.A-Za-z0-9_-]*)$/),
+          Validators.required
+        ]
       }),
       placement: ['hosts'],
       hosts: [[]],
@@ -97,19 +108,40 @@ export class CephfsVolumeFormComponent extends CdForm implements OnInit {
   }
 
   ngOnInit() {
-    this.hostService.list('false').subscribe((resp: object[]) => {
-      const options: SelectOption[] = [];
-      _.forEach(resp, (host: object) => {
-        if (_.get(host, 'sources.orchestrator', false)) {
-          const option = new SelectOption(false, _.get(host, 'hostname'), '');
-          options.push(option);
+    if (this.editing) {
+      this.route.params.subscribe((params: { id: string }) => {
+        this.fsId = Number(params.id);
+      });
+
+      this.cephfsService.getCephfs(this.fsId).subscribe((resp: object) => {
+        this.currentVolumeName = resp['cephfs']['name'];
+        this.form.get('name').setValue(this.currentVolumeName);
+
+        this.disableRename = !(
+          !resp['cephfs']['flags']['joinable'] && resp['cephfs']['flags']['refuse_client_session']
+        );
+        if (this.disableRename) {
+          this.form.get('name').disable();
+          this.fsFailCmd = `ceph fs fail ${this.currentVolumeName}`;
+          this.fsSetCmd = `ceph fs set ${this.currentVolumeName} refuse_client_session true`;
         }
       });
-      this.hosts.options = [...options];
-    });
-    this.hostService.getLabels().subscribe((resp: string[]) => {
-      this.labels = resp;
-    });
+    } else {
+      const hostContext = new CdTableFetchDataContext(() => undefined);
+      this.hostService.list(hostContext.toParams(), 'false').subscribe((resp: object[]) => {
+        const options: SelectOption[] = [];
+        _.forEach(resp, (host: object) => {
+          if (_.get(host, 'sources.orchestrator', false)) {
+            const option = new SelectOption(false, _.get(host, 'hostname'), '');
+            options.push(option);
+          }
+        });
+        this.hosts.options = [...options];
+      });
+      this.hostService.getLabels().subscribe((resp: string[]) => {
+        this.labels = resp;
+      });
+    }
     this.orchStatus$ = this.orchService.status();
   }
 
@@ -128,39 +160,59 @@ export class CephfsVolumeFormComponent extends CdForm implements OnInit {
   };
 
   submit() {
-    let values = this.form.getRawValue();
-    const serviceSpec: object = {
-      placement: {},
-      unmanaged: values['unmanaged']
-    };
-    switch (values['placement']) {
-      case 'hosts':
-        if (values['hosts'].length > 0) {
-          serviceSpec['placement']['hosts'] = values['hosts'];
-        }
-        break;
-      case 'label':
-        serviceSpec['placement']['label'] = values['label'];
-        break;
-    }
-
     const volumeName = this.form.get('name').value;
-    const self = this;
-    let taskUrl = `cephfs/${URLVerbs.CREATE}`;
-    this.taskWrapperService
-      .wrapTaskAroundCall({
-        task: new FinishedTask(taskUrl, {
-          volumeName: volumeName
-        }),
-        call: this.cephfsService.create(this.form.get('name').value, serviceSpec)
-      })
-      .subscribe({
-        error() {
-          self.form.setErrors({ cdSubmitButton: true });
-        },
-        complete: () => {
-          this.router.navigate(['cephfs']);
-        }
-      });
+    const BASE_URL = 'cephfs';
+
+    if (this.editing) {
+      this.taskWrapperService
+        .wrapTaskAroundCall({
+          task: new FinishedTask(`${BASE_URL}/${URLVerbs.EDIT}`, {
+            volumeName: volumeName
+          }),
+          call: this.cephfsService.rename(this.currentVolumeName, volumeName)
+        })
+        .subscribe({
+          error: () => {
+            this.form.setErrors({ cdSubmitButton: true });
+          },
+          complete: () => {
+            this.router.navigate([`${BASE_URL}/fs`]);
+          }
+        });
+    } else {
+      let values = this.form.getRawValue();
+      const serviceSpec: object = {
+        placement: {},
+        unmanaged: values['unmanaged']
+      };
+      switch (values['placement']) {
+        case 'hosts':
+          if (values['hosts'].length > 0) {
+            serviceSpec['placement']['hosts'] = values['hosts'];
+          }
+          break;
+        case 'label':
+          serviceSpec['placement']['label'] = values['label'];
+          break;
+      }
+
+      const self = this;
+      let taskUrl = `${BASE_URL}/${URLVerbs.CREATE}`;
+      this.taskWrapperService
+        .wrapTaskAroundCall({
+          task: new FinishedTask(taskUrl, {
+            volumeName: volumeName
+          }),
+          call: this.cephfsService.create(this.form.get('name').value, serviceSpec)
+        })
+        .subscribe({
+          error() {
+            self.form.setErrors({ cdSubmitButton: true });
+          },
+          complete: () => {
+            this.router.navigate([`${BASE_URL}/fs`]);
+          }
+        });
+    }
   }
 }

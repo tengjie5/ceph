@@ -29,16 +29,16 @@ public:
  */
 private:
   seastar::future<> notify_out(
-      crosscore_t::seq_t cc_seq) final;
+      cc_seq_t cc_seq) final;
 
   seastar::future<> notify_out_fault(
-      crosscore_t::seq_t cc_seq,
+      cc_seq_t cc_seq,
       const char *where,
       std::exception_ptr,
       io_handler_state) final;
 
   seastar::future<> notify_mark_down(
-      crosscore_t::seq_t cc_seq) final;
+      cc_seq_t cc_seq) final;
 
 /*
 * as ProtocolV2 to be called by SocketConnection
@@ -53,6 +53,14 @@ public:
   seastar::future<> close_clean_yielded();
 
 #ifdef UNIT_TESTS_BUILT
+  bool is_ready() const {
+    return state == state_t::READY;
+  }
+
+  bool is_standby() const {
+    return state == state_t::STANDBY;
+  }
+
   bool is_closed_clean() const {
     return closed_clean;
   }
@@ -243,7 +251,7 @@ private:
   // asynchronously populated from io_handler
   io_handler_state io_states;
 
-  crosscore_t crosscore;
+  proto_crosscore_ordering_t crosscore;
 
   bool has_socket = false;
 

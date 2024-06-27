@@ -1,19 +1,147 @@
 import errno
 import json
 import logging
-import time
 import uuid
 from io import StringIO
 from os.path import join as os_path_join
+import re
+from time import sleep
 
 from teuthology.exceptions import CommandFailedError
+from teuthology.contextutil import safe_while
 
-from tasks.cephfs.cephfs_test_case import CephFSTestCase
+from tasks.cephfs.cephfs_test_case import CephFSTestCase, classhook
 from tasks.cephfs.filesystem import FileLayout, FSMissing
 from tasks.cephfs.fuse_mount import FuseMount
-from tasks.cephfs.caps_helper import CapTester
+from tasks.cephfs.caps_helper import (CapTester, gen_mon_cap_str,
+                                      gen_osd_cap_str, gen_mds_cap_str)
 
 log = logging.getLogger(__name__)
+MDS_RESTART_GRACE = 60
+
+class TestLabeledPerfCounters(CephFSTestCase):
+    CLIENTS_REQUIRED = 2
+    MDSS_REQUIRED = 1
+
+    def _get_counters_for(self, filesystem, client_id):
+        dump = self.fs.rank_tell(["counter", "dump"])
+        per_client_metrics_key = f'mds_client_metrics-{filesystem}'
+        counters = [c["counters"] for \
+                    c in dump[per_client_metrics_key] if c["labels"]["client"] == client_id]
+        return counters[0]
+
+    def test_per_client_labeled_perf_counters_on_client_disconnect(self):
+        """
+        That the per-client labelled metrics are unavailable during client disconnect
+        """
+        mount_a_id = f'client.{self.mount_a.get_global_id()}'
+        self.mount_a.teardown()
+        with safe_while(sleep=1, tries=30, action=f'wait for counters - {mount_a_id}') as proceed:
+            while proceed():
+                dump = self.fs.rank_tell(["counter", "dump"])
+                per_client_metrics_key = f"mds_client_metrics-{dump['mds_client_metrics'][0]['labels']['fs_name']}"
+                clients = [c["labels"]["client"] for c in dump.get(per_client_metrics_key, {})]
+                if clients and mount_a_id not in clients:
+                    # success, no metrics.
+                    return True
+
+    def test_per_client_labeled_perf_counters_on_client_reconnect(self):
+        """
+        That the per-client labelled metrics are generated during client reconnect
+        """
+        # fail active mds and wait for reconnect
+        mds = self.fs.get_active_names()[0]
+        self.mds_cluster.mds_fail(mds)
+        self.fs.wait_for_state('up:active', rank=0, timeout=MDS_RESTART_GRACE)
+        mount_a_id = f'client.{self.mount_a.get_global_id()}'
+        mount_b_id = f'client.{self.mount_b.get_global_id()}'
+        fs_suffix = ""
+
+        with safe_while(sleep=1, tries=30, action='wait for counters') as proceed:
+            while proceed():
+                dump = self.fs.rank_tell(["counter", "dump"])
+                fs_suffix = dump['mds_client_metrics'][0]['labels']['fs_name']
+                per_client_metrics_key = f"mds_client_metrics-{fs_suffix}"
+                clients = [c["labels"]["client"] for c in dump.get(per_client_metrics_key, {})]
+                if mount_a_id in clients and mount_b_id in clients:
+                    # success, got metrics.
+                    break # break to continue the test
+
+        # Post reconnecting, validate the io perf counters
+        # write workload
+        self.mount_a.create_n_files("test_dir/test_file", 1000, sync=True)
+        with safe_while(sleep=1, tries=30, action=f'wait for counters - {mount_a_id}') as proceed:
+            while proceed():
+                counters_dump_a = self._get_counters_for(fs_suffix, mount_a_id)
+                if counters_dump_a["total_write_ops"] > 0 and counters_dump_a["total_write_size"] > 0 and \
+                   counters_dump_a["avg_write_latency"] >= 0 and counters_dump_a["avg_metadata_latency"] >= 0 and  \
+                   counters_dump_a["opened_files"] >= 0 and counters_dump_a["opened_inodes"] > 0 and \
+                   counters_dump_a["cap_hits"] > 0 and counters_dump_a["dentry_lease_hits"] > 0 and \
+                   counters_dump_a["pinned_icaps"] > 0:
+                    break # break to continue the test
+
+        # read from the other client
+        for i in range(100):
+            self.mount_b.open_background(basename=f'test_dir/test_file_{i}', write=False)
+        with safe_while(sleep=1, tries=30, action=f'wait for counters - {mount_b_id}') as proceed:
+            while proceed():
+                counters_dump_b = self._get_counters_for(fs_suffix, mount_b_id)
+                if counters_dump_b["total_read_ops"] >= 0 and counters_dump_b["total_read_size"] >= 0 and \
+                   counters_dump_b["avg_read_latency"] >= 0 and counters_dump_b["avg_metadata_latency"] >= 0 and \
+                   counters_dump_b["opened_files"] >= 0 and counters_dump_b["opened_inodes"] >= 0 and \
+                   counters_dump_b["cap_hits"] > 0 and counters_dump_a["dentry_lease_hits"] > 0 and \
+                   counters_dump_b["pinned_icaps"] > 0:
+                    break # break to continue the test
+        self.mount_a.teardown()
+        self.mount_b.teardown()
+
+    def test_per_client_labeled_perf_counters_io(self):
+        """
+        That the per-client labelled perf counters depict the clients performing IO.
+        """
+        # sleep a bit so that we get updated clients...
+        sleep(10)
+
+        # lookout for clients...
+        dump = self.fs.rank_tell(["counter", "dump"])
+
+        fs_suffix = dump["mds_client_metrics"][0]["labels"]["fs_name"]
+        self.assertGreaterEqual(dump["mds_client_metrics"][0]["counters"]["num_clients"], 2)
+
+        per_client_metrics_key = f'mds_client_metrics-{fs_suffix}'
+        mount_a_id = f'client.{self.mount_a.get_global_id()}'
+        mount_b_id = f'client.{self.mount_b.get_global_id()}'
+
+        clients = [c["labels"]["client"] for c in dump[per_client_metrics_key]]
+        self.assertIn(mount_a_id, clients)
+        self.assertIn(mount_b_id, clients)
+
+        # write workload
+        self.mount_a.create_n_files("test_dir/test_file", 1000, sync=True)
+        with safe_while(sleep=1, tries=30, action=f'wait for counters - {mount_a_id}') as proceed:
+            while proceed():
+                counters_dump_a = self._get_counters_for(fs_suffix, mount_a_id)
+                if counters_dump_a["total_write_ops"] > 0 and counters_dump_a["total_write_size"] > 0 and \
+                   counters_dump_a["avg_write_latency"] >= 0 and counters_dump_a["avg_metadata_latency"] >= 0 and  \
+                   counters_dump_a["opened_files"] >= 0 and counters_dump_a["opened_inodes"] > 0 and \
+                   counters_dump_a["cap_hits"] > 0 and counters_dump_a["dentry_lease_hits"] > 0 and \
+                   counters_dump_a["pinned_icaps"] > 0:
+                    break # break to continue the test
+
+        # read from the other client
+        for i in range(100):
+            self.mount_b.open_background(basename=f'test_dir/test_file_{i}', write=False)
+        with safe_while(sleep=1, tries=30, action=f'wait for counters - {mount_b_id}') as proceed:
+            while proceed():
+                counters_dump_b = self._get_counters_for(fs_suffix, mount_b_id)
+                if counters_dump_b["total_read_ops"] >= 0 and counters_dump_b["total_read_size"] >= 0 and \
+                   counters_dump_b["avg_read_latency"] >= 0 and counters_dump_b["avg_metadata_latency"] >= 0 and \
+                   counters_dump_b["opened_files"] >= 0 and counters_dump_b["opened_inodes"] >= 0 and \
+                   counters_dump_b["cap_hits"] > 0 and counters_dump_a["dentry_lease_hits"] > 0 and \
+                   counters_dump_b["pinned_icaps"] > 0:
+                    break # break to continue the test
+        self.mount_a.teardown()
+        self.mount_b.teardown()
 
 class TestAdminCommands(CephFSTestCase):
     """
@@ -37,6 +165,168 @@ class TestAdminCommands(CephFSTestCase):
         if overwrites:
             self.run_ceph_cmd('osd', 'pool', 'set', n+"-data", 'allow_ec_overwrites', 'true')
 
+    def _get_unhealthy_mds_id(self, health_report, health_warn):
+        '''
+        Return MDS ID for which health warning in "health_warn" has been
+        generated.
+        '''
+        # variable "msg" should hold string something like this -
+        # 'mds.b(mds.0): Behind on trimming (865/10) max_segments: 10,
+        # num_segments: 86
+        msg = health_report['checks'][health_warn]['detail'][0]['message']
+        mds_id = msg.split('(')[0]
+        mds_id = mds_id.replace('mds.', '')
+        return mds_id
+
+    def wait_till_health_warn(self, health_warn, active_mds_id, sleep=3,
+                              tries=10):
+        errmsg = (f'Expected health warning "{health_warn}" to eventually '
+                  'show up in output of command "ceph health detail". Tried '
+                  f'{tries} times with interval of {sleep} seconds but the '
+                  'health warning didn\'t turn up.')
+
+        with safe_while(sleep=sleep, tries=tries, action=errmsg) as proceed:
+            while proceed():
+                self.get_ceph_cmd_stdout(
+                    f'tell mds.{active_mds_id} cache status')
+
+                health_report = json.loads(self.get_ceph_cmd_stdout(
+                    'health detail --format json'))
+
+                if health_warn in health_report['checks']:
+                    return
+
+
+class TestMdsLastSeen(CephFSTestCase):
+    """
+    Tests for `mds last-seen` command.
+    """
+
+    MDSS_REQUIRED = 2
+
+    def test_in_text(self):
+        """
+        That `mds last-seen` returns 0 for an MDS currently in the map.
+        """
+
+        status = self.fs.status()
+        r0 = self.fs.get_rank(0, status=status)
+        s = self.get_ceph_cmd_stdout("mds", "last-seen", r0['name'])
+        seconds = int(re.match(r"^(\d+)s$", s).group(1))
+        self.assertEqual(seconds, 0)
+
+    def test_in_json(self):
+        """
+        That `mds last-seen` returns 0 for an MDS currently in the map.
+        """
+
+        status = self.fs.status()
+        r0 = self.fs.get_rank(0, status=status)
+        s = self.get_ceph_cmd_stdout("--format=json", "mds", "last-seen", r0['name'])
+        J = json.loads(s)
+        seconds = int(re.match(r"^(\d+)s$", J['last-seen']).group(1))
+        self.assertEqual(seconds, 0)
+
+    def test_unknown(self):
+        """
+        That `mds last-seen` returns ENOENT for an mds not in recent maps.
+        """
+
+        try:
+            self.get_ceph_cmd_stdout("--format=json", "mds", "last-seen", 'foo')
+        except CommandFailedError as e:
+            self.assertEqual(e.exitstatus, errno.ENOENT)
+        else:
+            self.fail("non-existent mds should fail ENOENT")
+
+    def test_standby(self):
+        """
+        That `mds last-seen` returns 0 for a standby.
+        """
+
+        status = self.fs.status()
+        for info in status.get_standbys():
+            s = self.get_ceph_cmd_stdout("--format=json", "mds", "last-seen", info['name'])
+            J = json.loads(s)
+            seconds = int(re.match(r"^(\d+)s$", J['last-seen']).group(1))
+            self.assertEqual(seconds, 0)
+
+    def test_stopped(self):
+        """
+        That `mds last-seen` returns >0 for mds that is stopped.
+        """
+
+        status = self.fs.status()
+        r0 = self.fs.get_rank(0, status=status)
+        self.fs.mds_stop(mds_id=r0['name'])
+        self.fs.rank_fail()
+        sleep(2)
+        with safe_while(sleep=1, tries=self.fs.beacon_timeout, action='wait for last-seen >0') as proceed:
+            while proceed():
+                s = self.get_ceph_cmd_stdout("--format=json", "mds", "last-seen", r0['name'])
+                J = json.loads(s)
+                seconds = int(re.match(r"^(\d+)s$", J['last-seen']).group(1))
+                if seconds == 0:
+                    continue
+                self.assertGreater(seconds, 1)
+                break
+
+    def test_gc(self):
+        """
+        That historical mds information is eventually garbage collected.
+        """
+
+        prune_time = 20
+        sleep_time = 2
+        self.config_set('mon', 'mon_fsmap_prune_threshold', prune_time)
+        status = self.fs.status()
+        r0 = self.fs.get_rank(0, status=status)
+        self.fs.mds_stop(mds_id=r0['name'])
+        self.fs.rank_fail()
+        last = 0
+        for i in range(prune_time):
+            sleep(sleep_time) # we will sleep twice prune_time
+            try:
+                s = self.get_ceph_cmd_stdout("--format=json", "mds", "last-seen", r0['name'])
+                J = json.loads(s)
+                seconds = int(re.match(r"^(\d+)s$", J['last-seen']).group(1))
+                self.assertGreater(seconds, last)
+                log.debug("last_seen: %ds", seconds)
+                last = seconds
+            except CommandFailedError as e:
+                self.assertEqual(e.exitstatus, errno.ENOENT)
+                self.assertGreaterEqual(last + sleep_time + 1, prune_time) # rounding error add 1
+                return
+        self.fail("map was no garbage collected as expected")
+
+@classhook('_add_valid_tell')
+class TestValidTell(TestAdminCommands):
+    @classmethod
+    def _add_valid_tell(cls):
+        tells = [
+          ['cache', 'status'],
+          ['damage', 'ls'],
+          ['dump_blocked_ops'],
+          ['dump_blocked_ops_count'],
+          ['dump_historic_ops'],
+          ['dump_historic_ops_by_duration'],
+          ['dump_mempools'],
+          ['dump_ops_in_flight'],
+          ['flush', 'journal'],
+          ['get', 'subtrees'],
+          ['ops', 'locks'],
+          ['ops'],
+          ['status'],
+          ['version'],
+        ]
+        def test(c):
+            def f(self):
+                J = self.fs.rank_tell(c)
+                json.dumps(J)
+                log.debug("dumped:\n%s", str(J))
+            return f
+        for c in tells:
+            setattr(cls, 'test_valid_' + '_'.join(c), test(c))
 
 class TestFsStatus(TestAdminCommands):
     """
@@ -598,7 +888,13 @@ class TestRenameCommand(TestAdminCommands):
         new_fs_name = 'new_cephfs'
         client_id = 'test_new_cephfs'
 
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         self.run_ceph_cmd(f'fs rename {orig_fs_name} {new_fs_name} --yes-i-really-mean-it')
+        self.run_ceph_cmd(f'fs set {new_fs_name} joinable true')
+        self.run_ceph_cmd(f'fs set {new_fs_name} refuse_client_session false')
+        sleep(5)
 
         # authorize a cephx ID access to the renamed file system.
         # use the ID to write to the file system.
@@ -631,8 +927,14 @@ class TestRenameCommand(TestAdminCommands):
         orig_fs_name = self.fs.name
         new_fs_name = 'new_cephfs'
 
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         self.run_ceph_cmd(f'fs rename {orig_fs_name} {new_fs_name} --yes-i-really-mean-it')
         self.run_ceph_cmd(f'fs rename {orig_fs_name} {new_fs_name} --yes-i-really-mean-it')
+        self.run_ceph_cmd(f'fs set {new_fs_name} joinable true')
+        self.run_ceph_cmd(f'fs set {new_fs_name} refuse_client_session false')
+        sleep(5)
 
         # original file system name does not appear in `fs ls` command
         self.assertFalse(self.fs.exists())
@@ -651,7 +953,13 @@ class TestRenameCommand(TestAdminCommands):
         new_fs_name = 'new_cephfs'
         data_pool = self.fs.get_data_pool_name()
         metadata_pool = self.fs.get_metadata_pool_name()
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         self.run_ceph_cmd(f'fs rename {orig_fs_name} {new_fs_name} --yes-i-really-mean-it')
+        self.run_ceph_cmd(f'fs set {new_fs_name} joinable true')
+        self.run_ceph_cmd(f'fs set {new_fs_name} refuse_client_session false')
+        sleep(5)
 
         try:
             self.run_ceph_cmd(f"fs new {orig_fs_name} {metadata_pool} {data_pool}")
@@ -688,6 +996,9 @@ class TestRenameCommand(TestAdminCommands):
         """
         That renaming a file system without '--yes-i-really-mean-it' flag fails.
         """
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         try:
             self.run_ceph_cmd(f"fs rename {self.fs.name} new_fs")
         except CommandFailedError as ce:
@@ -697,11 +1008,19 @@ class TestRenameCommand(TestAdminCommands):
         else:
             self.fail("expected renaming of file system without the "
                       "'--yes-i-really-mean-it' flag to fail ")
+        self.run_ceph_cmd(f'fs set {self.fs.name} joinable true')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session false')
 
     def test_fs_rename_fails_for_non_existent_fs(self):
         """
         That renaming a non-existent file system fails.
         """
+        self.skipTest('This test is broken ATM; see '
+                      'https://tracker.ceph.com/issues/66088')
+
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         try:
             self.run_ceph_cmd("fs rename non_existent_fs new_fs --yes-i-really-mean-it")
         except CommandFailedError as ce:
@@ -715,6 +1034,9 @@ class TestRenameCommand(TestAdminCommands):
         """
         self.fs2 = self.mds_cluster.newfs(name='cephfs2', create=True)
 
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         try:
             self.run_ceph_cmd(f"fs rename {self.fs.name} {self.fs2.name} --yes-i-really-mean-it")
         except CommandFailedError as ce:
@@ -722,6 +1044,8 @@ class TestRenameCommand(TestAdminCommands):
                              "invalid error code on renaming to a fs name that is already in use")
         else:
             self.fail("expected renaming to a new file system name that is already in use to fail.")
+        self.run_ceph_cmd(f'fs set {self.fs.name} joinable true')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session false')
 
     def test_fs_rename_fails_with_mirroring_enabled(self):
         """
@@ -731,6 +1055,9 @@ class TestRenameCommand(TestAdminCommands):
         new_fs_name = 'new_cephfs'
 
         self.run_ceph_cmd(f'fs mirror enable {orig_fs_name}')
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        sleep(5)
         try:
             self.run_ceph_cmd(f'fs rename {orig_fs_name} {new_fs_name} --yes-i-really-mean-it')
         except CommandFailedError as ce:
@@ -738,6 +1065,57 @@ class TestRenameCommand(TestAdminCommands):
         else:
             self.fail("expected renaming of a mirrored file system to fail")
         self.run_ceph_cmd(f'fs mirror disable {orig_fs_name}')
+        self.run_ceph_cmd(f'fs set {self.fs.name} joinable true')
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session false')
+
+    def test_rename_when_fs_is_online(self):
+        '''
+        Test that the command "ceph fs swap" command fails when first of the
+        two of FSs isn't failed/down.
+        '''
+        client_id = 'test_new_cephfs'
+        new_fs_name = 'new_cephfs'
+
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session true')
+        self.negtest_ceph_cmd(
+            args=(f'fs rename {self.fs.name} {new_fs_name} '
+                   '--yes-i-really-mean-it'),
+            errmsgs=(f"CephFS '{self.fs.name}' is not offline. Before "
+                      "renaming a CephFS, it must be marked as down. See "
+                      "`ceph fs fail`."),
+            retval=errno.EPERM)
+        self.run_ceph_cmd(f'fs set {self.fs.name} refuse_client_session false')
+
+        self.fs.getinfo()
+        keyring = self.fs.authorize(client_id, ('/', 'rw'))
+        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+        self.mount_a.remount(client_id=client_id,
+                             client_keyring_path=keyring_path,
+                             cephfs_mntpt='/',
+                             cephfs_name=self.fs.name)
+
+        self.check_pool_application_metadata_key_value(
+            self.fs.get_data_pool_name(), 'cephfs', 'data', self.fs.name)
+        self.check_pool_application_metadata_key_value(
+            self.fs.get_metadata_pool_name(), 'cephfs', 'metadata',
+            self.fs.name)
+
+    def test_rename_when_clients_not_refused(self):
+        '''
+        Test that "ceph fs rename" fails when client_refuse_session is not
+        set.
+        '''
+        self.mount_a.umount_wait(require_clean=True)
+
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
+        self.negtest_ceph_cmd(
+            args=f"fs rename {self.fs.name} new_fs --yes-i-really-mean-it",
+            errmsgs=(f"CephFS '{self.fs.name}' doesn't refuse clients. "
+                      "Before renaming a CephFS, flag "
+                      "'refuse_client_session' must be set. See "
+                      "`ceph fs set`."),
+            retval=errno.EPERM)
+        self.run_ceph_cmd(f'fs fail {self.fs.name}')
 
 
 class TestDump(CephFSTestCase):
@@ -773,7 +1151,7 @@ class TestDump(CephFSTestCase):
             self.fs.set_joinable(b)
             b = not b
 
-        time.sleep(10) # for tick/compaction
+        sleep(10) # for tick/compaction
 
         try:
             self.fs.status(epoch=epoch)
@@ -797,7 +1175,7 @@ class TestDump(CephFSTestCase):
 
         # force a new fsmap
         self.fs.set_joinable(False)
-        time.sleep(10) # for tick/compaction
+        sleep(10) # for tick/compaction
 
         status = self.fs.status()
         log.debug(f"new epoch is {status['epoch']}")
@@ -1200,6 +1578,8 @@ class TestMirroringCommands(CephFSTestCase):
 class TestFsAuthorize(CephFSTestCase):
     client_id = 'testuser'
     client_name = 'client.' + client_id
+    CLIENTS_REQUIRED = 2
+    MDSS_REQUIRED = 3
 
     def test_single_path_r(self):
         PERM = 'r'
@@ -1220,6 +1600,10 @@ class TestFsAuthorize(CephFSTestCase):
         self.captester.run_cap_tests(self.fs, self.client_id, PERM)
 
     def test_single_path_rootsquash(self):
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("only FUSE client has CEPHFS_FEATURE_MDS_AUTH_CAPS "
+                          "needed to enforce root_squash MDS caps")
+
         PERM = 'rw'
         FS_AUTH_CAPS = (('/', PERM, 'root_squash'),)
         self.captester = CapTester(self.mount_a, '/')
@@ -1230,13 +1614,181 @@ class TestFsAuthorize(CephFSTestCase):
         # Since root_squash is set in client caps, client can read but not
         # write even thought access level is set to "rw".
         self.captester.conduct_pos_test_for_read_caps()
+        self.captester.conduct_pos_test_for_open_caps()
         self.captester.conduct_neg_test_for_write_caps(sudo_write=True)
+        self.captester.conduct_neg_test_for_chown_caps()
+        self.captester.conduct_neg_test_for_truncate_caps()
+
+    def test_multifs_single_path_rootsquash(self):
+        """
+        Test root_squash with multi fs
+        """
+        self.skipTest('this test is broken ATM, see: '
+                      'https://tracker.ceph.com/issues/66076.')
+
+        self.fs1 = self.fs
+        self.fs2 = self.mds_cluster.newfs('testcephfs2')
+        self.mount_b.remount(cephfs_name=self.fs2.name)
+        self.captester1 = CapTester(self.mount_a)
+        self.captester2 = CapTester(self.mount_b)
+
+        PERM = 'rw'
+        FS_AUTH_CAPS = (('/', PERM, 'root_squash'),)
+
+        self.fs1.authorize(self.client_id, FS_AUTH_CAPS)
+        self.fs2.authorize(self.client_id, FS_AUTH_CAPS)
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+
+        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+        self.mount_a.remount(client_id=self.client_id,
+                             client_keyring_path=keyring_path)
+        # testing MDS caps...
+        # Since root_squash is set in client caps, client can read but not
+        # write even though access level is set to "rw" on both fses
+        self.captester1.conduct_pos_test_for_read_caps()
+        self.captester1.conduct_pos_test_for_open_caps()
+        self.captester1.conduct_neg_test_for_write_caps(sudo_write=True)
+        self.captester1.conduct_neg_test_for_chown_caps()
+        self.captester1.conduct_neg_test_for_truncate_caps()
+
+        keyring_path = self.mount_b.client_remote.mktemp(data=keyring)
+        self.mount_b.remount(client_id=self.client_id,
+                             client_keyring_path=keyring_path)
+        self.captester2.conduct_pos_test_for_read_caps()
+        self.captester2.conduct_pos_test_for_open_caps()
+        self.captester2.conduct_neg_test_for_write_caps(sudo_write=True)
+        self.captester2.conduct_neg_test_for_chown_caps()
+        self.captester2.conduct_neg_test_for_truncate_caps()
+
+    def test_multifs_rootsquash_nofeature(self):
+        """
+        That having root_squash on one fs doesn't prevent access to others.
+        """
+
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("only FUSE client has CEPHFS_FEATURE_MDS_AUTH_CAPS "
+                          "needed to enforce root_squash MDS caps")
+
+        self.fs1 = self.fs
+        self.fs2 = self.mds_cluster.newfs('testcephfs2')
+
+        self.mount_a.umount_wait()
+
+        # Authorize client to fs1
+        FS_AUTH_CAPS = (('/', 'rw'),)
+        self.fs1.authorize(self.client_id, FS_AUTH_CAPS)
+
+        FS_AUTH_CAPS = (('/', 'rw', 'root_squash'),)
+        keyring = self.fs2.authorize(self.client_id, FS_AUTH_CAPS)
+
+        CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK = 21
+        # all but CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK
+        features = ",".join([str(i) for i in range(CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK)])
+        mntargs = [f"--client_debug_inject_features={features}"]
+
+        # should succeed
+        with self.assert_cluster_log("report clients with broken root_squash", present=False):
+            keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+            self.mount_a.remount(client_id=self.client_id, client_keyring_path=keyring_path, mntargs=mntargs, cephfs_name=self.fs1.name)
+
+        captester = CapTester(self.mount_a, '/')
+        captester.conduct_pos_test_for_read_caps()
+        captester.conduct_pos_test_for_open_caps()
+
+    def test_rootsquash_nofeature(self):
+        """
+        That having root_squash on an fs without the feature bit raises a HEALTH_ERR warning.
+        """
+
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("only FUSE client has CEPHFS_FEATURE_MDS_AUTH_CAPS "
+                          "needed to enforce root_squash MDS caps")
+
+        self.mount_a.umount_wait()
+        self.mount_b.umount_wait()
+
+        FS_AUTH_CAPS = (('/', 'rw', 'root_squash'),)
+        keyring = self.fs.authorize(self.client_id, FS_AUTH_CAPS)
+
+        CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK = 21
+        # all but CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK
+        features = ",".join([str(i) for i in range(CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK)])
+        mntargs = [f"--client_debug_inject_features={features}"]
+
+        # should succeed
+        with self.assert_cluster_log("with broken root_squash implementation"):
+            keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+            self.mount_a.remount(client_id=self.client_id, client_keyring_path=keyring_path, mntargs=mntargs, cephfs_name=self.fs.name)
+            self.wait_for_health("MDS_CLIENTS_BROKEN_ROOTSQUASH", 60)
+            self.assertFalse(self.mount_a.is_blocked())
+
+        self.mount_a.umount_wait()
+        self.wait_for_health_clear(60)
+
+    def test_rootsquash_nofeature_evict(self):
+        """
+        That having root_squash on an fs without the feature bit can be evicted.
+        """
+
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("only FUSE client has CEPHFS_FEATURE_MDS_AUTH_CAPS "
+                          "needed to enforce root_squash MDS caps")
+
+        self.mount_a.umount_wait()
+        self.mount_b.umount_wait()
+
+        FS_AUTH_CAPS = (('/', 'rw', 'root_squash'),)
+        keyring = self.fs.authorize(self.client_id, FS_AUTH_CAPS)
+
+        CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK = 21
+        # all but CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK
+        features = ",".join([str(i) for i in range(CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK)])
+        mntargs = [f"--client_debug_inject_features={features}"]
+
+        # should succeed
+        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+        self.mount_a.remount(client_id=self.client_id, client_keyring_path=keyring_path, mntargs=mntargs, cephfs_name=self.fs.name)
+        self.wait_for_health("MDS_CLIENTS_BROKEN_ROOTSQUASH", 60)
+
+        self.fs.required_client_features("add", "client_mds_auth_caps")
+        self.wait_for_health_clear(60)
+        self.assertTrue(self.mount_a.is_blocked())
+
+
+    def test_single_path_rootsquash_issue_56067(self):
+        """
+        That a FS client using root squash MDS caps allows non-root user to write data
+        to a file. And after client remount, the non-root user can read the data that
+        was previously written by it. https://tracker.ceph.com/issues/56067
+        """
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("only FUSE client has CEPHFS_FEATURE_MDS_AUTH_CAPS "
+                          "needed to enforce root_squash MDS caps")
+
+        keyring = self.fs.authorize(self.client_id, ('/', 'rw', 'root_squash'))
+        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+        self.mount_a.remount(client_id=self.client_id,
+                             client_keyring_path=keyring_path,
+                             cephfs_mntpt='/')
+        filedata, filename = 'some data on fs 1', 'file_on_fs1'
+        filepath = os_path_join(self.mount_a.hostfs_mntpt, filename)
+        self.mount_a.write_file(filepath, filedata)
+
+        self.mount_a.remount(client_id=self.client_id,
+                             client_keyring_path=keyring_path,
+                             cephfs_mntpt='/')
+        if filepath.find(self.mount_a.hostfs_mntpt) != -1:
+            contents = self.mount_a.read_file(filepath)
+            self.assertEqual(filedata, contents)
 
     def test_single_path_authorize_on_nonalphanumeric_fsname(self):
         """
         That fs authorize command works on filesystems with names having [_.-]
         characters
         """
+        self.skipTest('this test is broken ATM, see: '
+                      'https://tracker.ceph.com/issues/66077')
+
         self.mount_a.umount_wait(require_clean=True)
         self.mds_cluster.delete_all_filesystems()
         fs_name = "cephfs-_."
@@ -1277,7 +1829,98 @@ class TestFsAuthorize(CephFSTestCase):
 
         self._remount_and_run_tests(FS_AUTH_CAPS, keyring)
 
+    def test_when_MDS_caps_needs_update_but_others_dont(self):
+        '''
+        Test that the command "ceph fs authorize" successfully updates MDS
+        caps even when MON and OSD caps don't need an update.
+
+        Tests: https://tracker.ceph.com/issues/64182
+
+        In this test we run -
+
+            ceph fs authorize cephfs1 client.x / rw
+            ceph fs authorize cephfs2 client.x / rw
+            ceph fs authorize cephfs2 client.x /dir1 rw
+
+        The first command will create the keyring by adding the MDS cap for
+        root path & MON and OSD caps with name of the FS name (say "cephfs1").
+        Second command will update the all of client's caps -- MON, OSD and
+        MDS caps to add caps for 2nd CephFS. The third command doesn't need
+        to add MON and OSD caps since cap for "cephfs2" has been granted
+        already. Thus, third command only need to update the MDS cap, thus
+        testing the bug under consideration here.
+        '''
+        PERM = 'rw'
+        DIR = 'dir1'
+
+        self.fs2 = self.mds_cluster.newfs(name='cephfs2', create=True)
+        self.mount_b.remount(cephfs_name=self.fs2.name)
+        self.mount_b.run_shell(f'mkdir {DIR}')
+        self.captesters = (CapTester(self.mount_a, '/'),
+                           CapTester(self.mount_b, '/'),
+                           CapTester(self.mount_b, f'/{DIR}'))
+
+        FS_AUTH_CAPS = (('/', PERM), ('/', PERM), (DIR, PERM))
+        keyring = self.fs.authorize(self.client_id, FS_AUTH_CAPS[0])
+        keyring = self.fs2.authorize(self.client_id, FS_AUTH_CAPS[1])
+
+        # if the following block of code pass it implies that
+        # https://tracker.ceph.com/issues/64182 has been fixed
+        keyring = self.fs2.authorize(self.client_id, FS_AUTH_CAPS[2])
+        mdscaps = ('caps mds = "'
+                   f'allow {PERM} fsname={self.fs.name}, '
+                   f'allow {PERM} fsname={self.fs2.name}, '
+                   f'allow {PERM} fsname={self.fs2.name} path={DIR}')
+        self.assertIn(mdscaps, keyring)
+
+        self._remount_and_run_tests_for_cap(
+            FS_AUTH_CAPS[0], self.captesters[0], self.fs.name, self.mount_a,
+            keyring)
+        self._remount_and_run_tests_for_cap(
+            FS_AUTH_CAPS[1], self.captesters[1], self.fs2.name, self.mount_b,
+            keyring)
+        self._remount_and_run_tests_for_cap(
+            FS_AUTH_CAPS[2], self.captesters[2], self.fs2.name, self.mount_b,
+            keyring)
+
+    def test_adding_multiple_caps(self):
+        '''
+        Test that the command "ceph fs authorize" is successful in updating
+        the entity's caps when multiple caps are passed to it in one go.
+
+        Tests: https://tracker.ceph.com/issues/64127
+        Tests: https://tracker.ceph.com/issues/64417
+        '''
+        DIR = 'dir1'
+        self.mount_a.run_shell(f'mkdir {DIR}')
+        self.captesters = (CapTester(self.mount_a, '/'),
+                           CapTester(self.mount_a, f'/{DIR}'))
+        self.fs.authorize(self.client_id, ('/', 'rw'))
+
+        FS_AUTH_CAPS = ('/', 'rw', 'root_squash'), (f'/{DIR}', 'rw' )
+        # The fact that following line passes means
+        # https://tracker.ceph.com/issues/64127 has been fixed
+        keyring = self.fs.authorize(self.client_id, FS_AUTH_CAPS)
+
+        # The fact that following lines passes means
+        # https://tracker.ceph.com/issues/64417 has been fixed.
+        mdscaps = (f'allow rw fsname={self.fs.name} root_squash, '
+                   f'allow rw fsname={self.fs.name} path={DIR}')
+        self.assertIn(mdscaps, keyring)
+
+        self._remount_and_run_tests(FS_AUTH_CAPS, keyring)
+
     def _remount_and_run_tests(self, fs_auth_caps, keyring):
+        '''
+        This method is specifically designed to meet needs of most of the
+        test case in this class. Following are assumptions made here -
+
+        1. CephFS to be mounted is self.fs
+        2. Mount object to be used is self.mount_a
+        3. Keyring file will be created on the host specified in self.mount_a.
+        4. CephFS dir that will serve as root is PATH component of particular
+           cap from FS_AUTH_CAPS.
+        '''
         for i, c in enumerate(fs_auth_caps):
             self.assertIn(i, (0, 1))
             PATH = c[0]
@@ -1287,17 +1930,318 @@ class TestFsAuthorize(CephFSTestCase):
             self.captesters[i].run_cap_tests(self.fs, self.client_id, PERM,
                                              PATH)
 
+    def _remount(self, keyring, path='/'):
+        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+        self.mount_a.remount(client_id=self.client_id,
+                             client_keyring_path=keyring_path,
+                             cephfs_mntpt=path)
+
+    def _remount_and_run_tests_for_cap(self, cap, captester, fsname, mount,
+                                       keyring):
+        PATH = cap[0]
+        PERM = cap[1]
+
+        cephfs_mntpt = os_path_join('/', PATH)
+        keyring_path = mount.client_remote.mktemp(data=keyring)
+        mount.remount(client_id=self.client_id, cephfs_mntpt=cephfs_mntpt,
+                      cephfs_name=fsname, client_keyring_path=keyring_path)
+
+        captester.run_cap_tests(self.fs, self.client_id, PERM, PATH)
+
     def tearDown(self):
         self.mount_a.umount_wait()
         self.run_ceph_cmd(f'auth rm {self.client_name}')
 
         super(type(self), self).tearDown()
 
-    def _remount(self, keyring, path='/'):
-        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
-        self.mount_a.remount(client_id=self.client_id,
-                             client_keyring_path=keyring_path,
-                             cephfs_mntpt=path)
+
+class TestFsAuthorizeUpdate(CephFSTestCase):
+    client_id = 'testuser'
+    client_name = f'client.{client_id}'
+    CLIENTS_REQUIRED = 2
+    MDSS_REQUIRED = 3
+
+    ######################################
+    # cases where "fs authorize" adds caps
+    ######################################
+
+    def test_add_caps_for_another_FS(self):
+        """
+        Test that "ceph fs authorize" adds caps for a second FS to a keyring
+        that already had caps for first FS.
+        """
+        self.fs1 = self.fs
+        self.fs2 = self.mds_cluster.newfs('testcephfs2')
+        self.mount_b.remount(cephfs_name=self.fs2.name)
+        self.captesters = (CapTester(self.mount_a), CapTester(self.mount_b))
+        self.fs1.authorize(self.client_id, ('/', 'rw'))
+
+        ########### testing begins here.
+        TEST_PERM = 'rw'
+        self.fs2.authorize(self.client_id, ('/', TEST_PERM,))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        moncap = gen_mon_cap_str((('r', self.fs1.name),
+                                  ('r', self.fs2.name)))
+        osdcap = gen_osd_cap_str(((TEST_PERM, self.fs1.name),
+                                  (TEST_PERM, self.fs2.name)))
+        mdscap = gen_mds_cap_str(((TEST_PERM, self.fs1.name),
+                                  (TEST_PERM, self.fs2.name)))
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs1.name, keyring)
+        self._remount(self.mount_b, self.fs2.name, keyring)
+        self.captesters[0].run_cap_tests(self.fs1, self.client_id, TEST_PERM)
+        self.captesters[0].run_cap_tests(self.fs1, self.client_id, TEST_PERM)
+
+    def test_add_caps_for_same_FS_diff_path(self):
+        '''
+        Test that "ceph fs authorze" grants a new cap when it is run for a
+        second time for same client and same FS but with a differnt paths.
+
+        In other words, running following two commands -
+        $ ceph fs authorize a client.x1 /dir1 rw
+        $ ceph fs authorize a client.x1 /dir2 rw
+
+        Should produce following MDS caps -
+        caps mon = "allow r fsname=a"
+        caps osd = "allow rw tag cephfs data=a"
+        caps mds = "allow rw fsname=a path=dir1, allow rw fsname=a path=dir2"
+        '''
+        PERM, PATH1, PATH2 = 'rw', 'dir1', 'dir2'
+        self.mount_a.run_shell('mkdir dir1 dir2')
+        self.captester_a = CapTester(self.mount_a, PATH1)
+        self.captester_b = CapTester(self.mount_b, PATH2)
+        self.fs.authorize(self.client_id, ('/', PERM))
+
+        ########## testing begins here.
+        self.fs.authorize(self.client_id, (PATH1, PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        moncap = gen_mon_cap_str((('r', self.fs.name),))
+        osdcap = gen_osd_cap_str(((PERM, self.fs.name),))
+        mdscap = gen_mds_cap_str(((PERM, self.fs.name, PATH1),))
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs.name, keyring, PATH1)
+        self.captester_a.run_cap_tests(self.fs, self.client_id, PERM, PATH1)
+
+        ########### testing once more
+        self.fs.authorize(self.client_id, (PATH2, PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        moncap = gen_mon_cap_str((('r', self.fs.name),))
+        osdcap = gen_osd_cap_str(((PERM, self.fs.name),))
+        mdscap = gen_mds_cap_str(((PERM, self.fs.name, PATH1),
+                                  (PERM, self.fs.name, PATH2)))
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_b, self.fs.name, keyring, PATH2)
+        self.captester_b.run_cap_tests(self.fs, self.client_id, PERM, PATH2)
+
+    def test_add_caps_for_client_with_no_caps(self):
+        """
+        Test that "ceph fs authorize" adds caps to the keyring when the
+        entity already has a keyring but it contains no caps.
+        """
+        TEST_PERM = 'rw'
+        self.captester = CapTester(self.mount_a)
+        self.run_ceph_cmd(f'auth add {self.client_name}')
+
+        ######## testing begins here.
+        self.fs.authorize(self.client_id, ('/', TEST_PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        moncap = gen_mon_cap_str((('r', self.fs.name,),))
+        osdcap = gen_osd_cap_str(((TEST_PERM, self.fs.name),))
+        mdscap = gen_mds_cap_str(((TEST_PERM, self.fs.name),))
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs.name, keyring)
+        self.captester.run_cap_tests(self.fs, self.client_id, TEST_PERM)
+
+
+    #########################################
+    # cases where "fs authorize" changes caps
+    #########################################
+
+    def test_change_perms(self):
+        """
+        Test that "ceph fs authorize" updates the caps for a FS when the caps
+        for that FS were already present in that keyring.
+        """
+        OLD_PERM = 'rw'
+        NEW_PERM = 'r'
+        self.captester = CapTester(self.mount_a)
+
+        self.fs.authorize(self.client_id, ('/', OLD_PERM))
+        ########### testing begins here
+        self.fs.authorize(self.client_id, ('/', NEW_PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        moncap = gen_mon_cap_str((('r', self.fs.name,),))
+        osdcap = gen_osd_cap_str(((NEW_PERM, self.fs.name),))
+        mdscap = gen_mds_cap_str(((NEW_PERM, self.fs.name),))
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs.name, keyring)
+        self.captester.run_cap_tests(self.fs, self.client_id, NEW_PERM)
+
+    ################################################
+    # Cases where fs authorize maintains idempotency
+    ################################################
+
+    def test_idem_caps_passed_same_as_current_caps(self):
+        """
+        Test that "ceph fs authorize" exits with the keyring on stdout and the
+        expected error message on stderr when caps supplied to the subcommand
+        are already present in the entity's keyring.
+        """
+        PERM = 'rw'
+        self.captester = CapTester(self.mount_a)
+        self.fs.authorize(self.client_id, ('/', PERM))
+        keyring1 = self.fs.mon_manager.get_keyring(self.client_id)
+
+        ############# testing begins here.
+        proc = self.fs.mon_manager.run_cluster_cmd(
+            args=f'fs authorize {self.fs.name} {self.client_name} / {PERM}',
+            stdout=StringIO(), stderr=StringIO())
+        errmsg = proc.stderr.getvalue()
+        self.assertIn(f'no update for caps of {self.client_name}', errmsg)
+
+        keyring2 = self.fs.mon_manager.get_keyring(self.client_id)
+        self.assertIn(keyring1, keyring2)
+
+        self._remount(self.mount_a, self.fs.name, keyring2)
+        self.captester.run_cap_tests(self.fs, self.client_id, PERM)
+
+    def test_idem_unaffected_root_squash(self):
+        """
+        Test that "root_squash" is not deleted from MDS caps when user runs
+        "fs authorize" a second time passing same FS name and path but not
+        with "root_squash"
+        In other words,
+        $ ceph fs authorize a client.x / rw root_squash
+        [client.x]
+        key = AQCvsyVkiDJZBBAAn1ClsPKvTfrCkUs01Eh8og==
+        $ ceph auth get client.x
+        [client.x]
+                key = AQD61CVkcA1QCRAAd0XYqPbHvcc+lpUAuc6Vcw==
+                caps mds = "allow rw fsname=a root_squash"
+                caps mon = "allow r fsname=a"
+                caps osd = "allow rw tag cephfs data=a"
+        $ ceph fs authorize a client.x / rw
+        $ ceph auth get client.x
+        [client.x]
+                key = AQD61CVkcA1QCRAAd0XYqPbHvcc+lpUAuc6Vcw==
+                caps mds = "allow rw fsname=a root_squash"
+                caps mon = "allow r fsname=a"
+                caps osd = "allow rw tag cephfs data=a"
+        """
+        self.skipTest('this test is broken ATM, see '
+                      'https://tracker.ceph.com/issues/65808')
+
+        PERM, PATH = 'rw', 'dir1'
+        self.mount_a.run_shell(f'mkdir {PATH}')
+        self.captester = CapTester(self.mount_a, PATH)
+        self.fs.authorize(self.client_id, (PATH, PERM, 'root_squash'))
+
+        ############# testing begins here.
+        self.fs.authorize(self.client_id, (PATH, PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        moncap = gen_mon_cap_str((('r', self.fs.name,),))
+        osdcap = gen_osd_cap_str(((PERM, self.fs.name),))
+        mdscap = gen_mds_cap_str(((PERM, self.fs.name, PATH, True),))
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+
+    def _get_uid(self):
+        return self.mount_a.client_remote.run(
+            args='id -u', stdout=StringIO()).stdout.getvalue().strip()
+
+    def _get_gid(self):
+        return self.mount_a.client_remote.run(
+            args='id -g', stdout=StringIO()).stdout.getvalue().strip()
+
+    def test_idem_unaffected_uid(self):
+        '''
+        1. Create a client with caps that has FS name and UID in it.
+        2. Run "ceph fs authorize" command for that client with same FS name.
+        3. Test that UID (as well as any other part of cap) is unaffected,
+           i.e. same as before.
+        '''
+        PERM, UID = 'rw', self._get_uid()
+        self.captester = CapTester(self.mount_a)
+        moncap = gen_mon_cap_str((('r', self.fs.name,),))
+        osdcap = gen_osd_cap_str(((PERM, self.fs.name),))
+        mdscap = f'allow rw uid={UID}'
+        self.fs.mon_manager.run_cluster_cmd(
+            args=(f'auth add {self.client_name} mon "{moncap}" '
+                  f'osd "{osdcap}" mds "{mdscap}"'))
+
+        ############# testing begins here.
+        self.fs.authorize(self.client_id, ('/', PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs.name, keyring)
+        self.captester.run_cap_tests(self.fs, self.client_id, PERM)
+
+    def test_idem_unaffected_gids(self):
+        '''
+        1. Create a client with caps that has FS name, UID and GID in it.
+        2. Run "ceph fs authorize" command for that client with same FS name.
+        3. Test that GID (as well as any other part of cap) is unaffected,
+           i.e. same as before.
+        '''
+        PERM, UID, GID = 'rw', self._get_uid(), self._get_gid()
+        self.captester = CapTester(self.mount_a)
+        moncap = gen_mon_cap_str((('r', self.fs.name),))
+        osdcap = gen_osd_cap_str(((PERM, self.fs.name),))
+        mdscap = f'allow rw uid={UID} gids={GID}'
+        self.fs.mon_manager.run_cluster_cmd(
+            args=(f'auth add {self.client_name} mon "{moncap}" '
+                  f'osd "{osdcap}" mds "{mdscap}"'))
+
+        ############# testing begins here.
+        self.fs.authorize(self.client_id, ('/', PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs.name, keyring)
+        self.captester.run_cap_tests(self.fs, self.client_id, PERM)
+
+    def test_idem_unaffected_gids_multiple(self):
+        '''
+        1. Create client with caps with FS name, UID & multiple GIDs in it.
+        2. Run "ceph fs authorize" command for that client with same FS name.
+        3. Test that multiple GIDs (as well as any other part of cap) is
+           unaffected, i.e. same as before.
+        '''
+        PERM, UID = 'rw', self._get_uid()
+        gids = [int(self._get_gid()), 1001, 1002]
+        # Apparently code for MDS caps always arranges GID in ascending
+        # order. Let's sort so that latter cap string matches with keyring.
+        gids.sort()
+        gids = f'{gids[0]},{gids[1]},{gids[2]}'
+        self.captester = CapTester(self.mount_a)
+        moncap = gen_mon_cap_str((('r', self.fs.name),))
+        osdcap = gen_osd_cap_str(((PERM, self.fs.name),))
+        mdscap = f'allow rw uid={UID} gids={gids}'
+        self.fs.mon_manager.run_cluster_cmd(
+            args=(f'auth add {self.client_name} mon "{moncap}" '
+                  f'osd "{osdcap}" mds "{mdscap}"'))
+
+        ############# testing begins here.
+        self.fs.authorize(self.client_id, ('/', PERM))
+        keyring = self.fs.mon_manager.get_keyring(self.client_id)
+        for cap in (moncap, osdcap, mdscap):
+            self.assertIn(cap, keyring)
+        self._remount(self.mount_a, self.fs.name, keyring)
+        self.captester.run_cap_tests(self.fs, self.client_id, PERM)
+
+    def _remount(self, mount_x, fsname, keyring, cephfs_mntpt='/'):
+        if len(cephfs_mntpt) > 1 and cephfs_mntpt[0] != '/':
+            cephfs_mntpt = '/' + cephfs_mntpt
+        keyring_path = mount_x.client_remote.mktemp(data=keyring)
+        mount_x.remount(client_id=self.client_id,
+                        client_keyring_path=keyring_path,
+                        cephfs_mntpt=cephfs_mntpt, cephfs_name=fsname)
 
 
 class TestAdminCommandIdempotency(CephFSTestCase):
@@ -1448,3 +2392,256 @@ class TestFsBalRankMask(CephFSTestCase):
             self.fs.set_bal_rank_mask(bal_rank_mask)
         except CommandFailedError as e:
             self.assertEqual(e.exitstatus, errno.EINVAL)
+
+
+class TestPermErrMsg(CephFSTestCase):
+
+    CLIENT_NAME = 'client.testuser'
+    FS1_NAME, FS2_NAME, FS3_NAME = 'abcd', 'efgh', 'ijkl'
+
+    EXPECTED_ERRNO = 22
+    EXPECTED_ERRMSG = ("Permission flags in MDS capability string must be '*' "
+                       "or 'all' or must start with 'r'")
+
+    MONCAP = f'allow r fsname={FS1_NAME}'
+    OSDCAP = f'allow rw tag cephfs data={FS1_NAME}'
+    MDSCAPS = [
+        'allow w',
+        f'allow w fsname={FS1_NAME}',
+
+        f'allow rw fsname={FS1_NAME}, allow w fsname={FS2_NAME}',
+        f'allow w fsname={FS1_NAME}, allow rw fsname={FS2_NAME}',
+        f'allow w fsname={FS1_NAME}, allow w fsname={FS2_NAME}',
+
+        (f'allow rw fsname={FS1_NAME}, allow rw fsname={FS2_NAME}, allow '
+         f'w fsname={FS3_NAME}'),
+
+        # without space after comma
+        f'allow rw fsname={FS1_NAME},allow w fsname={FS2_NAME}',
+
+
+        'allow wr',
+        f'allow wr fsname={FS1_NAME}',
+
+        f'allow rw fsname={FS1_NAME}, allow wr fsname={FS2_NAME}',
+        f'allow wr fsname={FS1_NAME}, allow rw fsname={FS2_NAME}',
+        f'allow wr fsname={FS1_NAME}, allow wr fsname={FS2_NAME}',
+
+        (f'allow rw fsname={FS1_NAME}, allow rw fsname={FS2_NAME}, allow '
+         f'wr fsname={FS3_NAME}'),
+
+        # without space after comma
+        f'allow rw fsname={FS1_NAME},allow wr fsname={FS2_NAME}']
+
+    def _negtestcmd(self, SUBCMD, MDSCAP):
+        return self.negtest_ceph_cmd(
+            args=(f'{SUBCMD} {self.CLIENT_NAME} '
+                  f'mon "{self.MONCAP}" osd "{self.OSDCAP}" mds "{MDSCAP}"'),
+            retval=self.EXPECTED_ERRNO, errmsgs=self.EXPECTED_ERRMSG)
+
+    def test_auth_add(self):
+        for mdscap in self.MDSCAPS:
+            self._negtestcmd('auth add', mdscap)
+
+    def test_auth_caps(self):
+        for mdscap in self.MDSCAPS:
+            self.fs.mon_manager.run_cluster_cmd(
+                args=f'auth add {self.CLIENT_NAME}')
+
+            self._negtestcmd('auth caps', mdscap)
+
+            self.fs.mon_manager.run_cluster_cmd(
+                args=f'auth rm {self.CLIENT_NAME}')
+
+    def test_auth_get_or_create(self):
+        for mdscap in self.MDSCAPS:
+            self._negtestcmd('auth get-or-create', mdscap)
+
+    def test_auth_get_or_create_key(self):
+        for mdscap in self.MDSCAPS:
+            self._negtestcmd('auth get-or-create-key', mdscap)
+
+    def test_fs_authorize(self):
+        for wrong_perm in ('w', 'wr'):
+            self.negtest_ceph_cmd(
+                args=(f'fs authorize {self.fs.name} {self.CLIENT_NAME} / '
+                      f'{wrong_perm}'), retval=self.EXPECTED_ERRNO,
+                errmsgs=self.EXPECTED_ERRMSG)
+
+
+class TestFSFail(TestAdminCommands):
+
+    MDSS_REQUIRED = 2
+    CLIENTS_REQUIRED = 1
+
+    def test_with_health_warn_oversize_cache(self):
+        '''
+        Test that, when health warning MDS_CACHE_OVERSIZE is present for an
+        MDS, command "ceph fs fail" fails without confirmation flag and passes
+        when confirmation flag is passed.
+        '''
+        health_warn = 'MDS_CACHE_OVERSIZED'
+        self.config_set('mds', 'mds_cache_memory_limit', '1K')
+        self.config_set('mds', 'mds_health_cache_threshold', '1.00000')
+        active_mds_id = self.fs.get_active_names()[0]
+
+        self.mount_a.open_n_background('.', 400)
+        self.wait_till_health_warn(health_warn, active_mds_id)
+
+        # actual testing begins now.
+        errmsg = 'mds_cache_oversized'
+        self.negtest_ceph_cmd(args=f'fs fail {self.fs.name}',
+                              retval=1, errmsgs=errmsg)
+        self.run_ceph_cmd(f'fs fail {self.fs.name} --yes-i-really-mean-it')
+
+        # Bring and wait for MDS to be up since it is needed for unmounting
+        # of CephFS in CephFSTestCase.tearDown() to be successful.
+        self.fs.set_joinable()
+        self.fs.wait_for_daemons()
+
+    def test_with_health_warn_trim(self):
+        '''
+        Test that, when health warning MDS_TRIM is present for an MDS, command
+        "ceph fs fail" fails without confirmation flag and passes when
+        confirmation flag is passed.
+        '''
+        health_warn = 'MDS_TRIM'
+        # for generating health warning MDS_TRIM
+        self.config_set('mds', 'mds_debug_subtrees', 'true')
+        # this will really really slow the trimming, so that MDS_TRIM stays
+        # for longer.
+        self.config_set('mds', 'mds_log_trim_decay_rate', '60')
+        self.config_set('mds', 'mds_log_trim_threshold', '1')
+        active_mds_id = self.fs.get_active_names()[0]
+
+        self.mount_a.open_n_background('.', 400)
+        self.wait_till_health_warn(health_warn, active_mds_id)
+
+        # actual testing begins now.
+        errmsg = 'mds_trim'
+        self.negtest_ceph_cmd(args=f'fs fail {self.fs.name}',
+                              retval=1, errmsgs=errmsg)
+        self.run_ceph_cmd(f'fs fail {self.fs.name} --yes-i-really-mean-it')
+
+        # Bring and wait for MDS to be up since it is needed for unmounting
+        # of CephFS in CephFSTestCase.tearDown() to be successful.
+        self.fs.set_joinable()
+        self.fs.wait_for_daemons()
+
+    def test_with_health_warn_with_2_active_MDSs(self):
+        '''
+        Test that, when a CephFS has 2 active MDSs and one of them have either
+        health warning MDS_TRIM or MDS_CACHE_OVERSIZE, running "ceph fs fail"
+        fails without confirmation flag and passes when confirmation flag is
+        passed.
+        '''
+        health_warn = 'MDS_CACHE_OVERSIZED'
+        self.fs.set_max_mds(2)
+        self.config_set('mds', 'mds_cache_memory_limit', '1K')
+        self.config_set('mds', 'mds_health_cache_threshold', '1.00000')
+        self.fs.wait_for_daemons()
+        mds1_id, mds2_id = self.fs.get_active_names()
+
+        self.mount_a.open_n_background('.', 400)
+        # MDS ID for which health warning has been generated.
+        self.wait_till_health_warn(health_warn, mds1_id)
+
+        # actual testing begins now.
+        errmsg = 'mds_cache_oversized'
+        self.negtest_ceph_cmd(args=f'fs fail {self.fs.name}',
+                              retval=1, errmsgs=errmsg)
+        self.run_ceph_cmd(f'fs fail {self.fs.name} --yes-i-really-mean-it')
+
+        # Bring and wait for MDS to be up since it is needed for unmounting
+        # of CephFS in CephFSTestCase.tearDown() to be successful.
+        self.fs.set_joinable()
+        self.fs.wait_for_daemons()
+
+
+class TestMDSFail(TestAdminCommands):
+
+    MDSS_REQUIRED = 2
+    CLIENTS_REQUIRED = 1
+
+    def test_with_health_warn_oversize_cache(self):
+        '''
+        Test that, when health warning MDS_CACHE_OVERSIZE is present for an
+        MDS, command "ceph mds fail" fails without confirmation flag and
+        passes when confirmation flag is passed.
+        '''
+        health_warn = 'MDS_CACHE_OVERSIZED'
+        self.config_set('mds', 'mds_cache_memory_limit', '1K')
+        self.config_set('mds', 'mds_health_cache_threshold', '1.00000')
+        active_mds_id = self.fs.get_active_names()[0]
+
+        self.mount_a.open_n_background('.', 400)
+        self.wait_till_health_warn(health_warn, active_mds_id)
+
+        # actual testing begins now.
+        errmsg = 'mds_cache_oversized'
+        self.negtest_ceph_cmd(args=f'mds fail {active_mds_id}',
+                              retval=1, errmsgs=errmsg)
+        self.run_ceph_cmd(f'mds fail {active_mds_id} --yes-i-really-mean-it')
+
+    def test_with_health_warn_trim(self):
+        '''
+        Test that, when health warning MDS_TRIM is present for an MDS, command
+        "ceph mds fail" fails without confirmation flag and passes when
+        confirmation is passed.
+        '''
+        health_warn = 'MDS_TRIM'
+        # for generating health warning MDS_TRIM
+        self.config_set('mds', 'mds_debug_subtrees', 'true')
+        # this will really really slow the trimming, so that MDS_TRIM stays
+        # for longer.
+        self.config_set('mds', 'mds_log_trim_decay_rate', '60')
+        self.config_set('mds', 'mds_log_trim_threshold', '1')
+        active_mds_id = self.fs.get_active_names()[0]
+
+        self.mount_a.open_n_background('.', 400)
+        self.wait_till_health_warn(health_warn, active_mds_id)
+
+        # actual testing begins now...
+        errmsg = 'mds_trim'
+        self.negtest_ceph_cmd(args=f'mds fail {active_mds_id}',
+                              retval=1, errmsgs=errmsg)
+        self.run_ceph_cmd(f'mds fail {active_mds_id} --yes-i-really-mean-it')
+
+    def test_with_health_warn_with_2_active_MDSs(self):
+        '''
+        Test when a CephFS has 2 active MDSs and one of them have either
+        health warning MDS_TRIM or MDS_CACHE_OVERSIZE, running "ceph mds fail"
+        fails for both MDSs without confirmation flag and passes for both when
+        confirmation flag is passed.
+        '''
+        health_warn = 'MDS_CACHE_OVERSIZED'
+        self.fs.set_max_mds(2)
+        self.config_set('mds', 'mds_cache_memory_limit', '1K')
+        self.config_set('mds', 'mds_health_cache_threshold', '1.00000')
+        self.fs.wait_for_daemons()
+        mds1_id, mds2_id = self.fs.get_active_names()
+
+        self.mount_a.open_n_background('.', 400)
+        self.wait_till_health_warn(health_warn, mds1_id)
+
+        health_report = json.loads(self.get_ceph_cmd_stdout('health detail '
+                                                            '--format json'))
+        # MDS ID for which health warning has been generated.
+        hw_mds_id = self._get_unhealthy_mds_id(health_report, health_warn)
+        if mds1_id == hw_mds_id:
+            non_hw_mds_id = mds2_id
+        elif mds2_id == hw_mds_id:
+            non_hw_mds_id = mds1_id
+        else:
+            raise RuntimeError('There are only 2 MDSs right now but apparently'
+                               'health warning was raised for an MDS other '
+                               'than these two. This is definitely an error.')
+
+        # actual testing begins now...
+        errmsg = 'mds_cache_oversized'
+        self.negtest_ceph_cmd(args=f'mds fail {non_hw_mds_id}', retval=1,
+                              errmsgs=errmsg)
+        self.negtest_ceph_cmd(args=f'mds fail {hw_mds_id}', retval=1,
+                              errmsgs=errmsg)
+        self.run_ceph_cmd(f'mds fail {mds1_id} --yes-i-really-mean-it')
+        self.run_ceph_cmd(f'mds fail {mds2_id} --yes-i-really-mean-it')

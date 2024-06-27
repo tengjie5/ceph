@@ -1,9 +1,15 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 import { ApiClient } from './api-client';
-import { map } from 'rxjs/operators';
+import { map, shareReplay, tap } from 'rxjs/operators';
 import { SummaryService } from '../services/summary.service';
-import { UpgradeInfoInterface } from '../models/upgrade.interface';
+import { UpgradeInfoInterface, UpgradeStatusInterface } from '../models/upgrade.interface';
+import { Observable } from 'rxjs';
+import { UpgradeStartModalComponent } from '~/app/ceph/cluster/upgrade/upgrade-form/upgrade-start-modal.component';
+import { ModalService } from '../services/modal.service';
+import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
+
+const CACHE_SIZE = 1;
 
 @Injectable({
   providedIn: 'root'
@@ -11,7 +17,27 @@ import { UpgradeInfoInterface } from '../models/upgrade.interface';
 export class UpgradeService extends ApiClient {
   baseURL = 'api/cluster/upgrade';
 
-  constructor(private http: HttpClient, private summaryService: SummaryService) {
+  upgradableServiceTypes = [
+    'mgr',
+    'mon',
+    'crash',
+    'osd',
+    'mds',
+    'rgw',
+    'rbd-mirror',
+    'cephfs-mirror',
+    'iscsi',
+    'nfs'
+  ];
+
+  _listData$: Observable<UpgradeInfoInterface>;
+  _upgradableVersions: string[];
+
+  constructor(
+    private http: HttpClient,
+    private summaryService: SummaryService,
+    private modalService: ModalService
+  ) {
     super();
   }
 
@@ -38,11 +64,45 @@ export class UpgradeService extends ApiClient {
         cVersion[0] === tVersion[0] && (cVersion[1] < tVersion[1] || cVersion[2] < tVersion[2])
       );
     });
-    upgradeInfo.versions = upgradableVersions;
+    upgradeInfo.versions = upgradableVersions.sort();
     return upgradeInfo;
   }
 
-  start(version: string) {
-    return this.http.post(`${this.baseURL}/start`, { version: version });
+  start(version?: string, image?: string) {
+    return this.http.post(`${this.baseURL}/start`, { image: image, version: version });
+  }
+
+  pause() {
+    return this.http.put(`${this.baseURL}/pause`, null);
+  }
+
+  resume() {
+    return this.http.put(`${this.baseURL}/resume`, null);
+  }
+
+  stop() {
+    return this.http.put(`${this.baseURL}/stop`, null);
+  }
+
+  status(): Observable<UpgradeStatusInterface> {
+    return this.http.get<UpgradeStatusInterface>(`${this.baseURL}/status`);
+  }
+
+  listCached(): Observable<UpgradeInfoInterface> {
+    if (!this._listData$) {
+      this._listData$ = this.list().pipe(
+        tap(
+          (upgradeInfo: UpgradeInfoInterface) => (this._upgradableVersions = upgradeInfo.versions)
+        ),
+        shareReplay(CACHE_SIZE)
+      );
+    }
+    return this._listData$;
+  }
+
+  startUpgradeModal(): NgbModalRef {
+    return this.modalService.show(UpgradeStartModalComponent, {
+      versions: this._upgradableVersions
+    });
   }
 }

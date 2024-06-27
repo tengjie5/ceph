@@ -6,6 +6,7 @@ import logging
 import math
 from datetime import datetime
 from functools import partial
+from typing import Any, Dict
 
 import cherrypy
 import rbd
@@ -136,12 +137,12 @@ class Rbd(RESTController):
     @RbdTask('edit', ['{image_spec}', '{name}'], 4.0)
     def set(self, image_spec, name=None, size=None, features=None,
             configuration=None, metadata=None, enable_mirror=None, primary=None,
-            force=False, resync=False, mirror_mode=None, schedule_interval='',
-            remove_scheduling=False):
+            force=False, resync=False, mirror_mode=None, image_mirror_mode=None,
+            schedule_interval='', remove_scheduling=False):
         return RbdService.set(image_spec, name, size, features,
                               configuration, metadata, enable_mirror, primary,
-                              force, resync, mirror_mode, schedule_interval,
-                              remove_scheduling)
+                              force, resync, mirror_mode, image_mirror_mode,
+                              schedule_interval, remove_scheduling)
 
     @RbdTask('copy',
              {'src_image_spec': '{image_spec}',
@@ -203,7 +204,7 @@ class RbdStatus(BaseController):
     @Endpoint()
     @ReadPermission
     def status(self):
-        status = {'available': True, 'message': None}
+        status: Dict[str, Any] = {'available': True, 'message': None}
         if not CephService.get_pool_list('rbd'):
             status['available'] = False
             status['message'] = 'No Block Pool is available in the cluster. Please click ' \

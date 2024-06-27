@@ -210,7 +210,7 @@ constexpr segment_id_t NULL_SEG_ID = MAX_SEG_ID;
 
 /* Monotonically increasing segment seq, uniquely identifies
  * the incarnation of a segment */
-using segment_seq_t = uint32_t;
+using segment_seq_t = uint64_t;
 static constexpr segment_seq_t MAX_SEG_SEQ =
   std::numeric_limits<segment_seq_t>::max();
 static constexpr segment_seq_t NULL_SEG_SEQ = MAX_SEG_SEQ;
@@ -488,6 +488,7 @@ constexpr device_off_t decode_device_off(internal_paddr_t addr) {
 struct seg_paddr_t;
 struct blk_paddr_t;
 struct res_paddr_t;
+struct pladdr_t;
 struct paddr_t {
 public:
   // P_ADDR_MAX == P_ADDR_NULL == paddr_t{}
@@ -668,6 +669,8 @@ private:
                      static_cast<u_device_off_t>(offset)) {}
 
   friend struct paddr_le_t;
+  friend struct pladdr_le_t;
+
 };
 
 std::ostream &operator<<(std::ostream &out, const paddr_t &rhs);
@@ -901,7 +904,6 @@ enum class backend_type_t {
 };
 
 std::ostream& operator<<(std::ostream& out, backend_type_t);
-using journal_type_t = backend_type_t;
 
 constexpr backend_type_t get_default_backend_of_device(device_type_t dtype) {
   assert(dtype != device_type_t::NONE &&
@@ -930,13 +932,13 @@ struct journal_seq_t {
 
   // produces a pseudo journal_seq_t relative to this by offset
   journal_seq_t add_offset(
-      journal_type_t type,
+      backend_type_t type,
       device_off_t off,
       device_off_t roll_start,
       device_off_t roll_size) const;
 
   device_off_t relative_to(
-      journal_type_t type,
+      backend_type_t type,
       const journal_seq_t& r,
       device_off_t roll_start,
       device_off_t roll_size) const;
@@ -1032,6 +1034,103 @@ struct __attribute((packed)) laddr_le_t {
   }
 };
 
+constexpr uint64_t PL_ADDR_NULL = std::numeric_limits<uint64_t>::max();
+
+struct pladdr_t {
+  std::variant<laddr_t, paddr_t> pladdr;
+
+  pladdr_t() = default;
+  pladdr_t(const pladdr_t &) = default;
+  pladdr_t(laddr_t laddr)
+    : pladdr(laddr) {}
+  pladdr_t(paddr_t paddr)
+    : pladdr(paddr) {}
+
+  bool is_laddr() const {
+    return pladdr.index() == 0;
+  }
+
+  bool is_paddr() const {
+    return pladdr.index() == 1;
+  }
+
+  pladdr_t& operator=(paddr_t paddr) {
+    pladdr = paddr;
+    return *this;
+  }
+
+  pladdr_t& operator=(laddr_t laddr) {
+    pladdr = laddr;
+    return *this;
+  }
+
+  bool operator==(const pladdr_t &) const = default;
+
+  paddr_t get_paddr() const {
+    assert(pladdr.index() == 1);
+    return paddr_t(std::get<1>(pladdr));
+  }
+
+  laddr_t get_laddr() const {
+    assert(pladdr.index() == 0);
+    return laddr_t(std::get<0>(pladdr));
+  }
+
+};
+
+std::ostream &operator<<(std::ostream &out, const pladdr_t &pladdr);
+
+enum class addr_type_t : uint8_t {
+  PADDR=0,
+  LADDR=1,
+  MAX=2	// or NONE
+};
+
+struct __attribute((packed)) pladdr_le_t {
+  ceph_le64 pladdr = ceph_le64(PL_ADDR_NULL);
+  addr_type_t addr_type = addr_type_t::MAX;
+
+  pladdr_le_t() = default;
+  pladdr_le_t(const pladdr_le_t &) = default;
+  explicit pladdr_le_t(const pladdr_t &addr)
+    : pladdr(
+	ceph_le64(
+	  addr.is_laddr() ?
+	    std::get<0>(addr.pladdr) :
+	    std::get<1>(addr.pladdr).internal_paddr)),
+      addr_type(
+	addr.is_laddr() ?
+	  addr_type_t::LADDR :
+	  addr_type_t::PADDR)
+  {}
+
+  operator pladdr_t() const {
+    if (addr_type == addr_type_t::LADDR) {
+      return pladdr_t(laddr_t(pladdr));
+    } else {
+      assert(addr_type == addr_type_t::PADDR);
+      return pladdr_t(paddr_t(pladdr));
+    }
+  }
+};
+
+template <typename T>
+struct min_max_t {};
+
+template <>
+struct min_max_t<laddr_t> {
+  static constexpr laddr_t max = L_ADDR_MAX;
+  static constexpr laddr_t min = L_ADDR_MIN;
+  static constexpr laddr_t null = L_ADDR_NULL;
+};
+
+template <>
+struct min_max_t<paddr_t> {
+  static constexpr paddr_t max = P_ADDR_MAX;
+  static constexpr paddr_t min = P_ADDR_MIN;
+  static constexpr paddr_t null = P_ADDR_NULL;
+};
+
 // logical offset, see LBAManager, TransactionManager
 using extent_len_t = uint32_t;
 constexpr extent_len_t EXTENT_LEN_MAX =
@@ -1041,6 +1140,11 @@ using extent_len_le_t = ceph_le32;
 inline extent_len_le_t init_extent_len_le(extent_len_t len) {
   return ceph_le32(len);
 }
+
+using extent_ref_count_t = uint32_t;
+constexpr extent_ref_count_t EXTENT_DEFAULT_REF_COUNT = 1;
+
+using extent_ref_count_le_t = ceph_le32;
 
 struct laddr_list_t : std::list<std::pair<laddr_t, extent_len_t>> {
   template <typename... T>
@@ -1206,6 +1310,8 @@ constexpr data_category_t get_extent_category(extent_types_t type) {
     return data_category_t::METADATA;
   }
 }
+
+bool can_inplace_rewrite(extent_types_t type);
 
 // type for extent modification time, milliseconds since the epoch
 using sea_time_point = seastar::lowres_system_clock::time_point;
@@ -1782,6 +1888,11 @@ constexpr bool is_trim_transaction(transaction_type_t type) {
       type == transaction_type_t::TRIM_ALLOC);
 }
 
+constexpr bool is_modify_transaction(transaction_type_t type) {
+  return (type == transaction_type_t::MUTATE ||
+      is_background_transaction(type));
+}
+
 struct record_size_t {
   extent_len_t plain_mdlength = 0; // mdlength without the record header
   extent_len_t dlength = 0;
@@ -2056,6 +2167,7 @@ struct scan_valid_records_cursor {
   journal_seq_t seq;
   journal_seq_t last_committed;
   std::size_t num_consumed_records = 0;
+  extent_len_t block_size = 0;
 
   struct found_record_group_t {
     paddr_t offset;
@@ -2082,10 +2194,12 @@ struct scan_valid_records_cursor {
     return seq.offset.as_seg_paddr().get_segment_off();
   }
 
+  extent_len_t get_block_size() const {
+    return block_size;
+  }
+
   void increment_seq(segment_off_t off) {
-    auto& seg_addr = seq.offset.as_seg_paddr();
-    seg_addr.set_segment_off(
-      seg_addr.get_segment_off() + off);
+    seq.offset = seq.offset.add_offset(off);
   }
 
   void emplace_record_group(const record_group_header_t&, ceph::bufferlist&&);
@@ -2101,6 +2215,157 @@ struct scan_valid_records_cursor {
     : seq(seq) {}
 };
 std::ostream& operator<<(std::ostream&, const scan_valid_records_cursor&);
+
+template <typename CounterT>
+using counter_by_src_t = std::array<CounterT, TRANSACTION_TYPE_MAX>;
+
+template <typename CounterT>
+CounterT& get_by_src(
+    counter_by_src_t<CounterT>& counters_by_src,
+    transaction_type_t src) {
+  assert(static_cast<std::size_t>(src) < counters_by_src.size());
+  return counters_by_src[static_cast<std::size_t>(src)];
+}
+
+template <typename CounterT>
+const CounterT& get_by_src(
+    const counter_by_src_t<CounterT>& counters_by_src,
+    transaction_type_t src) {
+  assert(static_cast<std::size_t>(src) < counters_by_src.size());
+  return counters_by_src[static_cast<std::size_t>(src)];
+}
+
+template <typename CounterT>
+void add_srcs(counter_by_src_t<CounterT>& base,
+              const counter_by_src_t<CounterT>& by) {
+  for (std::size_t i=0; i<TRANSACTION_TYPE_MAX; ++i) {
+    base[i] += by[i];
+  }
+}
+
+template <typename CounterT>
+void minus_srcs(counter_by_src_t<CounterT>& base,
+                const counter_by_src_t<CounterT>& by) {
+  for (std::size_t i=0; i<TRANSACTION_TYPE_MAX; ++i) {
+    base[i] -= by[i];
+  }
+}
+
+struct grouped_io_stats {
+  uint64_t num_io = 0;
+  uint64_t num_io_grouped = 0;
+
+  double average() const {
+    return static_cast<double>(num_io_grouped)/num_io;
+  }
+
+  bool is_empty() const {
+    return num_io == 0;
+  }
+
+  void add(const grouped_io_stats &o) {
+    num_io += o.num_io;
+    num_io_grouped += o.num_io_grouped;
+  }
+
+  void minus(const grouped_io_stats &o) {
+    num_io -= o.num_io;
+    num_io_grouped -= o.num_io_grouped;
+  }
+
+  void increment(uint64_t num_grouped_io) {
+    add({1, num_grouped_io});
+  }
+};
+
+struct device_stats_t {
+  uint64_t num_io = 0;
+  uint64_t total_depth = 0;
+  uint64_t total_bytes = 0;
+
+  void add(const device_stats_t& other) {
+    num_io += other.num_io;
+    total_depth += other.total_depth;
+    total_bytes += other.total_bytes;
+  }
+};
+
+struct trans_writer_stats_t {
+  uint64_t num_records = 0;
+  uint64_t metadata_bytes = 0;
+  uint64_t data_bytes = 0;
+
+  bool is_empty() const {
+    return num_records == 0;
+  }
+
+  uint64_t get_total_bytes() const {
+    return metadata_bytes + data_bytes;
+  }
+
+  trans_writer_stats_t&
+  operator+=(const trans_writer_stats_t& o) {
+    num_records += o.num_records;
+    metadata_bytes += o.metadata_bytes;
+    data_bytes += o.data_bytes;
+    return *this;
+  }
+
+  trans_writer_stats_t&
+  operator-=(const trans_writer_stats_t& o) {
+    num_records -= o.num_records;
+    metadata_bytes -= o.metadata_bytes;
+    data_bytes -= o.data_bytes;
+    return *this;
+  }
+};
+struct tw_stats_printer_t {
+  double seconds;
+  const trans_writer_stats_t &stats;
+};
+std::ostream& operator<<(std::ostream&, const tw_stats_printer_t&);
+
+struct writer_stats_t {
+  grouped_io_stats record_batch_stats;
+  grouped_io_stats io_depth_stats;
+  uint64_t record_group_padding_bytes = 0;
+  uint64_t record_group_metadata_bytes = 0;
+  uint64_t data_bytes = 0;
+  counter_by_src_t<trans_writer_stats_t> stats_by_src;
+
+  bool is_empty() const {
+    return io_depth_stats.is_empty();
+  }
+
+  uint64_t get_total_bytes() const {
+    return record_group_padding_bytes +
+           record_group_metadata_bytes +
+           data_bytes;
+  }
+
+  void add(const writer_stats_t &o) {
+    record_batch_stats.add(o.record_batch_stats);
+    io_depth_stats.add(o.io_depth_stats);
+    record_group_padding_bytes += o.record_group_padding_bytes;
+    record_group_metadata_bytes += o.record_group_metadata_bytes;
+    data_bytes += o.data_bytes;
+    add_srcs(stats_by_src, o.stats_by_src);
+  }
+
+  void minus(const writer_stats_t &o) {
+    record_batch_stats.minus(o.record_batch_stats);
+    io_depth_stats.minus(o.io_depth_stats);
+    record_group_padding_bytes -= o.record_group_padding_bytes;
+    record_group_metadata_bytes -= o.record_group_metadata_bytes;
+    data_bytes -= o.data_bytes;
+    minus_srcs(stats_by_src, o.stats_by_src);
+  }
+};
+struct writer_stats_printer_t {
+  double seconds;
+  const writer_stats_t &stats;
+};
+std::ostream& operator<<(std::ostream&, const writer_stats_printer_t&);
 
 }
 
@@ -2129,6 +2394,7 @@ template <> struct fmt::formatter<crimson::os::seastore::laddr_list_t> : fmt::os
 template <> struct fmt::formatter<crimson::os::seastore::omap_root_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::paddr_list_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::paddr_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::pladdr_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::placement_hint_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::device_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::record_group_header_t> : fmt::ostream_formatter {};
