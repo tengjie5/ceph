@@ -36,7 +36,7 @@
 </ng-template>
 
 <ng-template #statusTpl
-             let-row="row">
+             let-row="data.row">
   <span class="badge"
         [ngClass]="row | pipeFunction:getStatusClass">
     {{ row.status_desc }}
@@ -44,7 +44,7 @@
 </ng-template>
 
 <ng-template #listTpl
-             let-events="value">
+             let-events="data.value">
   <ul class="list-group list-group-flush"
       *ngIf="events?.length else noEventsAvailable">
     <li class="list-group-item"
@@ -63,8 +63,7 @@
     </li>
   </ul>
   <ng-template #noEventsAvailable>
-    <div *ngIf="events?.length === 0"
-         class="list-group-item">
+    <div class="list-group-item">
       <span>No data available</span>
     </div>
   </ng-template>
@@ -90,7 +89,7 @@
 </ng-template>
 
 <ng-template #cpuTpl
-             let-row="row">
+             let-row="data.row">
   <cd-usage-bar [total]="total"
                 [calculatePerc]="false"
                 [used]="row.cpu_percentage"

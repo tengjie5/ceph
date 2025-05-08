@@ -173,7 +173,7 @@ class DeltaRecorderT final: public DeltaRecorder {
         auto p_addr = reinterpret_cast<laddr_packed_t*>(
             mut.get_write() + update_offset);
         SUBDEBUG(seastore_onode,
-            "apply {:#x} to offset {:#x} ...",
+            "apply {} to offset {:#x} ...",
             new_addr, update_offset);
         layout_t::update_child_addr(mut, new_addr, p_addr);
         break;
@@ -523,15 +523,12 @@ class NodeExtentAccessorT {
     return c.nm.alloc_extent(c.t, hint, alloc_size
     ).handle_error_interruptible(
       eagain_iertr::pass_further{},
-      crimson::ct_error::input_output_error::assert_failure(
-          [FNAME, c, alloc_size, l_to_discard = extent->get_laddr()] {
-        SUBERRORT(seastore_onode,
-            "EIO during allocate -- node_size={}, to_discard={:x}",
-            c.t, alloc_size, l_to_discard);
-      })
+      crimson::ct_error::input_output_error::assert_failure(fmt::format(
+        "{} during allocate -- node_size={}, to_discard={}",
+        FNAME, alloc_size, extent->get_laddr()).c_str())
     ).si_then([this, c, FNAME] (auto fresh_extent) {
       SUBDEBUGT(seastore_onode,
-          "update addr from {:#x} to {:#x} ...",
+          "update addr from {} to {} ...",
           c.t, extent->get_laddr(), fresh_extent->get_laddr());
       assert(fresh_extent);
       assert(fresh_extent->is_initial_pending());
@@ -551,20 +548,9 @@ class NodeExtentAccessorT {
       return c.nm.retire_extent(c.t, to_discard
       ).handle_error_interruptible(
         eagain_iertr::pass_further{},
-        crimson::ct_error::input_output_error::assert_failure(
-            [FNAME, c, l_to_discard = to_discard->get_laddr(),
-             l_fresh = fresh_extent->get_laddr()] {
-          SUBERRORT(seastore_onode,
-              "EIO during retire -- to_disgard={:x}, fresh={:x}",
-              c.t, l_to_discard, l_fresh);
-        }),
-        crimson::ct_error::enoent::assert_failure(
-            [FNAME, c, l_to_discard = to_discard->get_laddr(),
-             l_fresh = fresh_extent->get_laddr()] {
-          SUBERRORT(seastore_onode,
-              "ENOENT during retire -- to_disgard={:x}, fresh={:x}",
-              c.t, l_to_discard, l_fresh);
-        })
+        crimson::ct_error::assert_all(fmt::format(
+          "{} during retire -- to_disgard={}, fresh={}",
+          FNAME, to_discard->get_laddr(), fresh_extent->get_laddr()).c_str())
       );
     }).si_then([this, c] {
       boost::ignore_unused(c);  // avoid clang warning;
@@ -580,14 +566,8 @@ class NodeExtentAccessorT {
     return c.nm.retire_extent(c.t, std::move(extent)
     ).handle_error_interruptible(
       eagain_iertr::pass_further{},
-      crimson::ct_error::input_output_error::assert_failure(
-          [FNAME, c, addr] {
-        SUBERRORT(seastore_onode, "EIO -- addr={:x}", c.t, addr);
-      }),
-      crimson::ct_error::enoent::assert_failure(
-          [FNAME, c, addr] {
-        SUBERRORT(seastore_onode, "ENOENT -- addr={:x}", c.t, addr);
-      })
+      crimson::ct_error::assert_all(fmt::format(
+        "{} addr={}", FNAME, addr).c_str())
 #ifndef NDEBUG
     ).si_then([c] {
       assert(!c.t.is_conflicted());

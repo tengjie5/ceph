@@ -44,6 +44,8 @@
 #include "osdc/Striper.h"
 #include <boost/algorithm/string/predicate.hpp>
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::ImageCtx: "
@@ -112,7 +114,7 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
       old_format(false),
       order(0), size(0), features(0),
       format_string(NULL),
-      id(image_id), parent(NULL),
+      id(image_id),
       stripe_unit(0), stripe_count(0), flags(0),
       readahead(),
       total_bytes_read(0),
@@ -157,6 +159,8 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
   ImageCtx::~ImageCtx() {
     ldout(cct, 10) << this << " " << __func__ << dendl;
 
+    ceph_assert(parent == nullptr);
+    ceph_assert(parent_rados == nullptr);
     ceph_assert(config_watcher == nullptr);
     ceph_assert(image_watcher == NULL);
     ceph_assert(exclusive_lock == NULL);
@@ -734,18 +738,7 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
 
     auto overlap = reduce_parent_overlap(raw_overlap, migration_write);
     if (area == overlap.second) {
-      // drop extents completely beyond the overlap
-      while (!image_extents.empty() &&
-             image_extents.back().first >= overlap.first) {
-        image_extents.pop_back();
-      }
-      if (!image_extents.empty()) {
-        // trim final overlapping extent
-        auto& last_extent = image_extents.back();
-        if (last_extent.first + last_extent.second > overlap.first) {
-          last_extent.second = overlap.first - last_extent.first;
-        }
-      }
+      io::util::prune_extents(image_extents, overlap.first);
     } else if (area == io::ImageArea::DATA &&
                overlap.second == io::ImageArea::CRYPTO_HEADER) {
       // all extents completely beyond the overlap
@@ -1014,11 +1007,19 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     }
 
     // atomically reset the data IOContext to new version
+#ifdef __cpp_lib_atomic_shared_ptr
+    data_io_context.store(ctx);
+#else
     atomic_store(&data_io_context, ctx);
+#endif
   }
 
   IOContext ImageCtx::get_data_io_context() const {
+#ifdef __cpp_lib_atomic_shared_ptr
+    return data_io_context.load();
+#else
     return atomic_load(&data_io_context);
+#endif
   }
 
   IOContext ImageCtx::duplicate_data_io_context() const {

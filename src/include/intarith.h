@@ -58,6 +58,18 @@ constexpr inline T p2align(T x, T align) {
 }
 
 /*
+ * return whether x is aligned with (align)
+ * eg, p2aligned(1200, 1024) ==> false
+ * eg, p2aligned(1024, 1024) ==> true
+ * eg, p2aligned(0x1234, 0x100) ==> false
+ * eg, p2aligned(0x5600, 0x100) ==> true
+ */
+template<typename T>
+constexpr inline bool p2aligned(T x, T align) {
+  return p2align(x, align) == x;
+}
+
+/*
  * return x % (mod) align
  * eg, p2phase(0x1234, 0x100) == 0x34 (x-0x12*align)
  * eg, p2phase(0x5600, 0x100) == 0x00 (x-0x56*align)
@@ -76,6 +88,17 @@ constexpr inline T p2phase(T x, T align) {
 template<typename T>
 constexpr inline T p2nphase(T x, T align) {
   return -x & (align - 1);
+}
+
+/*
+ * return how much space is left in this block,
+ * when perfectly aligned, return whole block
+ * eg, p2remain(0x1234, 0x100) == 0xcc
+ * eg, p2remain(0x5600, 0x100) == 0x100
+ */
+template<typename T>
+constexpr inline T p2remain(T x, T align) {
+  return align - p2phase(x, align);
 }
 
 /*

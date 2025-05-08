@@ -12,6 +12,9 @@
 
 #include "TrackedOp.h"
 
+#include <shared_mutex> // for std::shared_lock
+#include <sstream>
+
 #define dout_context cct
 #define dout_subsys ceph_subsys_optracker
 #undef dout_prefix
@@ -90,7 +93,7 @@ void OpHistory::_insert_delayed(const utime_t& now, TrackedOpRef op)
   arrived.insert(make_pair(op->get_initiated(), op));
   if (opduration >= history_slow_op_threshold.load()) {
     slow_op.insert(make_pair(op->get_initiated(), op));
-    logger->inc(l_osd_slow_op_count);
+    logger->inc(l_trackedop_slow_op_count);
   }
   cleanup(now);
 }
@@ -204,7 +207,7 @@ void OpHistory::dump_slow_ops(utime_t now, Formatter *f, set<string> filters)
   cleanup(now);
   f->open_object_section("OpHistory slow ops");
   f->dump_int("num to keep", history_slow_op_size.load());
-  f->dump_int("threshold to keep", history_slow_op_threshold.load());
+  f->dump_float("threshold to keep", history_slow_op_threshold.load());
   {
     f->open_array_section("Ops");
     for ([[maybe_unused]] const auto& [t, op] : slow_op) {

@@ -22,13 +22,12 @@ another, but below are some general guidelines.
 CPU
 ===
 
-CephFS Metadata Servers (MDS) are CPU-intensive. They are
-are single-threaded and perform best with CPUs with a high clock rate (GHz). MDS
-servers do not need a large number of CPU cores unless they are also hosting other
-services, such as SSD OSDs for the CephFS metadata pool.
-OSD nodes need enough processing power to run the RADOS service, to calculate data
-placement with CRUSH, to replicate data, and to maintain their own copies of the
-cluster map.
+CephFS Metadata Servers (MDS) are CPU-intensive. They are single-threaded
+and perform best with CPUs with a high clock rate (GHz). MDS servers do not
+need a large number of CPU cores unless they are also hosting other services,
+such as SSD OSDs for the CephFS metadata pool.  OSD nodes need enough
+processing power to run the RADOS service, to calculate data placement with
+CRUSH, to replicate data, and to maintain their own copies of the cluster map.
 
 With earlier releases of Ceph, we would make hardware recommendations based on
 the number of cores per OSD, but this cores-per-osd metric is no longer as
@@ -257,7 +256,7 @@ and Ceph Monitor / Manager purposes, a minimum capacity of 256GB is advised
 and at least 480GB is recommended. A drive model rated at 1+ DWPD (or the
 equivalent in TBW (TeraBytes Written) is suggested.  However, for a given write
 workload, a larger drive than technically required will provide more endurance
-because it effectively has greater overprovsioning. We stress that
+because it effectively has greater overprovisioning. We stress that
 enterprise-class drives are best for production use, as they feature power
 loss protection and increased durability compared to client (desktop) SKUs
 that are intended for much lighter and intermittent duty cycles.
@@ -312,7 +311,7 @@ media cost.  Moreover, when using NVMe SSDs, you do not need *any* HBA.  This
 additionally reduces the HDD vs SSD cost gap when the system as a whole is
 considered. The initial cost of a fancy RAID HBA plus onboard cache plus
 battery backup (BBU or supercapacitor) can easily exceed more than 1000 US
-dollars even after discounts - a sum that goes a log way toward SSD cost parity.
+dollars even after discounts - a sum that goes a long way toward SSD cost parity.
 An HBA-free system may also cost hundreds of US dollars less every year if one
 purchases an annual maintenance contract or extended warranty.
 

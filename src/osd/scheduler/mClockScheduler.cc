@@ -17,10 +17,17 @@
 #include <functional>
 
 #include "osd/scheduler/mClockScheduler.h"
-#include "common/dout.h"
+#include "common/debug.h"
+
+#ifdef WITH_CRIMSON
+#include "crimson/common/perf_counters_collection.h"
+#else
+#include "common/perf_counters_collection.h"
+#endif
 
 namespace dmc = crimson::dmclock;
 using namespace std::placeholders;
+using namespace std::literals;
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_mclock
@@ -30,33 +37,88 @@ using namespace std::placeholders;
 
 namespace ceph::osd::scheduler {
 
-mClockScheduler::mClockScheduler(CephContext *cct,
-  int whoami,
-  uint32_t num_shards,
-  int shard_id,
-  bool is_rotational,
-  unsigned cutoff_priority,
-  MonClient *monc)
-  : cct(cct),
-    whoami(whoami),
-    num_shards(num_shards),
-    shard_id(shard_id),
-    is_rotational(is_rotational),
-    cutoff_priority(cutoff_priority),
-    monc(monc),
-    scheduler(
-      std::bind(&mClockScheduler::ClientRegistry::get_info,
-                &client_registry,
-                _1),
-      dmc::AtLimit::Wait,
-      cct->_conf.get_val<double>("osd_mclock_scheduler_anticipation_timeout"))
+void mClockScheduler::_get_mclock_counter(scheduler_id_t id)
 {
-  cct->_conf.add_observer(this);
-  ceph_assert(num_shards > 0);
-  set_osd_capacity_params_from_config();
-  set_config_defaults_from_profile();
-  client_registry.update_from_config(
-    cct->_conf, osd_bandwidth_capacity_per_shard);
+  if (!logger) {
+    return;
+  }
+
+  /* op enter mclock queue will +1 */
+  logger->inc(l_mclock_all_type_queue_len);
+
+  switch (id.class_id) {
+  case op_scheduler_class::immediate:
+    logger->inc(l_mclock_immediate_queue_len);
+    break;
+  case op_scheduler_class::client:
+    logger->inc(l_mclock_client_queue_len);
+    break;
+  case op_scheduler_class::background_recovery:
+    logger->inc(l_mclock_recovery_queue_len);
+    break;
+  case op_scheduler_class::background_best_effort:
+    logger->inc(l_mclock_best_effort_queue_len);
+    break;
+   default:
+    derr << __func__ << " unknown class_id=" << id.class_id
+         << " unknown id=" << id << dendl;
+    break;
+  }
+}
+
+void mClockScheduler::_put_mclock_counter(scheduler_id_t id)
+{
+  if (!logger) {
+    return;
+  }
+
+  /* op leave mclock queue will -1 */
+  logger->dec(l_mclock_all_type_queue_len);
+
+  switch (id.class_id) {
+  case op_scheduler_class::immediate:
+    logger->dec(l_mclock_immediate_queue_len);
+    break;
+  case op_scheduler_class::client:
+    logger->dec(l_mclock_client_queue_len);
+    break;
+  case op_scheduler_class::background_recovery:
+    logger->dec(l_mclock_recovery_queue_len);
+    break;
+  case op_scheduler_class::background_best_effort:
+    logger->dec(l_mclock_best_effort_queue_len);
+    break;
+   default:
+    derr << __func__ << " unknown class_id=" << id.class_id
+         << " unknown id=" << id << dendl;
+    break;
+  }
+}
+
+void mClockScheduler::_init_logger()
+{
+  PerfCountersBuilder m(cct, "mclock-shard-queue-" + std::to_string(shard_id),
+                        l_mclock_first, l_mclock_last);
+
+  m.add_u64_counter(l_mclock_immediate_queue_len, "mclock_immediate_queue_len",
+                    "high_priority op count in mclock queue");
+  m.add_u64_counter(l_mclock_client_queue_len, "mclock_client_queue_len",
+                    "client type op count in mclock queue");
+  m.add_u64_counter(l_mclock_recovery_queue_len, "mclock_recovery_queue_len",
+                    "background_recovery type op count in mclock queue");
+  m.add_u64_counter(l_mclock_best_effort_queue_len, "mclock_best_effort_queue_len",
+                    "background_best_effort type op count in mclock queue");
+  m.add_u64_counter(l_mclock_all_type_queue_len, "mclock_all_type_queue_len",
+                    "all type op count in mclock queue");
+
+  logger = m.create_perf_counters();
+  cct->get_perfcounters_collection()->add(logger);
+
+  logger->set(l_mclock_immediate_queue_len, 0);
+  logger->set(l_mclock_client_queue_len, 0);
+  logger->set(l_mclock_recovery_queue_len, 0);
+  logger->set(l_mclock_best_effort_queue_len, 0);
+  logger->set(l_mclock_all_type_queue_len, 0);
 }
 
 /* ClientRegistry holds the dmclock::ClientInfo configuration parameters
@@ -406,6 +468,7 @@ void mClockScheduler::enqueue(OpSchedulerItem&& item)
       std::move(item),
       id,
       cost);
+    _get_mclock_counter(id);
   }
 
  dout(20) << __func__ << " client_count: " << scheduler.client_count()
@@ -446,6 +509,12 @@ void mClockScheduler::enqueue_high(unsigned priority,
   } else {
     high_priority[priority].push_front(std::move(item));
   }
+
+  scheduler_id_t id = scheduler_id_t {
+    op_scheduler_class::immediate,
+    client_profile_id_t()
+  };
+  _get_mclock_counter(id);
 }
 
 WorkItem mClockScheduler::dequeue()
@@ -461,6 +530,12 @@ WorkItem mClockScheduler::dequeue()
       high_priority.erase(iter);
     }
     ceph_assert(std::get_if<OpSchedulerItem>(&ret));
+
+    scheduler_id_t id = scheduler_id_t {
+      op_scheduler_class::immediate,
+      client_profile_id_t()
+    };
+    _put_mclock_counter(id);
     return ret;
   } else {
     mclock_queue_t::PullReq result = scheduler.pull_request();
@@ -474,6 +549,7 @@ WorkItem mClockScheduler::dequeue()
       ceph_assert(result.is_retn());
 
       auto &retn = result.get_retn();
+      _put_mclock_counter(retn.client);
       return std::move(*retn.request);
     }
   }
@@ -486,26 +562,24 @@ std::string mClockScheduler::display_queues() const
   return out.str();
 }
 
-const char** mClockScheduler::get_tracked_conf_keys() const
+std::vector<std::string> mClockScheduler::get_tracked_keys() const noexcept
 {
-  static const char* KEYS[] = {
-    "osd_mclock_scheduler_client_res",
-    "osd_mclock_scheduler_client_wgt",
-    "osd_mclock_scheduler_client_lim",
-    "osd_mclock_scheduler_background_recovery_res",
-    "osd_mclock_scheduler_background_recovery_wgt",
-    "osd_mclock_scheduler_background_recovery_lim",
-    "osd_mclock_scheduler_background_best_effort_res",
-    "osd_mclock_scheduler_background_best_effort_wgt",
-    "osd_mclock_scheduler_background_best_effort_lim",
-    "osd_mclock_max_capacity_iops_hdd",
-    "osd_mclock_max_capacity_iops_ssd",
-    "osd_mclock_max_sequential_bandwidth_hdd",
-    "osd_mclock_max_sequential_bandwidth_ssd",
-    "osd_mclock_profile",
-    NULL
+  return {
+    "osd_mclock_scheduler_client_res"s,
+    "osd_mclock_scheduler_client_wgt"s,
+    "osd_mclock_scheduler_client_lim"s,
+    "osd_mclock_scheduler_background_recovery_res"s,
+    "osd_mclock_scheduler_background_recovery_wgt"s,
+    "osd_mclock_scheduler_background_recovery_lim"s,
+    "osd_mclock_scheduler_background_best_effort_res"s,
+    "osd_mclock_scheduler_background_best_effort_wgt"s,
+    "osd_mclock_scheduler_background_best_effort_lim"s,
+    "osd_mclock_max_capacity_iops_hdd"s,
+    "osd_mclock_max_capacity_iops_ssd"s,
+    "osd_mclock_max_sequential_bandwidth_hdd"s,
+    "osd_mclock_max_sequential_bandwidth_ssd"s,
+    "osd_mclock_profile"s
   };
-  return KEYS;
 }
 
 void mClockScheduler::handle_conf_change(
@@ -594,6 +668,11 @@ void mClockScheduler::handle_conf_change(
 mClockScheduler::~mClockScheduler()
 {
   cct->_conf.remove_observer(this);
+  if (logger) {
+    cct->get_perfcounters_collection()->remove(logger);
+    delete logger;
+    logger = nullptr;
+  }
 }
 
 }

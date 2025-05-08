@@ -56,7 +56,7 @@ A sub-directory of the file system can be mounted by specifying the (absolute)
 path to the sub-directory right after "=" in the device part of the mount command.
 
 Mount helper application conventions dictate that the first two options are
-device to be mounted and the mountpoint for that device. Options must be
+device to be mounted and the mount point for that device. Options must be
 passed only after these fixed arguments.
 
 
@@ -192,12 +192,13 @@ Advanced
 :command:`wsync`
     Execute all namespace operations synchronously. This ensures that the
     namespace operation will only complete after receiving a reply from
-    the MDS. This is the default.
+    the MDS. 
 
 :command:`nowsync`
     Allow the client to do namespace operations asynchronously. When this
     option is enabled, a namespace operation may complete before the MDS
-    replies, if it has sufficient capabilities to do so.
+    replies, if it has sufficient capabilities to do so. This has been the
+    default since kernel version 5.16.
 
 :command:`crush_location=x`
     Specify the location of the client in terms of CRUSH hierarchy (since 5.8).

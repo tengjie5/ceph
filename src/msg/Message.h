@@ -18,9 +18,12 @@
 #include <concepts>
 #include <cstdlib>
 #include <ostream>
+#include <sstream>
 #include <string_view>
 
 #include <boost/intrusive/list.hpp>
+
+#include <fmt/core.h> // for FMT_VERSION
 #if FMT_VERSION >= 90000
 #include <fmt/ostream.h>
 #endif
@@ -30,7 +33,6 @@
 #include "common/ThrottleInterface.h"
 #include "common/config.h"
 #include "common/ref.h"
-#include "common/debug.h"
 #include "common/zipkin_trace.h"
 #include "common/tracer.h"
 #include "include/ceph_assert.h" // Because intrusive_ptr clobbers our assert...
@@ -135,6 +137,8 @@
 #define MSG_OSD_REPOPREPLY    113
 #define MSG_OSD_PG_UPDATE_LOG_MISSING  114
 #define MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY  115
+
+#define MSG_OSD_PG_PCT 136
 
 #define MSG_OSD_PG_CREATED      116
 #define MSG_OSD_REP_SCRUBMAP    117
@@ -242,13 +246,19 @@
 // *** ceph-mgr <-> MON daemons ***
 #define MSG_MGR_UPDATE     0x70b
 
+// *** nvmeof mon -> gw daemons ***
+#define MSG_MNVMEOF_GW_MAP        0x800
+
+// *** gw daemons -> nvmeof mon  ***
+#define MSG_MNVMEOF_GW_BEACON     0x801
+
 // ======================================================
 
 // abstract Message class
 
 class Message : public RefCountedObject {
 public:
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
   // In crimson, conn is independently maintained outside Message.
   using ConnectionRef = void*;
 #else
@@ -256,8 +266,8 @@ public:
 #endif
 
 protected:
-  ceph_msg_header  header;      // headerelope
-  ceph_msg_footer  footer;
+  ceph_msg_header  header{};      // headerelope
+  ceph_msg_footer  footer{};
   ceph::buffer::list       payload;  // "front" unaligned blob
   ceph::buffer::list       middle;   // "middle" unaligned blob
   ceph::buffer::list       data;     // data payload (page-alignment will be preserved where possible)
@@ -326,16 +336,11 @@ protected:
   friend class Messenger;
 
 public:
-  Message() {
-    memset(&header, 0, sizeof(header));
-    memset(&footer, 0, sizeof(footer));
-  }
+  Message() = default;
   Message(int t, int version=1, int compat_version=0) {
-    memset(&header, 0, sizeof(header));
     header.type = t;
     header.version = version;
     header.compat_version = compat_version;
-    memset(&footer, 0, sizeof(footer));
   }
 
   Message *get() {
@@ -354,13 +359,13 @@ protected:
   }
 public:
   const ConnectionRef& get_connection() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #endif
     return connection;
   }
   void set_connection(ConnectionRef c) {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     // In crimson, conn is independently maintained outside Message.
     ceph_assert(c == nullptr);
 #endif
@@ -436,6 +441,7 @@ public:
       byte_throttler->take(middle.length());
   }
   ceph::buffer::list& get_middle() { return middle; }
+  const ceph::buffer::list& get_middle() const { return middle; }
 
   void set_data(const ceph::buffer::list &bl) {
     if (byte_throttler)
@@ -500,7 +506,7 @@ public:
     return entity_name_t(header.src);
   }
   entity_addr_t get_source_addr() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #else
     if (connection)
@@ -509,7 +515,7 @@ public:
     return entity_addr_t();
   }
   entity_addrvec_t get_source_addrs() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #else
     if (connection)
@@ -572,7 +578,7 @@ class SafeMessage : public Message {
 public:
   using Message::Message;
   bool is_a_client() const {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     ceph_abort("In crimson, conn is independently maintained outside Message");
 #else
     return get_connection()->get_peer_type() == CEPH_ENTITY_TYPE_CLIENT;
@@ -611,7 +617,7 @@ struct formatter<M> {
     std::ostringstream oss;
     m.print(oss);
     if (auto ver = m.get_header().version; ver) {
-      return fmt::format_to(ctx.out(), "{} v{}", oss.str(), ver);
+      return fmt::format_to(ctx.out(), "{} v{}", oss.str(), (uint32_t)ver);
     } else {
       return fmt::format_to(ctx.out(), "{}", oss.str());
     }

@@ -143,6 +143,14 @@ The types of damage that can be reported and repaired by File System Scrub are:
 
 * BACKTRACE : Inode's backtrace in the data pool is corrupted.
 
+These above named MDS damages can be repaired by using the following command::
+
+    ceph tell mds.<fsname>:0 scrub start /path recursive, repair, force
+
+If scrub is able to repair the damage, the corresponding entry is automatically
+removed from the damage table.
+
+
 Evaluate strays using recursive scrub
 =====================================
 
@@ -154,3 +162,30 @@ Evaluate strays using recursive scrub
   at root, run scrub with flags ``scrub_mdsdir`` and ``recursive``::
 
     ceph tell mds.<fsname>:0 scrub start / recursive,scrub_mdsdir
+
+Dump stray folder content
+=====================================
+
+- In order to dump stray folder content on a specific MDS, use the following command::
+
+    ceph tell mds.<fsname>:0 dump stray
+    {
+    "strays": [
+        {
+            "ino": "0x100000001f7",
+            "stray_prior_path": "/dir/dir1",
+            "client_caps": [
+                {
+                    "client_id": 4156,
+                    "pending": "pAsLsXsFscr",
+                    "issued": "pAsLsXsFscr",
+                    "wanted": "-",
+                    "last_sent": 3
+                }
+            ],
+            "loner": -1,
+            "want_loner": -1,
+            "mds_caps_wanted": [],
+            "is_subvolume": false
+        }
+    ]}

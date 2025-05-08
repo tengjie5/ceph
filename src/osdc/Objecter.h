@@ -15,12 +15,10 @@
 #ifndef CEPH_OBJECTER_H
 #define CEPH_OBJECTER_H
 
-#include <condition_variable>
 #include <list>
 #include <map>
 #include <mutex>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -36,8 +34,6 @@
 #include <boost/asio/io_context_strand.hpp>
 #include <boost/asio/post.hpp>
 
-#include <fmt/format.h>
-
 #include "include/buffer.h"
 #include "include/ceph_assert.h"
 #include "include/ceph_fs.h"
@@ -48,16 +44,17 @@
 #include "include/function2.hpp"
 #include "include/neorados/RADOS_Decodable.hpp"
 
-#include "common/async/completion.h"
 #include "common/admin_socket.h"
 #include "common/ceph_time.h"
 #include "common/ceph_mutex.h"
 #include "common/ceph_timer.h"
 #include "common/config_obs.h"
 #include "common/shunique_lock.h"
+#include "common/snap_types.h" // for class SnapContext
 #include "common/zipkin_trace.h"
 #include "common/tracer.h"
 #include "common/Throttle.h"
+#include "crush/crush.h" // for CRUSH_ITEM_NONE
 
 #include "mon/MonClient.h"
 
@@ -1693,7 +1690,7 @@ public:
   using OpCompletion = boost::asio::any_completion_handler<OpSignature>;
 
   // config observer bits
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) override;
 
@@ -1723,6 +1720,8 @@ private:
   std::atomic<int> global_op_flags{0}; // flags which are applied to each IO op
   bool keep_balanced_budget = false;
   bool honor_pool_full = true;
+
+  std::atomic<int> extra_read_flags{0};
 
   // If this is true, accumulate a set of blocklisted entities
   // to be drained by consume_blocklist_events.
@@ -1857,6 +1856,7 @@ public:
     int min_size = -1; ///< the min size of the pool when were were last mapped
     bool sort_bitwise = false; ///< whether the hobject_t sort order is bitwise
     bool recovery_deletes = false; ///< whether the deletes are performed during recovery instead of peering
+    bool allows_ecoptimizations = false; ///< whether EC plugin optimizations are enabled.
     uint32_t peering_crush_bucket_count = 0;
     uint32_t peering_crush_bucket_target = 0;
     uint32_t peering_crush_bucket_barrier = 0;
@@ -1968,30 +1968,6 @@ public:
     }
   }
 
-  boost::asio::any_completion_handler<void(boost::system::error_code)>
-  OpCompletionVert(std::unique_ptr<ceph::async::Completion<
-		     void(boost::system::error_code)>> c) {
-    if (c)
-      return [c = std::move(c)](boost::system::error_code ec) mutable {
-	c->dispatch(std::move(c), ec);
-      };
-    else
-      return nullptr;
-  }
-
-  template<typename T>
-  boost::asio::any_completion_handler<void(boost::system::error_code, T)>
-  OpCompletionVert(std::unique_ptr<ceph::async::Completion<
-		     void(boost::system::error_code, T)>> c) {
-    if (c) {
-      return [c = std::move(c)](boost::system::error_code ec, T t) mutable {
-	c->dispatch(std::move(c), ec, std::move(t));
-      };
-    } else {
-      return nullptr;
-    }
-  }
-
   struct Op : public RefCountedObject {
     OSDSession *session = nullptr;
     int incarnation = 0;
@@ -2088,7 +2064,7 @@ public:
     }
 
     Op(const object_t& o, const object_locator_t& ol,  osdc_opvec&& _ops,
-       int f, OpComp&& fin, version_t *ov, int *offset = nullptr,
+       int f, OpComp fin, version_t *ov, int *offset = nullptr,
        ZTracer::Trace *parent_trace = nullptr) :
       target(o, ol, f),
       ops(std::move(_ops)),
@@ -2120,26 +2096,6 @@ public:
       objver(ov),
       data_offset(offset),
       otel_trace(otel_trace) {
-      if (target.base_oloc.key == o)
-	target.base_oloc.key.clear();
-      if (parent_trace && parent_trace->valid()) {
-        trace.init("op", nullptr, parent_trace);
-        trace.event("start");
-      }
-    }
-
-    Op(const object_t& o, const object_locator_t& ol, osdc_opvec&&  _ops,
-       int f, fu2::unique_function<OpSig>&& fin, version_t *ov, int *offset = nullptr,
-       ZTracer::Trace *parent_trace = nullptr) :
-      target(o, ol, f),
-      ops(std::move(_ops)),
-      out_bl(ops.size(), nullptr),
-      out_handler(ops.size()),
-      out_rval(ops.size(), nullptr),
-      out_ec(ops.size(), nullptr),
-      onfinish(std::move(fin)),
-      objver(ov),
-      data_offset(offset) {
       if (target.base_oloc.key == o)
 	target.base_oloc.key.clear();
       if (parent_trace && parent_trace->valid()) {
@@ -2402,6 +2358,11 @@ public:
 			      uint64_t cookie,
 			      uint64_t notifier_id,
 			      ceph::buffer::list&& bl)> handle;
+    // I am sorely tempted to replace function2 with cxx_function, as
+    // cxx_function has the `target` method from `std::function` and I
+    // keep having to do annoying circumlocutions like this one to be
+    // able to access function object data with function2.
+    ceph::unique_any user_data;
     OSDSession *session{nullptr};
 
     int ctx_budget{-1};
@@ -2755,7 +2716,8 @@ private:
 
   // messages
  public:
-  bool ms_dispatch(Message *m) override;
+  Dispatcher::dispatch_result_t ms_dispatch2(const MessageRef &m) override;
+
   bool ms_can_fast_dispatch_any() const override {
     return true;
   }
@@ -2768,10 +2730,8 @@ private:
       return false;
     }
   }
-  void ms_fast_dispatch(Message *m) override {
-    if (!ms_dispatch(m)) {
-      m->put();
-    }
+  void ms_fast_dispatch2(const MessageRef& m) override {
+    [[maybe_unused]] auto s = ms_dispatch2(m);
   }
 
   void handle_osd_op_reply(class MOSDOpReply *m);
@@ -2971,6 +2931,12 @@ public:
 private:
   int op_cancel(OSDSession *s, ceph_tid_t tid, int r);
   int _op_cancel(ceph_tid_t tid, int r);
+
+  int get_read_flags(int flags) {
+    return flags | global_op_flags | extra_read_flags.load(std::memory_order_relaxed) |
+                   CEPH_OSD_FLAG_READ;
+  }
+
 public:
   int op_cancel(ceph_tid_t tid, int r);
   int op_cancel(const std::vector<ceph_tid_t>& tidls, int r);
@@ -3109,13 +3075,13 @@ public:
   Op *prepare_read_op(
     const object_t& oid, const object_locator_t& oloc,
     ObjectOperation& op,
-    snapid_t snapid, ceph::buffer::list *pbl, int flags,
+    snapid_t snapid, ceph::buffer::list *pbl,
+    int flags, int flags_mask,
     Context *onack, version_t *objver = NULL,
     int *data_offset = NULL,
     uint64_t features = 0,
     ZTracer::Trace *parent_trace = nullptr) {
-    Op *o = new Op(oid, oloc, std::move(op.ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onack, objver,
+    Op *o = new Op(oid, oloc, std::move(op.ops), get_read_flags(flags) & flags_mask, onack, objver,
 		   data_offset, parent_trace);
     o->priority = op.priority;
     o->snapid = snapid;
@@ -3136,7 +3102,7 @@ public:
     Context *onack, version_t *objver = NULL,
     int *data_offset = NULL,
     uint64_t features = 0) {
-    Op *o = prepare_read_op(oid, oloc, op, snapid, pbl, flags, onack, objver,
+    Op *o = prepare_read_op(oid, oloc, op, snapid, pbl, flags, -1, onack, objver,
 			    data_offset);
     if (features)
       o->features = features;
@@ -3150,8 +3116,8 @@ public:
 	    int flags, Op::OpComp onack,
 	    version_t *objver = nullptr, int *data_offset = nullptr,
 	    uint64_t features = 0, ZTracer::Trace *parent_trace = nullptr) {
-    Op *o = new Op(oid, oloc, std::move(op.ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, std::move(onack), objver,
+    Op *o = new Op(oid, oloc, std::move(op.ops), get_read_flags(flags),
+		   std::move(onack), objver,
 		   data_offset, parent_trace);
     o->priority = op.priority;
     o->snapid = snapid;
@@ -3189,7 +3155,7 @@ public:
     int *ctx_budget) {
     Op *o = new Op(object_t(), oloc,
 		   std::move(op.ops),
-		   flags | global_op_flags | CEPH_OSD_FLAG_READ |
+		   get_read_flags(flags) |
 		   CEPH_OSD_FLAG_IGNORE_OVERLAY,
 		   onack, NULL);
     o->target.precalc_pgid = true;
@@ -3268,18 +3234,6 @@ public:
     return linger_watch(info, op, snapc, mtime, inbl,
 			OpContextVert<ceph::buffer::list>(onfinish, nullptr), objver);
   }
-  ceph_tid_t linger_watch(LingerOp *info,
-			  ObjectOperation& op,
-			  const SnapContext& snapc, ceph::real_time mtime,
-			  ceph::buffer::list& inbl,
-			  std::unique_ptr<ceph::async::Completion<
-			    void(boost::system::error_code,
-			         ceph::buffer::list)>> onfinish,
-			  version_t *objver) {
-    return linger_watch(info, op, snapc, mtime, inbl,
-			OpCompletionVert<ceph::buffer::list>(
-			  std::move(onfinish)), objver);
-  }
   ceph_tid_t linger_notify(LingerOp *info,
 			   ObjectOperation& op,
 			   snapid_t snap, ceph::buffer::list& inbl,
@@ -3294,17 +3248,6 @@ public:
     return linger_notify(info, op, snap, inbl,
 			 OpContextVert(onack, poutbl),
 			 objver);
-  }
-  ceph_tid_t linger_notify(LingerOp *info,
-			   ObjectOperation& op,
-			   snapid_t snap, ceph::buffer::list& inbl,
-			   std::unique_ptr<ceph::async::Completion<
-			     void(boost::system::error_code,
-			          ceph::buffer::list)>> onack,
-			   version_t *objver) {
-    return linger_notify(info, op, snap, inbl,
-			 OpCompletionVert<ceph::buffer::list>(
-			   std::move(onack)), objver);
   }
   tl::expected<ceph::timespan,
 	       boost::system::error_code> linger_check(LingerOp *info);
@@ -3352,8 +3295,8 @@ public:
     int i = init_ops(ops, 1, extra_ops);
     ops[i].op.op = CEPH_OSD_OP_STAT;
     C_Stat *fin = new C_Stat(psize, pmtime, onfinish);
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, fin, objver);
+    Op *o = new Op(oid, oloc, std::move(ops),
+		   get_read_flags(flags), fin, objver);
     o->snapid = snap;
     o->outbl = &fin->bl;
     return o;
@@ -3384,8 +3327,7 @@ public:
     ops[i].op.extent.truncate_size = 0;
     ops[i].op.extent.truncate_seq = 0;
     ops[i].op.flags = op_flags;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver,
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver,
 		   nullptr, parent_trace);
     o->snapid = snap;
     o->outbl = pbl;
@@ -3417,8 +3359,7 @@ public:
     ops[i].op.extent.truncate_seq = 0;
     ops[i].indata = cmp_bl;
     ops[i].op.flags = op_flags;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     return o;
   }
@@ -3449,8 +3390,7 @@ public:
     ops[i].op.extent.truncate_size = trunc_size;
     ops[i].op.extent.truncate_seq = trunc_seq;
     ops[i].op.flags = op_flags;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     o->outbl = pbl;
     ceph_tid_t tid;
@@ -3468,8 +3408,7 @@ public:
     ops[i].op.extent.length = len;
     ops[i].op.extent.truncate_size = 0;
     ops[i].op.extent.truncate_seq = 0;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     o->outbl = pbl;
     ceph_tid_t tid;
@@ -3487,8 +3426,7 @@ public:
     ops[i].op.xattr.value_len = 0;
     if (name)
       ops[i].indata.append(name, ops[i].op.xattr.name_len);
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     o->outbl = pbl;
     ceph_tid_t tid;
@@ -3504,8 +3442,7 @@ public:
     int i = init_ops(ops, 1, extra_ops);
     ops[i].op.op = CEPH_OSD_OP_GETXATTRS;
     C_GetAttrs *fin = new C_GetAttrs(attrset, onfinish);
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, fin, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), fin, objver);
     o->snapid = snap;
     o->outbl = &fin->bl;
     ceph_tid_t tid;
@@ -3886,12 +3823,6 @@ public:
     create_pool_snap(pool, snapName,
 		     OpContextVert<ceph::buffer::list>(c, nullptr));
   }
-  void create_pool_snap(
-    int64_t pool, std::string_view snapName,
-    std::unique_ptr<ceph::async::Completion<PoolOp::OpSig>> c) {
-    create_pool_snap(pool, snapName,
-		     OpCompletionVert<ceph::buffer::list>(std::move(c)));
-  }
   void allocate_selfmanaged_snap(int64_t pool,
 				 boost::asio::any_completion_handler<
 				 void(boost::system::error_code,
@@ -3901,24 +3832,12 @@ public:
     allocate_selfmanaged_snap(pool,
 			      OpContextVert(c, psnapid));
   }
-  void allocate_selfmanaged_snap(int64_t pool,
-				 std::unique_ptr<ceph::async::Completion<void(
-				   boost::system::error_code, snapid_t)>> c) {
-    allocate_selfmanaged_snap(pool,
-			      OpCompletionVert<snapid_t>(std::move(c)));
-  }
   void delete_pool_snap(int64_t pool, std::string_view snapName,
 			decltype(PoolOp::onfinish)&& onfinish);
   void delete_pool_snap(int64_t pool, std::string_view snapName,
 			Context* c) {
     delete_pool_snap(pool, snapName,
 		     OpContextVert<ceph::buffer::list>(c, nullptr));
-  }
-  void delete_pool_snap(int64_t pool, std::string_view snapName,
-			std::unique_ptr<ceph::async::Completion<void(
-                          boost::system::error_code, ceph::buffer::list)>> c) {
-    delete_pool_snap(pool, snapName,
-		     OpCompletionVert<ceph::buffer::list>(std::move(c)));
   }
 
   void delete_selfmanaged_snap(int64_t pool, snapid_t snap,
@@ -3927,12 +3846,6 @@ public:
 			       Context* c) {
     delete_selfmanaged_snap(pool, snap,
 			    OpContextVert<ceph::buffer::list>(c, nullptr));
-  }
-  void delete_selfmanaged_snap(int64_t pool, snapid_t snap,
-			       std::unique_ptr<ceph::async::Completion<void(
-                                 boost::system::error_code, ceph::buffer::list)>> c) {
-    delete_selfmanaged_snap(pool, snap,
-			    OpCompletionVert<ceph::buffer::list>(std::move(c)));
   }
 
 
@@ -3945,24 +3858,11 @@ public:
 		OpContextVert<ceph::buffer::list>(onfinish, nullptr),
 		crush_rule);
   }
-  void create_pool(std::string_view name,
-		   std::unique_ptr<ceph::async::Completion<void(
-                     boost::system::error_code, ceph::buffer::list)>> c,
-		   int crush_rule=-1) {
-    create_pool(name,
-		OpCompletionVert<ceph::buffer::list>(std::move(c)),
-		crush_rule);
-  }
   void delete_pool(int64_t pool,
 		   decltype(PoolOp::onfinish)&& onfinish);
   void delete_pool(int64_t pool,
 		   Context* onfinish) {
     delete_pool(pool, OpContextVert<ceph::buffer::list>(onfinish, nullptr));
-  }
-  void delete_pool(int64_t pool,
-		   std::unique_ptr<ceph::async::Completion<void(
-                    boost::system::error_code, ceph::buffer::list)>> c) {
-    delete_pool(pool, OpCompletionVert<ceph::buffer::list>(std::move(c)));
   }
 
   void delete_pool(std::string_view name,
@@ -3971,11 +3871,6 @@ public:
   void delete_pool(std::string_view name,
 		   Context* onfinish) {
     delete_pool(name, OpContextVert<ceph::buffer::list>(onfinish, nullptr));
-  }
-  void delete_pool(std::string_view name,
-		   std::unique_ptr<ceph::async::Completion<void(
-                     boost::system::error_code, ceph::buffer::list)>> c) {
-    delete_pool(name, OpCompletionVert<ceph::buffer::list>(std::move(c)));
   }
 
   void handle_pool_op_reply(MPoolOpReply *m);
@@ -4025,11 +3920,6 @@ public:
   void get_fs_stats(struct ceph_statfs& result, std::optional<int64_t> poolid,
 		    Context *onfinish) {
     get_fs_stats_(poolid, OpContextVert(onfinish, result));
-  }
-  void get_fs_stats(std::optional<int64_t> poolid,
-		    std::unique_ptr<ceph::async::Completion<void(
-                      boost::system::error_code, struct ceph_statfs)>> c) {
-    get_fs_stats_(poolid, OpCompletionVert<struct ceph_statfs>(std::move(c)));
   }
   int statfs_op_cancel(ceph_tid_t tid, int r);
   void _finish_statfs_op(StatfsOp *op, int r);

@@ -22,8 +22,6 @@
 #include "include/xlist.h"
 #include "include/elist.h"
 
-#include "common/config.h"
-
 #include "mdstypes.h"
 
 
@@ -100,6 +98,7 @@ public:
     void encode(ceph::buffer::list &bl) const;
     void decode(ceph::buffer::list::const_iterator &p);
     void dump(ceph::Formatter *f) const;
+    static void generate_test_instances(std::list<Import*>& ls);
 
     int64_t cap_id = 0;
     ceph_seq_t issue_seq = 0;
@@ -216,8 +215,6 @@ public:
 
   void set_cap_id(uint64_t i) { cap_id = i; }
   uint64_t get_cap_id() const { return cap_id; }
-
-  //ceph_seq_t get_last_issue() { return last_issue; }
 
   bool is_suppress() const { return suppress > 0; }
   void inc_suppress() { suppress++; }
@@ -336,9 +333,9 @@ public:
   int64_t last_rsize = 0;
 
   xlist<Capability*>::item item_session_caps;
-  xlist<Capability*>::item item_snaprealm_caps;
-  xlist<Capability*>::item item_revoking_caps;
-  xlist<Capability*>::item item_client_revoking_caps;
+  elist<Capability*>::item item_snaprealm_caps;
+  elist<Capability*>::item item_revoking_caps;
+  elist<Capability*>::item item_client_revoking_caps;
 
   elist<MDLockCache*> lock_caches;
   int get_lock_cache_allowed() const { return lock_cache_allowed; }

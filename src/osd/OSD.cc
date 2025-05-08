@@ -13,10 +13,13 @@
  *
  */
 
+#include "OSD.h"
+
 #include "acconfig.h"
 
 #include <cctype>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 
@@ -37,13 +40,14 @@
 #include "osd/PG.h"
 #include "osd/scrubber/scrub_machine.h"
 #include "osd/scrubber/pg_scrubber.h"
+#include "osd/ECCommon.h"
+#include "osd/ECInject.h"
 
 #include "include/types.h"
 #include "include/compat.h"
 #include "include/random.h"
 #include "include/scope_guard.h"
 
-#include "OSD.h"
 #include "OSDMap.h"
 #include "Watch.h"
 #include "osdc/Objecter.h"
@@ -52,6 +56,7 @@
 #include "common/ceph_argparse.h"
 #include "common/ceph_releases.h"
 #include "common/ceph_time.h"
+#include "common/debug.h"
 #include "common/version.h"
 #include "common/async/blocked_completion.h"
 #include "common/pick_address.h"
@@ -122,6 +127,7 @@
 #include "global/pidfile.h"
 
 #include "include/color.h"
+#include "log/Log.h"
 #include "perfglue/cpu_profiler.h"
 #include "perfglue/heap_profiler.h"
 
@@ -191,6 +197,8 @@ using ceph::make_mutex;
 using namespace ceph::osd::scheduler;
 using TOPNSPC::common::cmd_getval;
 using TOPNSPC::common::cmd_getval_or;
+using TOPNSPC::common::cmd_getval_cast_or;
+using namespace std::literals;
 
 static ostream& _prefix(std::ostream* _dout, int whoami, epoch_t epoch) {
   return *_dout << "osd." << whoami << " " << epoch << " ";
@@ -348,15 +356,16 @@ void OSDService::identify_splits_and_merges(
     return;
   }
   int old_pgnum = old_map->get_pg_num(pgid.pool());
-  auto p = osd->pg_num_history.pg_nums.find(pgid.pool());
-  if (p == osd->pg_num_history.pg_nums.end()) {
+  if (!osd->pg_num_history.pg_nums.contains(pgid.pool())) {
     dout(20) << __func__ << " " << pgid << " pool " << pgid.pool()
 	     << " has no history" << dendl;
     return;
   }
+  // The pgid's pool [epoch -> pg_num] map
+  const auto& pool_pg_num_history_map = osd->pg_num_history.pg_nums[pgid.pool()];
   dout(20) << __func__ << " " << pgid << " e" << old_map->get_epoch()
 	   << " to e" << new_map->get_epoch()
-	   << " pg_nums " << p->second << dendl;
+	   << " pg_nums " << pool_pg_num_history_map << dendl;
   deque<spg_t> queue;
   queue.push_back(pgid);
   set<spg_t> did;
@@ -365,83 +374,87 @@ void OSDService::identify_splits_and_merges(
     queue.pop_front();
     did.insert(cur);
     unsigned pgnum = old_pgnum;
-    for (auto q = p->second.lower_bound(old_map->get_epoch());
-	 q != p->second.end() &&
-	   q->first <= new_map->get_epoch();
-	 ++q) {
-      if (pgnum < q->second) {
+    for (auto map_iter = pool_pg_num_history_map.lower_bound(old_map->get_epoch());
+	 map_iter != pool_pg_num_history_map.end();
+	 ++map_iter) {
+      const auto& [new_epoch, new_pgnum] = *map_iter;
+      if (new_epoch > new_map->get_epoch()) {
+        // don't handle any changes recorded later than new_map's epoch
+        break;
+      }
+      if (pgnum < new_pgnum) {
 	// split?
 	if (cur.ps() < pgnum) {
 	  set<spg_t> children;
-	  if (cur.is_split(pgnum, q->second, &children)) {
-	    dout(20) << __func__ << " " << cur << " e" << q->first
-		     << " pg_num " << pgnum << " -> " << q->second
+	  if (cur.is_split(pgnum, new_pgnum, &children)) {
+	    dout(20) << __func__ << " " << cur << " e" << new_epoch
+		     << " pg_num " << pgnum << " -> " << new_pgnum
 		     << " children " << children << dendl;
 	    for (auto i : children) {
-	      split_children->insert(make_pair(i, q->first));
+	      split_children->insert(make_pair(i, new_epoch));
               if (!did.count(i))
 	        queue.push_back(i);
 	    }
 	  }
-	} else if (cur.ps() < q->second) {
-	  dout(20) << __func__ << " " << cur << " e" << q->first
-		   << " pg_num " << pgnum << " -> " << q->second
+	} else if (cur.ps() < new_pgnum) {
+	  dout(20) << __func__ << " " << cur << " e" << new_epoch
+		   << " pg_num " << pgnum << " -> " << new_pgnum
 		   << " is a child" << dendl;
 	  // normally we'd capture this from the parent, but it's
 	  // possible the parent doesn't exist yet (it will be
 	  // fabricated to allow an intervening merge).  note this PG
 	  // as a split child here to be sure we catch it.
-	  split_children->insert(make_pair(cur, q->first));
+	  split_children->insert(make_pair(cur, new_epoch));
 	} else {
-	  dout(20) << __func__ << " " << cur << " e" << q->first
-		   << " pg_num " << pgnum << " -> " << q->second
+	  dout(20) << __func__ << " " << cur << " e" << new_epoch
+		   << " pg_num " << pgnum << " -> " << new_pgnum
 		   << " is post-split, skipping" << dendl;
 	}
       } else if (merge_pgs) {
 	// merge?
-	if (cur.ps() >= q->second) {
+	if (cur.ps() >= new_pgnum) {
 	  if (cur.ps() < pgnum) {
 	    spg_t parent;
-	    if (cur.is_merge_source(pgnum, q->second, &parent)) {
+	    if (cur.is_merge_source(pgnum, new_pgnum, &parent)) {
 	      set<spg_t> children;
-	      parent.is_split(q->second, pgnum, &children);
-	      dout(20) << __func__ << " " << cur << " e" << q->first
-		       << " pg_num " << pgnum << " -> " << q->second
+	      parent.is_split(new_pgnum, pgnum, &children);
+	      dout(20) << __func__ << " " << cur << " e" << new_epoch
+		       << " pg_num " << pgnum << " -> " << new_pgnum
 		       << " is merge source, target " << parent
 		       << ", source(s) " << children << dendl;
-	      merge_pgs->insert(make_pair(parent, q->first));
+	      merge_pgs->insert(make_pair(parent, new_epoch));
               if (!did.count(parent)) {
                 // queue (and re-scan) parent in case it might not exist yet
                 // and there are some future splits pending on it
                 queue.push_back(parent);
               }
 	      for (auto c : children) {
-		merge_pgs->insert(make_pair(c, q->first));
+		merge_pgs->insert(make_pair(c, new_epoch));
                 if (!did.count(c))
                   queue.push_back(c);
 	      }
 	    }
 	  } else {
-	    dout(20) << __func__ << " " << cur << " e" << q->first
-		     << " pg_num " << pgnum << " -> " << q->second
+	    dout(20) << __func__ << " " << cur << " e" << new_epoch
+		     << " pg_num " << pgnum << " -> " << new_pgnum
 		     << " is beyond old pgnum, skipping" << dendl;
 	  }
 	} else {
 	  set<spg_t> children;
-	  if (cur.is_split(q->second, pgnum, &children)) {
-	    dout(20) << __func__ << " " << cur << " e" << q->first
-		     << " pg_num " << pgnum << " -> " << q->second
+	  if (cur.is_split(new_pgnum, pgnum, &children)) {
+	    dout(20) << __func__ << " " << cur << " e" << new_epoch
+		     << " pg_num " << pgnum << " -> " << new_pgnum
 		     << " is merge target, source " << children << dendl;
 	    for (auto c : children) {
-	      merge_pgs->insert(make_pair(c, q->first));
+	      merge_pgs->insert(make_pair(c, new_epoch));
               if (!did.count(c))
                 queue.push_back(c);
 	    }
-	    merge_pgs->insert(make_pair(cur, q->first));
+	    merge_pgs->insert(make_pair(cur, new_epoch));
 	  }
 	}
       }
-      pgnum = q->second;
+      pgnum = new_pgnum;
     }
   }
 }
@@ -499,6 +512,8 @@ void OSDService::shutdown_reserver()
 
 void OSDService::shutdown()
 {
+  pg_timer.stop();
+
   mono_timer.suspend();
 
   {
@@ -1059,7 +1074,12 @@ void OSDService::inc_osd_stat_repaired()
 {
   std::lock_guard l(stat_lock);
   osd_stat.num_shards_repaired++;
-  return;
+}
+
+void OSDService::set_osd_stat_repaired(int64_t count)
+{
+  std::lock_guard l(stat_lock);
+  osd_stat.num_shards_repaired = count;
 }
 
 float OSDService::compute_adjusted_ratio(osd_stat_t new_stat, float *pratio,
@@ -1814,11 +1834,6 @@ void OSDService::queue_for_scrub(PG* pg, Scrub::scrub_prio_t with_priority)
   queue_scrub_event_msg_default_cost<PGScrub>(pg, with_priority);
 }
 
-void OSDService::queue_scrub_after_repair(PG* pg, Scrub::scrub_prio_t with_priority)
-{
-  queue_scrub_event_msg_default_cost<PGScrubAfterRepair>(pg, with_priority);
-}
-
 void OSDService::queue_for_rep_scrub(PG* pg,
 				     Scrub::scrub_prio_t with_priority,
 				     unsigned int qu_priority,
@@ -2123,6 +2138,7 @@ void OSD::write_superblock(CephContext* cct, OSDSuperblock& sb, ObjectStore::Tra
 
   bufferlist bl;
   encode(sb, bl);
+  t.truncate(coll_t::meta(), OSD_SUPERBLOCK_GOBJECT, 0);
   t.write(coll_t::meta(), OSD_SUPERBLOCK_GOBJECT, 0, bl.length(), bl);
   std::map<std::string, ceph::buffer::list> attrs;
   attrs.emplace(OSD_SUPERBLOCK_OMAP_KEY, bl);
@@ -2428,7 +2444,7 @@ OSD::OSD(CephContext *cct_,
       } else {
         // This should never happen
         dout(0) << "Invalid value passed for 'osd_op_queue': " << type << dendl;
-        ceph_assert(0 == "Unsupported op queue type");
+        ceph_abort_msg("Unsupported op queue type");
       }
     } else {
       static const std::vector<op_queue_type_t> index_lookup = {
@@ -3219,6 +3235,11 @@ will start to track new ops received afterwards.";
     scrub_purged_snaps();
   }
 
+  else if (prefix == "clear_shards_repaired") {
+    int64_t count = cmd_getval_or<int64_t>(cmdmap, "count", 0);
+    service.set_osd_stat_repaired(count);
+  }
+
   else if (prefix == "reset_purged_snaps_last") {
     lock_guard l(osd_lock);
     superblock.purged_snaps_last = 0;
@@ -3467,10 +3488,14 @@ int OSD::run_osd_bench_test(
     bsize = osize;
   }
 
-  dout(1) << " bench count " << count
-          << " bsize " << byte_u_t(bsize) << dendl;
+  dout(0) << " bench count " << count
+          << " bsize " << byte_u_t(bsize)
+          << " onum " << onum
+          << " osize " << byte_u_t(osize)
+          << dendl;
 
   ObjectStore::Transaction cleanupt;
+  utime_t start = ceph_clock_now();
 
   if (osize && onum) {
     bufferlist bl;
@@ -3496,9 +3521,13 @@ int OSD::run_osd_bench_test(
       waiter.wait();
     }
   }
+  dout(0) << __func__
+          << " prefill took " << ceph_clock_now() - start
+          << dendl;
 
+
+  start = ceph_clock_now();
   bufferlist bl;
-  utime_t start = ceph_clock_now();
   for (int64_t pos = 0; pos < count; pos += bsize) {
     char nm[34];
     unsigned offset = 0;
@@ -3531,6 +3560,9 @@ int OSD::run_osd_bench_test(
   }
   utime_t end = ceph_clock_now();
   *elapsed = end - start;
+  dout(0) << __func__
+          << " benchmark took " << *elapsed
+          << dendl;
 
   // clean up
   store->queue_transaction(service.meta_ch, std::move(cleanupt), nullptr);
@@ -3665,6 +3697,21 @@ float OSD::get_osd_recovery_sleep()
     return cct->_conf.get_val<double>("osd_recovery_sleep_hybrid");
   else
     return cct->_conf->osd_recovery_sleep_hdd;
+}
+
+float OSD::get_osd_recovery_sleep_degraded() {
+  float osd_recovery_sleep_degraded =
+    cct->_conf.get_val<double>("osd_recovery_sleep_degraded");
+  if (osd_recovery_sleep_degraded > 0) {
+    return osd_recovery_sleep_degraded;
+  }
+  if (!store_is_rotational && !journal_is_rotational) {
+    return cct->_conf.get_val<double>("osd_recovery_sleep_degraded_ssd");
+  } else if (store_is_rotational && !journal_is_rotational) {
+    return cct->_conf.get_val<double>("osd_recovery_sleep_degraded_hybrid");
+  } else {
+    return cct->_conf.get_val<double>("osd_recovery_sleep_degraded_hdd");
+  }
 }
 
 float OSD::get_osd_delete_sleep()
@@ -3862,14 +3909,9 @@ int OSD::init()
   if (superblock.compat_features.merge(initial)) {
     // Are we adding SNAPMAPPER2?
     if (diff.incompat.contains(CEPH_OSD_FEATURE_INCOMPAT_SNAPMAPPER2)) {
-      dout(1) << __func__ << " upgrade snap_mapper (first start as octopus)"
-	      << dendl;
-      auto ch = service.meta_ch;
-      auto hoid = make_snapmapper_oid();
-      unsigned max = cct->_conf->osd_target_transaction_size;
-      r = SnapMapper::convert_legacy(cct, store.get(), ch, hoid, max);
-      if (r < 0)
-	goto out;
+      derr << __func__ << " snap_mapper upgrade from pre-octopus"
+	   << " is no longer supported" << dendl;
+      ceph_abort();
     }
     // We need to persist the new compat_set before we
     // do anything else
@@ -3929,11 +3971,6 @@ int OSD::init()
   load_pgs();
 
   dout(2) << "superblock: I am osd." << superblock.whoami << dendl;
-
-  if (cct->_conf.get_val<bool>("osd_compact_on_start")) {
-    dout(2) << "compacting object store's DB" << dendl;
-    store->compact();
-  }
 
   // prime osd stats
   {
@@ -4079,6 +4116,11 @@ int OSD::init()
   osd_lock.lock();
   if (is_stopping())
     return 0;
+
+  if (cct->_conf.get_val<bool>("osd_compact_on_start")) {
+    dout(2) << "compacting object store's DB" << dendl;
+    store->compact();
+  }
 
   // start objecter *after* we have authenticated, so that we don't ignore
   // the OSDMaps it requests.
@@ -4336,6 +4378,46 @@ void OSD::final_init()
     "inject metadata error to an object");
   ceph_assert(r == 0);
   r = admin_socket->register_command(
+    "injectecreaderr " \
+    "name=pool,type=CephString " \
+    "name=objname,type=CephObjectname " \
+    "name=shardid,type=CephInt,req=true,range=0|255 " \
+    "name=type,type=CephInt,req=false " \
+    "name=when,type=CephInt,req=false " \
+    "name=duration,type=CephInt,req=false",
+    test_ops_hook,
+    "inject error for read of object in an EC pool");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "injectecclearreaderr " \
+    "name=pool,type=CephString " \
+    "name=objname,type=CephObjectname " \
+    "name=shardid,type=CephInt,req=true,range=0|255 " \
+    "name=type,type=CephInt,req=false",
+    test_ops_hook,
+    "clear read error injects for object in an EC pool");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "injectecwriteerr " \
+    "name=pool,type=CephString " \
+    "name=objname,type=CephObjectname " \
+    "name=shardid,type=CephInt,req=true,range=0|255 " \
+    "name=type,type=CephInt,req=false " \
+    "name=when,type=CephInt,req=false " \
+    "name=duration,type=CephInt,req=false",
+    test_ops_hook,
+    "inject error for write of object in an EC pool");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "injectecclearwriteerr " \
+    "name=pool,type=CephString " \
+    "name=objname,type=CephObjectname " \
+    "name=shardid,type=CephInt,req=true,range=0|255 " \
+    "name=type,type=CephInt,req=false",
+    test_ops_hook,
+    "clear write error inject for object in an EC pool");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command(
     "set_recovery_delay " \
     "name=utime,type=CephInt,req=false",
     test_ops_hook,
@@ -4439,6 +4521,12 @@ void OSD::final_init()
     "name=value,type=CephString,req=false",
     asok_hook,
     "debug the scrubber");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "clear_shards_repaired "
+    "name=count,type=CephInt,req=false,range=0",
+    asok_hook,
+    "clear num_shards_repaired to clear health warning");
   ceph_assert(r == 0);
 
   // -- pg commands --
@@ -4628,6 +4716,9 @@ int OSD::shutdown()
     // then, wait on osd_op_tp to drain (TBD: should probably add a timeout)
     osd_op_tp.drain();
     osd_op_tp.stop();
+
+    dout(10) << "stopping agent" << dendl;
+    service.agent_stop();
 
     utime_t  start_time_umount = ceph_clock_now();
     store->prepare_for_fast_shutdown();
@@ -5140,7 +5231,7 @@ PG* OSD::_make_pg(
   PG *pg;
   if (pi.type == pg_pool_t::TYPE_REPLICATED ||
       pi.type == pg_pool_t::TYPE_ERASURE)
-    pg = new PrimaryLogPG(&service, createmap, pool, ec_profile, pgid);
+    pg = new PrimaryLogPG(&service, createmap, pool, ec_profile, pgid, lookup_ec_extent_cache_lru(pgid));
   else
     ceph_abort();
   return pg;
@@ -5225,6 +5316,13 @@ bool OSD::try_finish_pg_delete(PG *pg, unsigned old_pg_num)
     service.logger->dec(l_osd_pg_stray);
 
   return true;
+}
+
+ECExtentCache::LRU &OSD::lookup_ec_extent_cache_lru(spg_t pgid) const
+{
+  uint32_t shard_index = pgid.hash_to_shard(num_shards);
+  auto sdata = shards[shard_index];
+  return sdata->ec_extent_cache_lru;
 }
 
 PGRef OSD::_lookup_pg(spg_t pgid)
@@ -6469,8 +6567,10 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
   //directly request the osd make a change.
   if (command == "setomapval" || command == "rmomapkey" ||
       command == "setomapheader" || command == "getomap" ||
-      command == "truncobj" || command == "injectmdataerr" ||
-      command == "injectdataerr"
+      command == "truncobj" ||
+      command == "injectmdataerr" || command == "injectdataerr" ||
+      command == "injectecreaderr" || command == "injectecclearreaderr" ||
+      command == "injectecwriteerr" || command == "injectecclearwriteerr"
     ) {
     pg_t rawpg;
     int64_t pool;
@@ -6504,13 +6604,28 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
       return;
     }
 
-    int64_t shardid = cmd_getval_or<int64_t>(cmdmap, "shardid", shard_id_t::NO_SHARD);
-    hobject_t obj(object_t(objname), string(""), CEPH_NOSNAP, rawpg.ps(), pool, nspace);
-    ghobject_t gobj(obj, ghobject_t::NO_GEN, shard_id_t(uint8_t(shardid)));
-    spg_t pgid(curmap->raw_pg_to_pg(rawpg), shard_id_t(shardid));
+    shard_id_t shardid =
+	cmd_getval_cast_or<int64_t>(cmdmap, "shardid", shard_id_t::NO_SHARD);
+    hobject_t obj(
+	object_t(objname), ""s, CEPH_NOSNAP, rawpg.ps(), pool, nspace);
+    ghobject_t gobj(obj, ghobject_t::NO_GEN, shardid);
+    spg_t pgid(curmap->raw_pg_to_pg(rawpg), shardid);
     if (curmap->pg_is_ec(rawpg)) {
-        if ((command != "injectdataerr") && (command != "injectmdataerr")) {
-            ss << "Must not call on ec pool, except injectdataerr or injectmdataerr";
+        if ((command != "injectdataerr") &&
+	    (command != "injectmdataerr") &&
+	    (command != "injectecreaderr") &&
+	    (command != "injectecclearreaderr") &&
+	    (command != "injectecwriteerr") &&
+	    (command != "injectecclearwriteerr")) {
+            ss << "Must not call on ec pool";
+            return;
+        }
+    } else {
+        if ((command == "injectecreaderr") ||
+	    (command == "injecteclearreaderr") ||
+	    (command == "injectecwriteerr") ||
+	    (command == "injecteclearwriteerr")) {
+            ss << "Only supported on ec pool";
             return;
         }
     }
@@ -6589,6 +6704,38 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
     } else if (command == "injectmdataerr") {
       store->inject_mdata_error(gobj);
       ss << "ok";
+    } else if (command == "injectecreaderr") {
+      if (service->cct->_conf->bluestore_debug_inject_read_err) {
+	int64_t type = cmd_getval_or<int64_t>(cmdmap, "type", 0);
+        int64_t when = cmd_getval_or<int64_t>(cmdmap, "when", 0);
+        int64_t duration = cmd_getval_or<int64_t>(cmdmap, "duration", 1);
+	ss << ECInject::read_error(gobj, type, when, duration);
+      } else {
+	ss << "bluestore_debug_inject_read_err not enabled";
+      }
+    } else if (command == "injectecclearreaderr") {
+      if (service->cct->_conf->bluestore_debug_inject_read_err) {
+	int64_t type = cmd_getval_or<int64_t>(cmdmap, "type", 0);
+	ss << ECInject::clear_read_error(gobj, type);
+      } else {
+	ss << "bluestore_debug_inject_read_err not enabled";
+      }
+    } else if (command == "injectecwriteerr") {
+      if (service->cct->_conf->bluestore_debug_inject_read_err) {
+	int64_t type = cmd_getval_or<int64_t>(cmdmap, "type", 0);
+	int64_t when = cmd_getval_or<int64_t>(cmdmap, "when", 0);
+        int64_t duration = cmd_getval_or<int64_t>(cmdmap, "duration", 1);
+	ss << ECInject::write_error(gobj, type, when, duration);
+      } else {
+	ss << "bluestore_debug_inject_read_err not enabled";
+      }
+    } else if (command == "injectecclearwriteerr") {
+      if (service->cct->_conf->bluestore_debug_inject_read_err) {
+	int64_t type = cmd_getval_or<int64_t>(cmdmap, "type", 0);
+	ss << ECInject::clear_write_error(gobj, type);
+      } else {
+	ss << "bluestore_debug_inject_read_err not enabled";
+      }
     }
     return;
   }
@@ -7645,9 +7792,8 @@ void OSD::ms_fast_dispatch(Message *m)
   OID_EVENT_TRACE_WITH_MSG(m, "MS_FAST_DISPATCH_END", false);
 }
 
-int OSD::ms_handle_fast_authentication(Connection *con)
+bool OSD::ms_handle_fast_authentication(Connection *con)
 {
-  int ret = 0;
   auto s = ceph::ref_cast<Session>(con->get_priv());
   if (!s) {
     s = ceph::make_ref<Session>(cct, con);
@@ -7665,6 +7811,7 @@ int OSD::ms_handle_fast_authentication(Connection *con)
   AuthCapsInfo &caps_info = con->get_peer_caps_info();
   if (caps_info.allow_all) {
     s->caps.set_allow_all();
+    return true;
   } else if (caps_info.caps.length() > 0) {
     bufferlist::const_iterator p = caps_info.caps.cbegin();
     string str;
@@ -7674,23 +7821,22 @@ int OSD::ms_handle_fast_authentication(Connection *con)
     catch (ceph::buffer::error& e) {
       dout(10) << __func__ << " session " << s << " " << s->entity_name
 	       << " failed to decode caps string" << dendl;
-      ret = -EACCES;
+      return false;
     }
-    if (!ret) {
-      bool success = s->caps.parse(str);
-      if (success) {
-	dout(10) << __func__ << " session " << s
-		 << " " << s->entity_name
-		 << " has caps " << s->caps << " '" << str << "'" << dendl;
-	ret = 1;
-      } else {
-	dout(10) << __func__ << " session " << s << " " << s->entity_name
-		 << " failed to parse caps '" << str << "'" << dendl;
-	ret = -EACCES;
-      }
+    bool success = s->caps.parse(str);
+    if (success) {
+      dout(10) << __func__ << " session " << s
+               << " " << s->entity_name
+               << " has caps " << s->caps << " '" << str << "'" << dendl;
+      return true;
+    } else {
+      dout(10) << __func__ << " session " << s << " " << s->entity_name
+               << " failed to parse caps '" << str << "'" << dendl;
+      return false;
     }
+  } else {
+    return false;
   }
-  return ret;
 }
 
 void OSD::_dispatch(Message *m)
@@ -8277,13 +8423,18 @@ void OSD::handle_osd_map(MOSDMap *m)
     rerequest_full_maps();
   }
 
+  track_pools_and_pg_num_changes(added_maps, t);
+
   if (!superblock.maps.empty()) {
     trim_maps(m->cluster_osdmap_trim_lower_bound);
     pg_num_history.prune(superblock.get_oldest_map());
   }
   superblock.insert_osdmap_epochs(first, last);
   if (superblock.maps.num_intervals() > 1) {
-    dout(10) << __func__ << " osd map gap " << superblock.maps << dendl;
+    // we had a map gap and not yet trimmed all the way up to
+    // cluster_osdmap_trim_lower_bound
+    dout(10) << __func__ << " osd maps are not contiguous"
+             << superblock.maps << dendl;
   }
   superblock.current_epoch = last;
 
@@ -8294,54 +8445,6 @@ void OSD::handle_osd_map(MOSDMap *m)
     superblock.clean_thru = last;
   }
 
-  // check for pg_num changes and deleted pools
-  OSDMapRef lastmap;
-  for (auto& i : added_maps) {
-    if (!lastmap) {
-      if (!(lastmap = service.try_get_map(i.first - 1))) {
-        dout(10) << __func__ << " can't get previous map " << i.first - 1
-                 << " probably first start of this osd" << dendl;
-        continue;
-      }
-    }
-    ceph_assert(lastmap->get_epoch() + 1 == i.second->get_epoch());
-    for (auto& j : lastmap->get_pools()) {
-      if (!i.second->have_pg_pool(j.first)) {
-	pg_num_history.log_pool_delete(i.first, j.first);
-	dout(10) << __func__ << " recording final pg_pool_t for pool "
-		 << j.first << dendl;
-	// this information is needed by _make_pg() if have to restart before
-	// the pool is deleted and need to instantiate a new (zombie) PG[Pool].
-	ghobject_t obj = make_final_pool_info_oid(j.first);
-	bufferlist bl;
-	encode(j.second, bl, CEPH_FEATURES_ALL);
-	string name = lastmap->get_pool_name(j.first);
-	encode(name, bl);
-	map<string,string> profile;
-	if (lastmap->get_pg_pool(j.first)->is_erasure()) {
-	  profile = lastmap->get_erasure_code_profile(
-	    lastmap->get_pg_pool(j.first)->erasure_code_profile);
-	}
-	encode(profile, bl);
-	t.write(coll_t::meta(), obj, 0, bl.length(), bl);
-      } else if (unsigned new_pg_num = i.second->get_pg_num(j.first);
-		 new_pg_num != j.second.get_pg_num()) {
-	dout(10) << __func__ << " recording pool " << j.first << " pg_num "
-		 << j.second.get_pg_num() << " -> " << new_pg_num << dendl;
-	pg_num_history.log_pg_num_change(i.first, j.first, new_pg_num);
-      }
-    }
-    for (auto& j : i.second->get_pools()) {
-      if (!lastmap->have_pg_pool(j.first)) {
-	dout(10) << __func__ << " recording new pool " << j.first << " pg_num "
-		 << j.second.get_pg_num() << dendl;
-	pg_num_history.log_pg_num_change(i.first, j.first,
-					 j.second.get_pg_num());
-      }
-    }
-    lastmap = i.second;
-  }
-  pg_num_history.epoch = last;
   {
     bufferlist bl;
     ::encode(pg_num_history, bl);
@@ -8383,6 +8486,101 @@ void OSD::handle_osd_map(MOSDMap *m)
     service.meta_ch,
     std::move(t));
   service.publish_superblock(superblock);
+}
+
+/*
+ *  Compare between the previous last_map we had to
+ *  each one of the added_maps.
+ *  Track all of the changes relevant in pg_num_history.
+ */
+void OSD::track_pools_and_pg_num_changes(
+  const map<epoch_t,OSDMapRef>& added_maps,
+  ObjectStore::Transaction& t)
+{
+  epoch_t first = added_maps.begin()->first;
+  epoch_t last = added_maps.rbegin()->first;
+
+  // Unless this is the first start of this OSD,
+  // lastmap should be the newest_map we have.
+  OSDMapRef lastmap;
+
+  if (superblock.maps.empty()) {
+    dout(10) << __func__ << " no maps stored, this is probably "
+             << "the first start of this osd" << dendl;
+    lastmap = added_maps.at(first);
+  } else {
+    if (first > superblock.get_newest_map() + 1) {
+      ceph_assert(first == superblock.cluster_osdmap_trim_lower_bound);
+      dout(20) << __func__ << " can't get previous map "
+               << superblock.get_newest_map()
+               << " first start of this osd after a map gap" << dendl;
+    }
+    if (!(lastmap =
+          service.try_get_map(superblock.get_newest_map()))) {
+      // This is unexpected
+      ceph_abort();
+    }
+  }
+
+  // For each added map, record any changes into pg_num_history
+  // and update lastmap afterwards.
+  for (auto& [current_added_map_epoch, current_added_map] : added_maps) {
+    _track_pools_and_pg_num_changes(t, lastmap,
+                                    current_added_map,
+                                    current_added_map_epoch);
+    lastmap = current_added_map;
+  }
+  pg_num_history.epoch = last;
+}
+
+void OSD::_track_pools_and_pg_num_changes(
+  ObjectStore::Transaction& t,
+  const OSDMapRef& lastmap,
+  const OSDMapRef& current_added_map,
+  epoch_t current_added_map_epoch)
+{
+  // 1) Check if a pool was deleted
+  for (auto& [pool_id, pg_pool] : lastmap->get_pools()) {
+    if (!current_added_map->have_pg_pool(pool_id)) {
+      pg_num_history.log_pool_delete(current_added_map_epoch, pool_id);
+      dout(10) << __func__ << " recording final pg_pool_t for pool "
+               << pool_id << dendl;
+      // this information is needed by _make_pg() if have to restart before
+      // the pool is deleted and need to instantiate a new (zombie) PG[Pool].
+      ghobject_t obj = make_final_pool_info_oid(pool_id);
+      bufferlist bl;
+      encode(pg_pool, bl, CEPH_FEATURES_ALL);
+      string name = lastmap->get_pool_name(pool_id);
+      encode(name, bl);
+      map<string,string> profile;
+      if (lastmap->get_pg_pool(pool_id)->is_erasure()) {
+        profile = lastmap->get_erasure_code_profile(
+        lastmap->get_pg_pool(pool_id)->erasure_code_profile);
+      }
+      encode(profile, bl);
+      t.write(coll_t::meta(), obj, 0, bl.length(), bl);
+
+    // 2) For existing pools, check if pg_num was changed
+    } else if (unsigned new_pg_num = current_added_map->get_pg_num(pool_id);
+               new_pg_num != pg_pool.get_pg_num()) {
+      dout(10) << __func__ << " recording pool " << pool_id << " pg_num "
+               << pg_pool.get_pg_num() << " -> " << new_pg_num << dendl;
+      pg_num_history.log_pg_num_change(current_added_map_epoch,
+                                       pool_id,
+                                       new_pg_num);
+    }
+  }
+
+  // 3) Check if a pool was created
+  for (auto& [pool_id, pg_pool] : current_added_map->get_pools()) {
+    if (!lastmap->have_pg_pool(pool_id)) {
+        dout(10) << __func__ << " recording new pool " <<pool_id << " pg_num "
+                 << pg_pool.get_pg_num() << dendl;
+    pg_num_history.log_pg_num_change(current_added_map_epoch,
+                                     pool_id,
+                                     pg_pool.get_pg_num());
+    }
+  }
 }
 
 void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
@@ -9434,7 +9632,8 @@ void OSD::handle_pg_query_nopg(const MQuery& q)
 			 q.query.epoch_sent,
 			 osdmap->get_epoch(),
 			 empty,
-			 PastIntervals()};
+			 PastIntervals(),
+			 PG_FEATURE_CLASSIC_ALL};
       m = new MOSDPGNotify2(spg_t{pgid.pgid, q.query.from},
 			    std::move(notify));
     }
@@ -9544,9 +9743,12 @@ void OSD::do_recovery(
    * ops are scheduled after osd_recovery_sleep amount of time from the previous
    * recovery event's schedule time. This is done by adding a
    * recovery_requeue_callback event, which re-queues the recovery op using
-   * queue_recovery_after_sleep.
+   * queue_recovery_after_sleep. (osd_recovery_sleep_degraded will be
+   * used instead of osd_recovery_sleep when pg is degraded)
    */
-  float recovery_sleep = get_osd_recovery_sleep();
+  float recovery_sleep = pg->is_degraded() 
+                        ? get_osd_recovery_sleep_degraded() 
+                        : get_osd_recovery_sleep();
   {
     std::lock_guard l(service.sleep_lock);
     if (recovery_sleep > 0 && service.recovery_needs_sleep) {
@@ -9835,62 +10037,68 @@ void OSD::dequeue_delete(
 
 // --------------------------------
 
-const char** OSD::get_tracked_conf_keys() const
+std::vector<std::string> OSD::get_tracked_keys() const noexcept
 {
-  static const char* KEYS[] = {
-    "osd_max_backfills",
-    "osd_min_recovery_priority",
-    "osd_max_trimming_pgs",
-    "osd_op_complaint_time",
-    "osd_op_log_threshold",
-    "osd_op_history_size",
-    "osd_op_history_duration",
-    "osd_op_history_slow_op_size",
-    "osd_op_history_slow_op_threshold",
-    "osd_enable_op_tracker",
-    "osd_map_cache_size",
-    "osd_pg_epoch_max_lag_factor",
-    "osd_pg_epoch_persisted_max_stale",
-    "osd_recovery_sleep",
-    "osd_recovery_sleep_hdd",
-    "osd_recovery_sleep_ssd",
-    "osd_recovery_sleep_hybrid",
-    "osd_delete_sleep",
-    "osd_delete_sleep_hdd",
-    "osd_delete_sleep_ssd",
-    "osd_delete_sleep_hybrid",
-    "osd_snap_trim_sleep",
-    "osd_snap_trim_sleep_hdd",
-    "osd_snap_trim_sleep_ssd",
-    "osd_snap_trim_sleep_hybrid",
-    "osd_scrub_sleep",
-    "osd_recovery_max_active",
-    "osd_recovery_max_active_hdd",
-    "osd_recovery_max_active_ssd",
+  return {
+    "osd_max_backfills"s,
+    "osd_min_recovery_priority"s,
+    "osd_max_trimming_pgs"s,
+    "osd_op_complaint_time"s,
+    "osd_op_log_threshold"s,
+    "osd_op_history_size"s,
+    "osd_op_history_duration"s,
+    "osd_op_history_slow_op_size"s,
+    "osd_op_history_slow_op_threshold"s,
+    "osd_enable_op_tracker"s,
+    "osd_map_cache_size"s,
+    "osd_pg_epoch_max_lag_factor"s,
+    "osd_pg_epoch_persisted_max_stale"s,
+    "osd_recovery_sleep"s,
+    "osd_recovery_sleep_hdd"s,
+    "osd_recovery_sleep_ssd"s,
+    "osd_recovery_sleep_hybrid"s,
+    "osd_recovery_sleep_degraded"s,
+    "osd_recovery_sleep_degraded_hdd"s,
+    "osd_recovery_sleep_degraded_ssd"s,
+    "osd_recovery_sleep_degraded_hybrid"s,
+    "osd_delete_sleep"s,
+    "osd_delete_sleep_hdd"s,
+    "osd_delete_sleep_ssd"s,
+    "osd_delete_sleep_hybrid"s,
+    "osd_snap_trim_sleep"s,
+    "osd_snap_trim_sleep_hdd"s,
+    "osd_snap_trim_sleep_ssd"s,
+    "osd_snap_trim_sleep_hybrid"s,
+    "osd_scrub_sleep"s,
+    "osd_recovery_max_active"s,
+    "osd_recovery_max_active_hdd"s,
+    "osd_recovery_max_active_ssd"s,
     // clog & admin clog
-    "clog_to_monitors",
-    "clog_to_syslog",
-    "clog_to_syslog_facility",
-    "clog_to_syslog_level",
-    "osd_objectstore_fuse",
-    "clog_to_graylog",
-    "clog_to_graylog_host",
-    "clog_to_graylog_port",
-    "host",
-    "fsid",
-    "osd_recovery_delay_start",
-    "osd_client_message_size_cap",
-    "osd_client_message_cap",
-    "osd_heartbeat_min_size",
-    "osd_heartbeat_interval",
-    "osd_object_clean_region_max_num_intervals",
-    "osd_scrub_min_interval",
-    "osd_scrub_max_interval",
-    "osd_op_thread_timeout",
-    "osd_op_thread_suicide_timeout",
-    NULL
+    "clog_to_monitors"s,
+    "clog_to_syslog"s,
+    "clog_to_syslog_facility"s,
+    "clog_to_syslog_level"s,
+    "osd_objectstore_fuse"s,
+    "clog_to_graylog"s,
+    "clog_to_graylog_host"s,
+    "clog_to_graylog_port"s,
+    "host"s,
+    "fsid"s,
+    "osd_recovery_delay_start"s,
+    "osd_client_message_size_cap"s,
+    "osd_client_message_cap"s,
+    "osd_heartbeat_min_size"s,
+    "osd_heartbeat_interval"s,
+    "osd_object_clean_region_max_num_intervals"s,
+    "osd_scrub_min_interval"s,
+    "osd_scrub_max_interval"s,
+    "osd_deep_scrub_interval"s,
+    "osd_deep_scrub_interval_cv"s,
+    "osd_scrub_interval_randomize_ratio"s,
+    "osd_op_thread_timeout"s,
+    "osd_op_thread_suicide_timeout"s,
+    "osd_max_scrubs"s
   };
-  return KEYS;
 }
 
 void OSD::handle_conf_change(const ConfigProxy& conf,
@@ -9921,7 +10129,11 @@ void OSD::handle_conf_change(const ConfigProxy& conf,
       changed.count("osd_recovery_sleep") ||
       changed.count("osd_recovery_sleep_hdd") ||
       changed.count("osd_recovery_sleep_ssd") ||
-      changed.count("osd_recovery_sleep_hybrid")) {
+      changed.count("osd_recovery_sleep_hybrid") ||
+      changed.count("osd_recovery_sleep_degraded") ||
+      changed.count("osd_recovery_sleep_degraded_hdd") ||
+      changed.count("osd_recovery_sleep_degraded_ssd") ||
+      changed.count("osd_recovery_sleep_degraded_hybrid")) {
     maybe_override_sleep_options_for_qos();
   }
   if (changed.count("osd_min_recovery_priority")) {
@@ -9932,6 +10144,10 @@ void OSD::handle_conf_change(const ConfigProxy& conf,
     service.snap_reserver.set_max(cct->_conf->osd_max_trimming_pgs);
   }
   if (changed.count("osd_max_scrubs")) {
+    dout(0) << fmt::format(
+                   "{}: scrub concurrency max changed to {}",
+                   __func__, cct->_conf->osd_max_scrubs)
+            << dendl;
     service.scrub_reserver.set_max(cct->_conf->osd_max_scrubs);
   }
   if (changed.count("osd_op_complaint_time") ||
@@ -10006,13 +10222,16 @@ void OSD::handle_conf_change(const ConfigProxy& conf,
 
   if (changed.count("osd_scrub_min_interval") ||
       changed.count("osd_scrub_max_interval") ||
-      changed.count("osd_deep_scrub_interval")) {
+      changed.count("osd_deep_scrub_interval") ||
+      changed.count("osd_deep_scrub_interval_cv") ||
+      changed.count("osd_scrub_interval_randomize_ratio")) {
     service.get_scrub_services().on_config_change();
     dout(0) << fmt::format(
-		   "{}: scrub interval change (min:{} deep:{} max:{})",
+		   "{}: scrub interval change (min:{} deep:{} max:{} ratio:{})",
 		   __func__, cct->_conf->osd_scrub_min_interval,
 		   cct->_conf->osd_deep_scrub_interval,
-		   cct->_conf->osd_scrub_max_interval)
+		   cct->_conf->osd_scrub_max_interval,
+		   cct->_conf->osd_scrub_interval_randomize_ratio)
 	    << dendl;
   }
 
@@ -10103,22 +10322,28 @@ void OSD::maybe_override_max_osd_capacity_for_qos()
             << dendl;
 
     // Get the threshold IOPS set for the underlying hdd/ssd.
-    double threshold_iops = 0.0;
+    double hi_threshold_iops = 0.0;
+    double lo_threshold_iops = 0.0;
     if (store_is_rotational) {
-      threshold_iops = cct->_conf.get_val<double>(
+      hi_threshold_iops = cct->_conf.get_val<double>(
         "osd_mclock_iops_capacity_threshold_hdd");
+      lo_threshold_iops = cct->_conf.get_val<double>(
+        "osd_mclock_iops_capacity_low_threshold_hdd");
     } else {
-      threshold_iops = cct->_conf.get_val<double>(
+      hi_threshold_iops = cct->_conf.get_val<double>(
         "osd_mclock_iops_capacity_threshold_ssd");
+      lo_threshold_iops = cct->_conf.get_val<double>(
+        "osd_mclock_iops_capacity_low_threshold_ssd");
     }
 
     // Persist the iops value to the MON store or throw cluster warning
-    // if the measured iops exceeds the set threshold. If the iops exceed
-    // the threshold, the default value is used.
-    if (iops > threshold_iops) {
+    // if the measured iops is not in the threshold range. If the iops is
+    // not within the threshold range, the current/default value is retained.
+    if (iops < lo_threshold_iops || iops > hi_threshold_iops) {
       clog->warn() << "OSD bench result of " << std::to_string(iops)
-                   << " IOPS exceeded the threshold limit of "
-                   << std::to_string(threshold_iops) << " IOPS for osd."
+                   << " IOPS is not within the threshold limit range of "
+                   << std::to_string(lo_threshold_iops) << " IOPS and "
+                   << std::to_string(hi_threshold_iops) << " IOPS for osd."
                    << std::to_string(whoami) << ". IOPS capacity is unchanged"
                    << " at " << std::to_string(cur_iops) << " IOPS. The"
                    << " recommendation is to establish the osd's IOPS capacity"
@@ -10243,6 +10468,12 @@ void OSD::maybe_override_sleep_options_for_qos()
     cct->_conf.set_val("osd_recovery_sleep_ssd", std::to_string(0));
     cct->_conf.set_val("osd_recovery_sleep_hybrid", std::to_string(0));
 
+    // Disable recovery sleep for pg degraded
+    cct->_conf.set_val("osd_recovery_sleep_degraded", std::to_string(0));
+    cct->_conf.set_val("osd_recovery_sleep_degraded_hdd", std::to_string(0));
+    cct->_conf.set_val("osd_recovery_sleep_degraded_ssd", std::to_string(0));
+    cct->_conf.set_val("osd_recovery_sleep_degraded_hybrid", std::to_string(0));
+
     // Disable delete sleep
     cct->_conf.set_val("osd_delete_sleep", std::to_string(0));
     cct->_conf.set_val("osd_delete_sleep_hdd", std::to_string(0));
@@ -10366,7 +10597,7 @@ void OSD::get_latest_osdmap()
 // --------------------------------
 
 void OSD::set_perf_queries(const ConfigPayload &config_payload) {
-  const OSDConfigPayload &osd_config_payload = boost::get<OSDConfigPayload>(config_payload);
+  const OSDConfigPayload &osd_config_payload = std::get<OSDConfigPayload>(config_payload);
   const std::map<OSDPerfMetricQuery, OSDPerfMetricLimits> &queries = osd_config_payload.config;
   dout(10) << "setting " << queries.size() << " queries" << dendl;
 
@@ -10853,7 +11084,9 @@ OSDShard::OSDShard(
     scheduler(ceph::osd::scheduler::make_scheduler(
       cct, osd->whoami, osd->num_shards, id, osd->store->is_rotational(),
       osd->store->get_type(), osd_op_queue, osd_op_queue_cut_off, osd->monc)),
-    context_queue(sdata_wait_lock, sdata_cond)
+    context_queue(sdata_wait_lock, sdata_cond),
+    ec_extent_cache_lru(cct->_conf.get_val<uint64_t>(
+      "ec_extent_cache_size"))
 {
   dout(0) << "using op scheduler " << *scheduler << dendl;
 }

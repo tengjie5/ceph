@@ -12,9 +12,12 @@
  *
  */
 
+#include "MDSDaemon.h"
+
 #include <unistd.h>
 
 #include "include/compat.h"
+#include "include/Context.h"
 #include "include/types.h"
 #include "include/str_list.h"
 
@@ -23,6 +26,7 @@
 #include "common/Timer.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
+#include "common/debug.h"
 #include "common/entity_name.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
@@ -30,6 +34,14 @@
 #include "common/version.h"
 
 #include "global/signal_handler.h"
+#include "log/Log.h"
+
+#include "messages/MCommand.h"
+#include "messages/MCommandReply.h"
+#include "messages/MGenericMessage.h"
+#include "messages/MMDSMap.h"
+#include "messages/MMonCommand.h"
+#include "messages/MRemoveSnaps.h"
 
 #include "msg/Messenger.h"
 #include "mon/MonClient.h"
@@ -37,8 +49,8 @@
 #include "osdc/Objecter.h"
 
 #include "MDSMap.h"
+#include "MDSRank.h"
 
-#include "MDSDaemon.h"
 #include "Server.h"
 #include "Locker.h"
 
@@ -51,6 +63,8 @@
 #include "auth/AuthAuthorizeHandler.h"
 #include "auth/RotatingKeyRing.h"
 #include "auth/KeyRing.h"
+
+#include "messages/MRemoveSnaps.h"
 
 #include "perfglue/cpu_profiler.h"
 #include "perfglue/heap_profiler.h"
@@ -142,7 +156,7 @@ void MDSDaemon::asok_command(
   dout(1) << "asok_command: " << command << " " << cmdmap
 	  << " (starting...)" << dendl;
 
-  int r = -CEPHFS_ENOSYS;
+  int r = -ENOSYS;
   bufferlist outbl;
   CachedStackStringStream css;
   auto& ss = *css;
@@ -182,7 +196,7 @@ void MDSDaemon::asok_command(
   } else if (command == "heap") {
     if (!ceph_using_tcmalloc()) {
       ss << "not using tcmalloc";
-      r = -CEPHFS_EOPNOTSUPP;
+      r = -EOPNOTSUPP;
     } else {
       string heapcmd;
       cmd_getval(cmdmap, "heapcmd", heapcmd);
@@ -214,7 +228,7 @@ void MDSDaemon::asok_command(
 	return;
       } catch (const TOPNSPC::common::bad_cmd_get& e) {
 	ss << e.what();
-	r = -CEPHFS_EINVAL;
+	r = -EINVAL;
       }
     }
   }
@@ -304,6 +318,10 @@ void MDSDaemon::set_up_admin_socket()
 				     asok_hook,
 				     "show recent ops, sorted by op duration");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("dump_export_states",
+				     asok_hook,
+				     "dump export states");
+  ceph_assert(r == 0);
   r = admin_socket->register_command("scrub_path name=path,type=CephString "
 				     "name=scrubops,type=CephChoices,"
 				     "strings=force|recursive|repair,n=N,req=false "
@@ -333,6 +351,11 @@ void MDSDaemon::set_up_admin_socket()
   r = admin_socket->register_command("scrub status",
                                      asok_hook,
                                      "Status of scrub operations(s)");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("scrub purge_status "
+				     "name=tag,type=CephString,req=true",
+                                     asok_hook,
+                                     "Purge status of scrub tag|all");
   ceph_assert(r == 0);
   r = admin_socket->register_command("tag path name=path,type=CephString"
                                      " name=tag,type=CephString",
@@ -408,11 +431,11 @@ void MDSDaemon::set_up_admin_socket()
 				     asok_hook,
 				     "List client sessions based on a filter");
   ceph_assert(r == 0);
-  r = admin_socket->register_command("session evict name=filters,type=CephString,n=N,req=false",
+  r = admin_socket->register_command("session evict name=filters,type=CephString,n=N,req=true",
 				     asok_hook,
 				     "Evict client session(s) based on a filter");
   ceph_assert(r == 0);
-  r = admin_socket->register_command("client evict name=filters,type=CephString,n=N,req=false",
+  r = admin_socket->register_command("client evict name=filters,type=CephString,n=N,req=true",
 				     asok_hook,
 				     "Evict client session(s) based on a filter");
   ceph_assert(r == 0);
@@ -532,6 +555,11 @@ void MDSDaemon::set_up_admin_socket()
     asok_hook,
     "run cpu profiling on daemon");
   ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "dump stray",
+    asok_hook,
+    "dump stray folder content");
+  ceph_assert(r == 0);
 }
 
 void MDSDaemon::clean_up_admin_socket()
@@ -550,7 +578,7 @@ int MDSDaemon::init()
   // to run on Windows.
   derr << "The Ceph MDS does not support running on Windows at the moment."
        << dendl;
-  return -CEPHFS_ENOSYS;
+  return -ENOSYS;
 #endif // _WIN32
 
   dout(10) << "Dumping misc struct sizes:" << dendl;
@@ -623,7 +651,7 @@ int MDSDaemon::init()
 	 << " Maybe I have a clock skew against the monitors?" << dendl;
     std::lock_guard locker{mds_lock};
     suicide();
-    return -CEPHFS_ETIMEDOUT;
+    return -ETIMEDOUT;
   }
 
   mds_lock.lock();
@@ -717,12 +745,12 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
       << *m->get_connection()->peer_addrs << dendl;
 
     ss << "permission denied";
-    r = -CEPHFS_EACCES;
+    r = -EACCES;
   } else if (m->cmd.empty()) {
-    r = -CEPHFS_EINVAL;
+    r = -EINVAL;
     ss << "no command given";
   } else if (!TOPNSPC::common::cmdmap_from_json(m->cmd, &cmdmap, ss)) {
-    r = -CEPHFS_EINVAL;
+    r = -EINVAL;
   } else {
     cct->get_admin_socket()->queue_tell_command(m);
     return;
@@ -980,7 +1008,7 @@ void MDSDaemon::respawn()
 
 
 
-bool MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
+Dispatcher::dispatch_result_t MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
 {
   dout(25) << __func__ << ": processing " << m << dendl;
   std::lock_guard l(mds_lock);
@@ -1151,11 +1179,11 @@ bool MDSDaemon::parse_caps(const AuthCapsInfo& info, MDSAuthCaps& caps)
   }
 }
 
-int MDSDaemon::ms_handle_fast_authentication(Connection *con)
+bool MDSDaemon::ms_handle_fast_authentication(Connection *con)
 {
   /* N.B. without mds_lock! */
   MDSAuthCaps caps;
-  return parse_caps(con->get_peer_caps_info(), caps) ? 0 : -1;
+  return parse_caps(con->get_peer_caps_info(), caps);
 }
 
 void MDSDaemon::ms_handle_accept(Connection *con)

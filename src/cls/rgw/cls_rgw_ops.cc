@@ -125,9 +125,6 @@ void rgw_cls_obj_prepare_op::dump(Formatter *f) const
   f->dump_string("name", key.name);
   f->dump_string("tag", tag);
   f->dump_string("locator", locator);
-  f->dump_bool("log_op", log_op);
-  f->dump_int("bilog_flags", bilog_flags);
-  encode_json("zones_trace", zones_trace, f);
 }
 
 void rgw_cls_obj_complete_op::generate_test_instances(list<rgw_cls_obj_complete_op*>& o)
@@ -373,6 +370,10 @@ void rgw_cls_bucket_update_stats_op::generate_test_instances(list<rgw_cls_bucket
   s.total_size = 1;
   s.total_size_rounded = 4096;
   s.num_entries = 1;
+  rgw_bucket_category_stats& dec_s = r->dec_stats[RGWObjCategory::None];
+  dec_s.total_size = 1;
+  dec_s.total_size_rounded = 4096;
+  dec_s.num_entries = 1;
   o.push_back(r);
 
   o.push_back(new rgw_cls_bucket_update_stats_op);
@@ -386,6 +387,11 @@ void rgw_cls_bucket_update_stats_op::dump(Formatter *f) const
     s[(int)entry.first] = entry.second;
   }
   encode_json("stats", s, f);
+  map<int, rgw_bucket_category_stats> dec_s;
+  for (auto& entry : dec_stats) {
+    dec_s[(int)entry.first] = entry.second;
+  }
+  encode_json("dec_stats", dec_s, f);
 }
 
 void cls_rgw_bi_log_list_op::dump(Formatter *f) const
@@ -570,4 +576,10 @@ void cls_rgw_get_bucket_resharding_op::generate_test_instances(
 
 void cls_rgw_get_bucket_resharding_op::dump(Formatter *f) const
 {
+}
+
+void rgw_cls_bi_put_entries_op::dump(Formatter *f) const
+{
+  encode_json("entries", entries, f);
+  encode_json("check_existing", check_existing, f);
 }

@@ -45,9 +45,9 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
-#include "include/unordered_map.h"
-
+#include "common/intrusive_timer.h"
 #include "common/shared_cache.hpp"
 #include "common/simple_cache.hpp"
 #include "messages/MOSDOp.h"
@@ -514,8 +514,6 @@ public:
   void queue_for_snap_trim(PG *pg, uint64_t cost);
   void queue_for_scrub(PG* pg, Scrub::scrub_prio_t with_priority);
 
-  void queue_scrub_after_repair(PG* pg, Scrub::scrub_prio_t with_priority);
-
   /// Signals either (a) the end of a sleep period, or (b) a recheck of the availability
   /// of the primary map being created by the backend.
   void queue_for_scrub_resched(PG* pg, Scrub::scrub_prio_t with_priority);
@@ -733,6 +731,7 @@ public:
     osd_alert_list_t& alerts);
   osd_stat_t set_osd_stat(std::vector<int>& hb_peers, int num_pgs);
   void inc_osd_stat_repaired(void);
+  void set_osd_stat_repaired(int64_t count);
   float compute_adjusted_ratio(osd_stat_t new_stat, float *pratio, uint64_t adjust_used = 0);
   osd_stat_t get_osd_stat() {
     std::lock_guard l(stat_lock);
@@ -879,6 +878,8 @@ public:
   bool prepare_to_stop();
   void got_stop_ack();
 
+  // -- PG timer --
+  common::intrusive_timer pg_timer;
 
 #ifdef PG_DEBUG_REFS
   ceph::mutex pgid_lock = ceph::make_mutex("OSDService::pgid_lock");
@@ -1020,6 +1021,11 @@ struct OSDShard {
 
   ContextQueue context_queue;
 
+  //This is an extent cache for the erasure coding. Specifically, this acts as
+  //a least-recently-used cache invalidator, allowing for cache shards to last
+  //longer than the most recent IO in each object.
+  ECExtentCache::LRU ec_extent_cache_lru;
+
   void _attach_pg(OSDShardPGSlot *slot, PG *pg);
   void _detach_pg(OSDShardPGSlot *slot);
 
@@ -1075,7 +1081,7 @@ class OSD : public Dispatcher,
 
 public:
   // config observer bits
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) override;
   void update_log_config();
@@ -1205,6 +1211,12 @@ public:
    */
   static CompatSet get_osd_compat_set();
 
+  /**
+   * lookup_ec_extent_cache_lru()
+   * @param pgid -
+   * @return extent cache for LRU
+   */
+  ECExtentCache::LRU &lookup_ec_extent_cache_lru(spg_t pgid) const;
 
 private:
   class C_Tick;
@@ -1507,7 +1519,7 @@ public:
     bool ms_handle_refused(Connection *con) override {
       return osd->ms_handle_refused(con);
     }
-    int ms_handle_fast_authentication(Connection *con) override {
+    bool ms_handle_fast_authentication(Connection *con) override {
       return true;
     }
   } heartbeat_dispatcher;
@@ -1668,13 +1680,24 @@ protected:
  protected:
 
   // -- osd map --
-  // TODO: switch to std::atomic<OSDMapRef> when C++20 will be available.
-  OSDMapRef       _osdmap;
+#ifdef __cpp_lib_atomic_shared_ptr
+  std::atomic<OSDMapRef> _osdmap;
+#else
+  OSDMapRef _osdmap;
+#endif
   void set_osdmap(OSDMapRef osdmap) {
+#ifdef __cpp_lib_atomic_shared_ptr
+    _osdmap.store(osdmap);
+#else
     std::atomic_store(&_osdmap, osdmap);
+#endif
   }
   OSDMapRef get_osdmap() const {
+#ifdef __cpp_lib_atomic_shared_ptr
+    return _osdmap.load();
+#else
     return std::atomic_load(&_osdmap);
+#endif
   }
   epoch_t get_osdmap_epoch() const {
     // XXX: performance?
@@ -1682,6 +1705,12 @@ protected:
     return osdmap ? osdmap->get_epoch() : 0;
   }
 
+  /* When handling OSDMaps pg_num_history is used to
+   * track any changes to number of PGs of each pool
+   * to be used later in order to identify PG splits and merges.
+   * See: OSD::track_pools_and_pg_num_changes
+   *      and OSDService::identify_splits_and_merges.
+   */
   pool_pg_num_history_t pg_num_history;
 
   ceph::shared_mutex map_lock = ceph::make_shared_mutex("OSD::map_lock");
@@ -1690,6 +1719,12 @@ protected:
   friend struct send_map_on_destruct;
 
   void handle_osd_map(class MOSDMap *m);
+  void track_pools_and_pg_num_changes(const std::map<epoch_t,OSDMapRef>& added_maps,
+                                      ObjectStore::Transaction& t);
+  void _track_pools_and_pg_num_changes(ObjectStore::Transaction& t,
+                                       const OSDMapRef& lastmap,
+                                       const OSDMapRef& current_added_map,
+                                       epoch_t current_added_map_epoch);
   void _committed_osd_maps(epoch_t first, epoch_t last, class MOSDMap *m);
   void trim_maps(epoch_t oldest);
   void note_down_osd(int osd);
@@ -1931,6 +1966,7 @@ private:
     case MSG_OSD_REP_SCRUBMAP:
     case MSG_OSD_PG_UPDATE_LOG_MISSING:
     case MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY:
+    case MSG_OSD_PG_PCT:
     case MSG_OSD_PG_RECOVERY_DELETE:
     case MSG_OSD_PG_RECOVERY_DELETE_REPLY:
     case MSG_OSD_PG_LEASE:
@@ -1945,7 +1981,7 @@ private:
   void ms_handle_connect(Connection *con) override;
   void ms_handle_fast_connect(Connection *con) override;
   void ms_handle_fast_accept(Connection *con) override;
-  int ms_handle_fast_authentication(Connection *con) override;
+  bool ms_handle_fast_authentication(Connection *con) override;
   bool ms_handle_reset(Connection *con) override;
   void ms_handle_remote_reset(Connection *con) override {}
   bool ms_handle_refused(Connection *con) override;
@@ -2002,6 +2038,7 @@ private:
   int get_num_op_threads();
 
   float get_osd_recovery_sleep();
+  float get_osd_recovery_sleep_degraded();
   float get_osd_delete_sleep();
   float get_osd_snap_trim_sleep();
 

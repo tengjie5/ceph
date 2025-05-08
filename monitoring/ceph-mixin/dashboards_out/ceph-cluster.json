@@ -32,9 +32,23 @@
   "editable": false,
   "gnetId": null,
   "graphTooltip": 0,
+  "hideControls": false,
   "id": null,
   "iteration": 1525415495309,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Browse Dashboards",
+      "tooltip": "",
+      "type": "dashboards",
+      "url": ""
+    }
+  ],
   "panels": [
     {
       "cacheTimeout": null,
@@ -1428,5 +1442,6 @@
   },
   "timezone": "",
   "title": "Ceph - Cluster",
-  "version": 13
+  "uid": "edtb0oxdq",
+  "version": 0
 }

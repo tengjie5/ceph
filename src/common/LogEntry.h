@@ -17,12 +17,21 @@
 
 #include <fmt/format.h>
 
+#include "include/types.h" // for version_t
 #include "include/utime.h"
+#include "include/utime_fmt.h"
 #include "msg/msg_fmt.h"
 #include "msg/msg_types.h"
 #include "common/entity_name.h"
 #include "ostream_temp.h"
 #include "LRUSet.h"
+
+#include <cstdint>
+#include <iostream>
+#include <list>
+#include <map>
+#include <string>
+#include <unordered_set>
 
 namespace ceph {
   class Formatter;
@@ -152,7 +161,7 @@ struct LogSummary {
   // channel -> [(seq#, entry), ...]
   std::map<std::string,std::list<std::pair<uint64_t,LogEntry>>> tail_by_channel;
   uint64_t seq = 0;
-  ceph::unordered_set<LogEntryKey> keys;
+  std::unordered_set<LogEntryKey> keys;
 
   // ---- quincy+ ----
   LRUSet<LogEntryKey> recent_keys;
@@ -217,14 +226,14 @@ template <> struct fmt::formatter<clog_type> : fmt::ostream_formatter {};
 
 template <> struct fmt::formatter<EntityName> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(const EntityName& e, FormatContext& ctx) {
+  auto format(const EntityName& e, FormatContext& ctx) const {
     return formatter<std::string_view>::format(e.to_str(), ctx);
   }
 };
 
 template <> struct fmt::formatter<LogEntry> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(const LogEntry& e, FormatContext& ctx) {
+  auto format(const LogEntry& e, FormatContext& ctx) const {
     return fmt::format_to(ctx.out(), "{} {} ({}) {} : {} [{}] {}",
                           e.stamp, e.name, e.rank, e.seq, e.channel,
                           LogEntry::level_to_str(e.prio), e.msg);

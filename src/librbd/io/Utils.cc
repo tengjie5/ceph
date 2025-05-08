@@ -15,6 +15,8 @@
 #include "osd/osd_types.h"
 #include "osdc/Striper.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::io::util: " << __func__ << ": "
@@ -153,6 +155,21 @@ int clip_request(I* image_ctx, Extents* image_extents, ImageArea area) {
     image_extent.second = clip_len;
   }
   return 0;
+}
+
+void prune_extents(Extents& extents, uint64_t size) {
+  // drop extents completely beyond size
+  while (!extents.empty() && extents.back().first >= size) {
+    extents.pop_back();
+  }
+
+  if (!extents.empty()) {
+    // trim final overlapping extent
+    auto& last_extent = extents.back();
+    if (last_extent.first + last_extent.second > size) {
+      last_extent.second = size - last_extent.first;
+    }
+  }
 }
 
 void unsparsify(CephContext* cct, ceph::bufferlist* bl,

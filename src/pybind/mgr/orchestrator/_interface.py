@@ -42,6 +42,8 @@ from ceph.deployment.service_spec import (
     RGWSpec,
     SMBSpec,
     SNMPGatewaySpec,
+    MgmtGatewaySpec,
+    OAuth2ProxySpec,
     ServiceSpec,
     TunedProfileSpec,
 )
@@ -452,6 +454,14 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def stop_drain_host(self, hostname: str) -> OrchResult[str]:
+        """
+        stop draining daemons of a host
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
     def update_host_addr(self, host: str, addr: str) -> OrchResult[str]:
         """
         Update a host's address
@@ -501,7 +511,7 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def exit_host_maintenance(self, hostname: str) -> OrchResult:
+    def exit_host_maintenance(self, hostname: str, force: bool = False, offline: bool = False) -> OrchResult:
         """
         Return a host from maintenance, restarting the clusters systemd target
         """
@@ -518,19 +528,20 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def replace_device(self,
+                       hostname: str,
+                       device: str,
+                       clear: bool = False,
+                       yes_i_really_mean_it: bool = False) -> OrchResult:
+        """Perform all required operations in order to replace a device.
+        """
+        raise NotImplementedError()
+
     def get_inventory(self, host_filter: Optional['InventoryFilter'] = None, refresh: bool = False) -> OrchResult[List['InventoryHost']]:
         """
         Returns something that was created by `ceph-volume inventory`.
 
         :return: list of InventoryHost
-        """
-        raise NotImplementedError()
-
-    def service_discovery_dump_cert(self) -> OrchResult:
-        """
-        Returns service discovery server root certificate
-
-        :return: service discovery root certificate
         """
         raise NotImplementedError()
 
@@ -557,8 +568,92 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def cert_store_cert_ls(self, show_details: bool = False) -> OrchResult[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    def cert_store_entity_ls(self) -> OrchResult[Dict[Any, Dict[str, List[str]]]]:
+        raise NotImplementedError()
+
+    def cert_store_reload(self) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_cert_check(self) -> OrchResult[List[str]]:
+        raise NotImplementedError()
+
+    def cert_store_key_ls(self) -> OrchResult[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    def cert_store_get_cert(
+        self,
+        cert_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        no_exception_when_missing: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_get_key(
+        self,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        no_exception_when_missing: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_pair(
+        self,
+        cert: str,
+        key: str,
+        entity: str,
+        cert_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        force: Optional[bool] = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_cert(
+        self,
+        cert_name: str,
+        cert: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_key(
+        self,
+        key: str,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_rm_cert(
+        self,
+        cert_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_rm_key(
+        self,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
     @handle_orch_error
-    def apply(self, specs: Sequence["GenericSpec"], no_overwrite: bool = False) -> List[str]:
+    def apply(
+        self,
+        specs: Sequence["GenericSpec"],
+        no_overwrite: bool = False,
+        continue_on_error: bool = False
+    ) -> List[str]:
         """
         Applies any spec
         """
@@ -584,6 +679,8 @@ class Orchestrator(object):
             'snmp-gateway': self.apply_snmp_gateway,
             'host': self.add_host,
             'smb': self.apply_smb,
+            'mgmt-gateway': self.apply_mgmt_gateway,
+            'oauth2-proxy': self.apply_oauth2_proxy,
         }
 
         def merge(l: OrchResult[List[str]], r: OrchResult[str]) -> OrchResult[List[str]]:  # noqa: E741
@@ -636,7 +733,7 @@ class Orchestrator(object):
         # assert action in ["start", "stop", "reload, "restart", "redeploy"]
         raise NotImplementedError()
 
-    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None) -> OrchResult[str]:
+    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None, force: bool = False) -> OrchResult[str]:
         """
         Perform an action (start/stop/reload) on a daemon.
 
@@ -648,7 +745,7 @@ class Orchestrator(object):
         # assert action in ["start", "stop", "reload, "restart", "redeploy"]
         raise NotImplementedError()
 
-    def create_osds(self, drive_group: DriveGroupSpec) -> OrchResult[str]:
+    def create_osds(self, drive_group: DriveGroupSpec, skip_validation: bool = False) -> OrchResult[str]:
         """
         Create one or more OSDs within a single Drive Group.
 
@@ -679,12 +776,18 @@ class Orchestrator(object):
 
     def remove_osds(self, osd_ids: List[str],
                     replace: bool = False,
+                    replace_block: bool = False,
+                    replace_db: bool = False,
+                    replace_wal: bool = False,
                     force: bool = False,
                     zap: bool = False,
                     no_destroy: bool = False) -> OrchResult[str]:
         """
         :param osd_ids: list of OSD IDs
         :param replace: marks the OSD as being destroyed. See :ref:`orchestrator-osd-replace`
+        :param replace_block: marks the corresponding block device as being replaced.
+        :param replace_db: marks the corresponding db device as being replaced.
+        :param replace_wal: marks the corresponding wal device as being replaced.
         :param force: Forces the OSD removal process without waiting for the data to be drained first.
         :param zap: Zap/Erase all devices associated with the OSDs (DESTROYS DATA)
         :param no_destroy: Do not destroy associated VGs/LVs with the OSD.
@@ -705,6 +808,10 @@ class Orchestrator(object):
         """
         Returns a status of the ongoing OSD removal operations.
         """
+        raise NotImplementedError()
+
+    def set_osd_spec(self, service_name: str, osd_ids: List[str]) -> OrchResult:
+        """ set service of osd """
         raise NotImplementedError()
 
     def blink_device_light(self, ident_fault: str, on: bool, locations: List['DeviceLightLoc']) -> OrchResult[List[str]]:
@@ -769,12 +876,20 @@ class Orchestrator(object):
         """get prometheus access information"""
         raise NotImplementedError()
 
+    def get_security_config(self) -> OrchResult[Dict[str, bool]]:
+        """get security config"""
+        raise NotImplementedError()
+
     def set_alertmanager_access_info(self, user: str, password: str) -> OrchResult[str]:
         """set alertmanager access information"""
         raise NotImplementedError()
 
     def set_prometheus_access_info(self, user: str, password: str) -> OrchResult[str]:
         """set prometheus access information"""
+        raise NotImplementedError()
+
+    def generate_certificates(self, module_name: str) -> OrchResult[Optional[Dict[str, str]]]:
+        """generate cert/key for the module with the name module_name"""
         raise NotImplementedError()
 
     def set_custom_prometheus_alerts(self, alerts_file: str) -> OrchResult[str]:
@@ -825,6 +940,14 @@ class Orchestrator(object):
         """Update an existing snmp gateway service"""
         raise NotImplementedError()
 
+    def apply_mgmt_gateway(self, spec: MgmtGatewaySpec) -> OrchResult[str]:
+        """Update an existing cluster gateway service"""
+        raise NotImplementedError()
+
+    def apply_oauth2_proxy(self, spec: OAuth2ProxySpec) -> OrchResult[str]:
+        """Update an existing oauth2-proxy"""
+        raise NotImplementedError()
+
     def apply_smb(self, spec: SMBSpec) -> OrchResult[str]:
         """Update a smb gateway service"""
         raise NotImplementedError()
@@ -845,9 +968,17 @@ class Orchestrator(object):
         """Change/Add a specific setting for a tuned profile"""
         raise NotImplementedError()
 
+    def tuned_profile_add_settings(self, profile_name: str, setting: dict) -> OrchResult[str]:
+        """Change/Add multiple settings for a tuned profile"""
+        raise NotImplementedError()
+
     def tuned_profile_rm_setting(self, profile_name: str, setting: str) -> OrchResult[str]:
         """Remove a specific setting for a tuned profile"""
         raise NotImplementedError()
+
+    def tuned_profile_rm_settings(self, profile_name: str, settings: List[str]) -> OrchResult[str]:
+        """Remove multiple settings from a tuned profile"""
+        raise NotImplementedError
 
     def upgrade_check(self, image: Optional[str], version: Optional[str]) -> OrchResult[str]:
         raise NotImplementedError()
@@ -875,6 +1006,9 @@ class Orchestrator(object):
 
         :return: UpgradeStatusSpec instance
         """
+        raise NotImplementedError()
+
+    def update_service(self, service_type: str, service_image: str, image: str) -> OrchResult:
         raise NotImplementedError()
 
     @_hide_in_features
@@ -908,6 +1042,8 @@ def daemon_type_to_service(dtype: str) -> str:
         'keepalived': 'ingress',
         'iscsi': 'iscsi',
         'nvmeof': 'nvmeof',
+        'mgmt-gateway': 'mgmt-gateway',
+        'oauth2-proxy': 'oauth2-proxy',
         'rbd-mirror': 'rbd-mirror',
         'cephfs-mirror': 'cephfs-mirror',
         'nfs': 'nfs',
@@ -943,6 +1079,8 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'ingress': ['haproxy', 'keepalived'],
         'iscsi': ['iscsi'],
         'nvmeof': ['nvmeof'],
+        'mgmt-gateway': ['mgmt-gateway'],
+        'oauth2-proxy': ['oauth2-proxy'],
         'rbd-mirror': ['rbd-mirror'],
         'cephfs-mirror': ['cephfs-mirror'],
         'nfs': ['nfs'],
@@ -993,6 +1131,39 @@ class UpgradeStatusSpec(object):
             'message': self.message,
             'is_paused': self.is_paused,
         }
+
+    def to_dict(self) -> Dict:
+        out: Dict[str, Any] = {}
+        out['in_progress'] = self.in_progress
+        out['target_image'] = self.target_image
+        out['services_complete'] = self.services_complete
+        out['which'] = self.which
+        out['progress'] = self.progress
+        out['message'] = self.message
+        out['is_paused'] = self.is_paused
+        return out
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'UpgradeStatusSpec':
+        if not isinstance(data, dict):
+            raise ValueError(f'Expected a dictionary, but got {type(data)}')
+        instance = cls()
+        instance.in_progress = data.get('in_progress', False)
+        instance.target_image = data.get('target_image', None)
+        instance.services_complete = data.get('services_complete', [])
+        instance.which = data.get('which', '<unknown>')
+        instance.progress = data.get('progress', None)
+        instance.message = data.get('message', "")
+        instance.is_paused = data.get('is_paused', False)
+
+        return instance
+
+    @staticmethod
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'UpgradeStatusSpec') -> yaml.Node:
+        return dumper.represent_dict(cast(Mapping, data.to_json().items()))
+
+
+yaml.add_representer(UpgradeStatusSpec, UpgradeStatusSpec.yaml_representer)
 
 
 def handle_type_error(method: FuncT) -> FuncT:
@@ -1066,10 +1237,12 @@ class DaemonDescription(object):
                  ports: Optional[List[int]] = None,
                  ip: Optional[str] = None,
                  deployed_by: Optional[List[str]] = None,
+                 systemd_unit: Optional[str] = None,
                  rank: Optional[int] = None,
                  rank_generation: Optional[int] = None,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 pending_daemon_config: bool = False
                  ) -> None:
 
         #: Host is at the same granularity as InventoryHost
@@ -1132,6 +1305,8 @@ class DaemonDescription(object):
 
         self.deployed_by = deployed_by
 
+        self.systemd_unit = systemd_unit
+
         self.is_active = is_active
 
         self.extra_container_args: Optional[ArgumentList] = None
@@ -1142,6 +1317,7 @@ class DaemonDescription(object):
         if extra_entrypoint_args:
             self.extra_entrypoint_args = ArgumentSpec.from_general_args(
                 extra_entrypoint_args)
+        self.pending_daemon_config = pending_daemon_config
 
     def __setattr__(self, name: str, value: Any) -> None:
         if value is not None and name in ('extra_container_args', 'extra_entrypoint_args'):
@@ -1263,6 +1439,9 @@ class DaemonDescription(object):
             return f'{daemon_type_to_service(self.daemon_type)}.{self.service_id()}'
         return daemon_type_to_service(self.daemon_type)
 
+    def update_pending_daemon_config(self, value: bool) -> None:
+        self.pending_daemon_config = value
+
     def __repr__(self) -> str:
         return "<DaemonDescription>({type}.{id})".format(type=self.daemon_type,
                                                          id=self.daemon_id)
@@ -1295,6 +1474,8 @@ class DaemonDescription(object):
         out['ip'] = self.ip
         out['rank'] = self.rank
         out['rank_generation'] = self.rank_generation
+        out['systemd_unit'] = self.systemd_unit
+        out['pending_daemon_config'] = self.pending_daemon_config
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
@@ -1331,6 +1512,8 @@ class DaemonDescription(object):
         out['is_active'] = self.is_active
         out['ports'] = self.ports
         out['ip'] = self.ip
+        out['systemd_unit'] = self.systemd_unit
+        out['pending_daemon_config'] = self.pending_daemon_config
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:

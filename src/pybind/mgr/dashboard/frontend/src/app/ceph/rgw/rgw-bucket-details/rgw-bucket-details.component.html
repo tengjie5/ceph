@@ -8,7 +8,8 @@
          i18n>Details</a>
       <ng-template ngbNavContent>
 
-        <table class="table table-striped table-bordered">
+        <table class="cds--data-table--sort cds--data-table--no-border cds--data-table cds--data-table--md"
+               data-testid="rgw-bucket-details">
           <tbody>
             <tr>
               <td i18n
@@ -51,7 +52,8 @@
         <!-- Bucket quota -->
         <div>
           <legend i18n>Bucket quota</legend>
-          <table class="table table-striped table-bordered">
+          <table class="cds--data-table--sort cds--data-table--no-border cds--data-table cds--data-table--md"
+                 data-testid="rgw-bucket-quota-details">
             <tbody>
               <tr>
                 <td i18n
@@ -84,7 +86,8 @@
 
         <!-- Locking -->
         <legend i18n>Locking</legend>
-        <table class="table table-striped table-bordered">
+        <table class="cds--data-table--sort cds--data-table--no-border cds--data-table cds--data-table--md"
+               data-testid="rgw-bucket-locking-details">
           <tbody>
             <tr>
               <td i18n
@@ -106,20 +109,26 @@
           </tbody>
         </table>
 
-      <!-- Tags -->
-      <ng-container *ngIf="(selection.tagset | keyvalue)?.length">
-        <legend i18n>Tags</legend>
-        <table class="table table-striped table-bordered">
-          <tbody>
-            <tr *ngFor="let tag of selection.tagset | keyvalue">
-              <td i18n
-                  class="bold w-25">{{tag.key}}</td>
-              <td class="w-75">{{ tag.value }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </ng-container>
+        <!-- Tags -->
+        <ng-container *ngIf="(selection.tagset | keyvalue)?.length">
+          <legend i18n>Tags</legend>
+          <table class="cds--data-table--sort cds--data-table--no-border cds--data-table cds--data-table--md">
+            <tbody>
+              <tr *ngFor="let tag of selection.tagset | keyvalue">
+                <td i18n
+                    class="bold w-25">{{tag.key}}</td>
+                <td class="w-75">{{ tag.value }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </ng-container>
 
+
+        <!-- Bucket Rate Limit -->
+        <ng-container *ngIf="!!bucketRateLimit">
+          <cd-rgw-rate-limit-details [rateLimitConfig]="bucketRateLimit"
+                                     [type]="'bucket'"></cd-rgw-rate-limit-details>
+        </ng-container>
       </ng-template>
     </ng-container>
 
@@ -127,49 +136,106 @@
       <a ngbNavLink
          i18n>Policies</a>
       <ng-template ngbNavContent>
+        <div class="table-scroller">
+          <table class="cds--data-table--sort cds--data-table--no-border cds--data-table cds--data-table--md">
+            <tbody>
+              <tr>
+                <td i18n
+                    class="bold w-25">Bucket policy</td>
+                <td><pre>{{ selection.bucket_policy | json}}</pre></td>
+              </tr>
+              <tr>
+                <td i18n
+                    class="bold w-25">Lifecycle
+                  <div *ngIf="(selection.lifecycle | json) !== '{}'"
+                       class="input-group">
+                    <button type="button"
+                            class="btn btn-light"
+                            [ngClass]="{'active': lifecycleFormat === 'json'}"
+                            (click)="updateLifecycleFormatTo('json')">
+                          JSON
+                    </button>
+                    <button type="button"
+                            class="btn btn-light"
+                            [ngClass]="{'active': lifecycleFormat === 'xml'}"
+                            (click)="updateLifecycleFormatTo('xml')">
+                          XML
+                    </button>
+                  </div>
+                </td>
+                <td>
+                  <cds-code-snippet display="multi"
+                                    *ngIf="lifecycleFormat === 'json'">
+                    {{selection.lifecycle | json}}
+                  </cds-code-snippet>
+                  <cds-code-snippet display="multi"
+                                    *ngIf="lifecycleFormat === 'xml'">
+                    {{ (selection.lifecycle | xml:{'Rules':'Rule'}) || '-'}}
+                  </cds-code-snippet>
+                </td>
+              </tr>
+              <tr *ngIf="selection.lifecycle_progress?.length > 0">
+                <td i18n
+                    class="bold w-25">
+                  Lifecycle progress
+                </td>
+                <td>
+                  <cds-tooltip [description]="lifecycleProgressMap.get(lifecycleProgress.status)?.description"
+                               [align]="'top'">
+                    <cds-tag size="md"
+                             [type]="lifecycleProgressMap.get(lifecycleProgress.status)?.color">
+                      {{ lifecycleProgress.status }}
+                    </cds-tag>
+                  </cds-tooltip>
+                  <div *ngIf="lifecycleProgress?.status !== 'UNINITIAL'"
+                       class="spacing-left">{{lifecycleProgress?.started}}</div>
+                </td>
+              </tr>
+              <tr>
+                <td i18n
+                    class="bold w-25">Replication policy</td>
+                <td><pre>{{ selection.replication | json}}</pre></td>
+              </tr>
+              <tr>
+                <td i18n
+                    class="bold w-25">ACL</td>
+                <td>
+                  <table class="table">
+                    <thead>
+                      <tr i18n>
+                        <th>Grantee</th>
+                        <th>Permissions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr i18n>
+                        <td>Bucket Owner</td>
+                        <td>{{ aclPermissions.Owner || '-'}}</td>
+                      </tr>
+                      <tr i18n>
+                        <td>Everyone</td>
+                        <td>{{ aclPermissions.AllUsers || '-'}}</td>
+                      </tr>
+                      <tr i18n>
+                        <td>Authenticated users group</td>
+                        <td>{{ aclPermissions.AuthenticatedUsers || '-'}}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </ng-template>
+    </ng-container>
 
-        <table class="table table-striped table-bordered">
-          <tbody>
-            <tr>
-              <td i18n
-                  class="bold w-25">Bucket policy</td>
-              <td><pre>{{ selection.bucket_policy | json}}</pre></td>
-            </tr>
-            <tr>
-              <td i18n
-                  class="bold w-25">Replication policy</td>
-              <td><pre>{{ selection.replication | json}}</pre></td>
-            </tr>
-            <tr>
-              <td i18n
-                  class="bold w-25">ACL</td>
-              <td>
-                <table class="table">
-                  <thead>
-                    <tr i18n>
-                      <th>Grantee</th>
-                      <th>Permissions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr i18n>
-                      <td>Bucket Owner</td>
-                      <td>{{ aclPermissions.Owner || '-'}}</td>
-                    </tr>
-                    <tr i18n>
-                      <td>Everyone</td>
-                      <td>{{ aclPermissions.AllUsers || '-'}}</td>
-                    </tr>
-                    <tr i18n>
-                      <td>Authenticated users group</td>
-                      <td>{{ aclPermissions.AuthenticatedUsers || '-'}}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+    <ng-container ngbNavItem="tiering">
+      <a ngbNavLink
+         i18n>Tiering</a>
+      <ng-template ngbNavContent>
+        <cd-rgw-bucket-lifecycle-list [bucket]="selection"
+                                      (updateBucketDetails)="updateBucketDetails(extractLifecycleDetails.bind(this))"></cd-rgw-bucket-lifecycle-list>
       </ng-template>
     </ng-container>
   </nav>

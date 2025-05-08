@@ -1,10 +1,17 @@
-from typing import Dict, List, Optional, Union, cast
+from typing import Dict, List, Optional, Tuple, Union, cast
 
+import base64
+import errno
 import json
 
 import yaml
 
-from ceph.deployment.service_spec import PlacementSpec
+from ceph.deployment.service_spec import (
+    PlacementSpec,
+    SMBClusterPublicIPSpec,
+    SpecValidationError,
+)
+from object_format import ErrorResponseBase
 
 from . import resourcelib, validation
 from .enums import (
@@ -14,9 +21,14 @@ from .enums import (
     JoinSourceType,
     LoginAccess,
     LoginCategory,
+    PasswordFilter,
+    SMBClustering,
     UserGroupSourceType,
 )
-from .proto import Self, Simplified, checked
+from .proto import Self, Simplified
+from .utils import checked
+
+ConversionOp = Tuple[PasswordFilter, PasswordFilter]
 
 
 def _get_intent(data: Simplified) -> Intent:
@@ -34,10 +46,21 @@ def _present(data: Simplified) -> bool:
     return _get_intent(data) == Intent.PRESENT
 
 
-class InvalidResourceError(ValueError):
+class InvalidResourceError(ValueError, ErrorResponseBase):
     def __init__(self, msg: str, data: Simplified) -> None:
         super().__init__(msg)
         self.resource_data = data
+
+    def to_simplified(self) -> Simplified:
+        return {
+            'resource': self.resource_data,
+            'msg': str(self),
+            'success': False,
+        }
+
+    def format_response(self) -> Tuple[int, str, str]:
+        data = json.dumps(self.to_simplified())
+        return -errno.EINVAL, data, "Invalid resource"
 
     @classmethod
     def wrap(cls, err: Exception, data: Simplified) -> Exception:
@@ -48,12 +71,35 @@ class InvalidResourceError(ValueError):
         return err
 
 
+class InvalidInputError(ValueError, ErrorResponseBase):
+    summary_max = 1024
+
+    def __init__(self, msg: str, content: str) -> None:
+        super().__init__(msg)
+        self.content = content
+
+    def to_simplified(self) -> Simplified:
+        return {
+            'input': self.content[: self.summary_max],
+            'truncated_input': len(self.content) > self.summary_max,
+            'msg': str(self),
+            'success': False,
+        }
+
+    def format_response(self) -> Tuple[int, str, str]:
+        data = json.dumps(self.to_simplified())
+        return -errno.EINVAL, data, "Invalid input"
+
+
 class _RBase:
     # mypy doesn't currently (well?) support class decorators adding methods
     # so we use a base class to add this method to all our resource classes.
     def to_simplified(self) -> Simplified:
         rc = getattr(self, '_resource_config')
         return rc.object_to_simplified(self)
+
+    def convert(self, operation: ConversionOp) -> Self:
+        return self
 
 
 @resourcelib.component()
@@ -201,6 +247,12 @@ class JoinAuthValues(_RBase):
     username: str
     password: str
 
+    def convert(self, operation: ConversionOp) -> Self:
+        return self.__class__(
+            username=self.username,
+            password=_password_convert(self.password, operation),
+        )
+
 
 @resourcelib.component()
 class JoinSource(_RBase):
@@ -227,6 +279,20 @@ class UserGroupSettings(_RBase):
 
     users: List[Dict[str, str]]
     groups: List[Dict[str, str]]
+
+    def convert(self, operation: ConversionOp) -> Self:
+        def _convert_pw_key(dct: Dict[str, str]) -> Dict[str, str]:
+            pw = dct.get('password', None)
+            if pw is not None:
+                data = dict(dct)
+                data["password"] = _password_convert(pw, operation)
+                return data
+            return dct
+
+        return self.__class__(
+            users=[_convert_pw_key(u) for u in self.users],
+            groups=self.groups,
+        )
 
 
 @resourcelib.component()
@@ -297,8 +363,7 @@ class WrappedPlacementSpec(PlacementSpec):
         # improperly typed. They are improperly typed because typing.Self
         # didn't exist and the old correct way is a PITA to write (and
         # remember).  Thus a lot of classmethods are return the exact class
-        # which is technically incorrect. This fine class is guilty of the same
-        # sin. :-)
+        # which is technically incorrect.
         return cast(Self, cls.from_json(data))
 
     @classmethod
@@ -310,6 +375,25 @@ class WrappedPlacementSpec(PlacementSpec):
 
     def to_simplified(self) -> Simplified:
         return self.to_json()
+
+
+# This class is a near 1:1 mirror of the service spec helper class.
+@resourcelib.component()
+class ClusterPublicIPAssignment(_RBase):
+    address: str
+    destination: Union[List[str], str, None] = None
+
+    def to_spec(self) -> SMBClusterPublicIPSpec:
+        return SMBClusterPublicIPSpec(
+            address=self.address,
+            destination=self.destination,
+        )
+
+    def validate(self) -> None:
+        try:
+            self.to_spec().validate()
+        except SpecValidationError as err:
+            raise ValueError(str(err)) from err
 
 
 @resourcelib.resource('ceph.smb.cluster')
@@ -325,6 +409,9 @@ class Cluster(_RBase):
     custom_smb_global_options: Optional[Dict[str, str]] = None
     # embedded orchestration placement spec
     placement: Optional[WrappedPlacementSpec] = None
+    # control if the cluster is really a cluster
+    clustering: Optional[SMBClustering] = None
+    public_addrs: Optional[List[ClusterPublicIPAssignment]] = None
 
     def validate(self) -> None:
         if not self.cluster_id:
@@ -362,6 +449,30 @@ class Cluster(_RBase):
     def cleaned_custom_smb_global_options(self) -> Optional[Dict[str, str]]:
         return validation.clean_custom_options(self.custom_smb_global_options)
 
+    @property
+    def clustering_mode(self) -> SMBClustering:
+        return self.clustering if self.clustering else SMBClustering.DEFAULT
+
+    def is_clustered(self) -> bool:
+        """Return true if smbd instance should use (CTDB) clustering."""
+        if self.clustering_mode == SMBClustering.ALWAYS:
+            return True
+        if self.clustering_mode == SMBClustering.NEVER:
+            return False
+        # do clustering automatically, based on the placement spec's count value
+        count = 0
+        if self.placement and self.placement.count:
+            count = self.placement.count
+        # clustering enabled unless we're deploying a single instance "cluster"
+        return count != 1
+
+    def service_spec_public_addrs(
+        self,
+    ) -> Optional[List[SMBClusterPublicIPSpec]]:
+        if self.public_addrs is None:
+            return None
+        return [a.to_spec() for a in self.public_addrs]
+
 
 @resourcelib.resource('ceph.smb.join.auth')
 class JoinAuth(_RBase):
@@ -386,6 +497,14 @@ class JoinAuth(_RBase):
         rc.linked_to_cluster.quiet = True
         rc.on_construction_error(InvalidResourceError.wrap)
         return rc
+
+    def convert(self, operation: ConversionOp) -> Self:
+        return self.__class__(
+            auth_id=self.auth_id,
+            intent=self.intent,
+            auth=None if not self.auth else self.auth.convert(operation),
+            linked_to_cluster=self.linked_to_cluster,
+        )
 
 
 @resourcelib.resource('ceph.smb.usersgroups')
@@ -412,6 +531,15 @@ class UsersAndGroups(_RBase):
         rc.on_construction_error(InvalidResourceError.wrap)
         return rc
 
+    def convert(self, operation: ConversionOp) -> Self:
+        values = None if not self.values else self.values.convert(operation)
+        return self.__class__(
+            users_groups_id=self.users_groups_id,
+            intent=self.intent,
+            values=values,
+            linked_to_cluster=self.linked_to_cluster,
+        )
+
 
 # SMBResource is a union of all valid top-level smb resource types.
 SMBResource = Union[
@@ -424,19 +552,27 @@ SMBResource = Union[
 ]
 
 
-def load_text(blob: str) -> List[SMBResource]:
+def load_text(
+    blob: str, *, input_sample_max: int = 1024
+) -> List[SMBResource]:
     """Given JSON or YAML return a list of SMBResource objects deserialized
     from the input.
     """
+    json_err = None
     try:
-        data = yaml.safe_load(blob)
-    except ValueError:
-        pass
-    try:
+        # apparently JSON is not always as strict subset of YAML
+        # therefore trying to parse as JSON first is not a waste:
+        # https://john-millikin.com/json-is-not-a-yaml-subset
         data = json.loads(blob)
-    except ValueError:
-        pass
-    return load(data)
+    except ValueError as err:
+        json_err = err
+    try:
+        data = yaml.safe_load(blob) if json_err else data
+    except (ValueError, yaml.parser.ParserError) as err:
+        raise InvalidInputError(str(err), blob) from err
+    if not isinstance(data, (list, dict)):
+        raise InvalidInputError("input must be an object or list", blob)
+    return load(cast(Simplified, data))
 
 
 def load(data: Simplified) -> List[SMBResource]:
@@ -445,3 +581,18 @@ def load(data: Simplified) -> List[SMBResource]:
     structured types.
     """
     return resourcelib.load(data)
+
+
+def _password_convert(pvalue: str, operation: ConversionOp) -> str:
+    if operation == (PasswordFilter.NONE, PasswordFilter.BASE64):
+        pvalue = base64.b64encode(pvalue.encode("utf8")).decode("utf8")
+    elif operation == (PasswordFilter.NONE, PasswordFilter.HIDDEN):
+        pvalue = "*" * 16
+    elif operation == (PasswordFilter.BASE64, PasswordFilter.NONE):
+        pvalue = base64.b64decode(pvalue.encode("utf8")).decode("utf8")
+    else:
+        osrc, odst = operation
+        raise ValueError(
+            f"can not convert password value encoding from {osrc} to {odst}"
+        )
+    return pvalue

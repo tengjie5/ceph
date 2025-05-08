@@ -5,7 +5,7 @@ try:
 except ImportError:
     pass
 
-from ceph.deployment.drive_selection.selector import DriveSelection
+from ceph.deployment.drive_selection.selector import DriveSelection  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,9 @@ class to_ceph_volume(object):
         for i in range(len(cmds)):
             if self.spec.encrypted:
                 cmds[i] += " --dmcrypt"
+
+            if self.spec.tpm2:
+                cmds[i] += " --with-tpm"
 
             if self.spec.osds_per_device:
                 cmds[i] += " --osds-per-device {}".format(self.spec.osds_per_device)

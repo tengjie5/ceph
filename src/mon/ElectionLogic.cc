@@ -17,6 +17,11 @@
 #include "include/ceph_assert.h"
 #include "common/dout.h"
 
+#include <iomanip>
+#include <ostream>
+#include <sstream>
+#include <string>
+
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, epoch, elector)
@@ -335,6 +340,12 @@ void ElectionLogic::propose_connectivity_handler(int from, epoch_t mepoch,
   ldout(cct, 10) << __func__ << " from " << from << " mepoch: "
     << mepoch << " epoch: " << epoch << dendl;
   ldout(cct, 30) << "last_election_winner: " << last_election_winner << dendl;
+  // ignore proposal from marked down mons if we are the tiebreaker
+  if (elector->is_tiebreaker(elector->get_my_rank()) &&
+      elector->is_stretch_marked_down_mons(from)) {
+    ldout(cct, 10) << "Ignoring proposal from marked down mon " << from << dendl;
+    return;
+  }
   if ((epoch % 2 == 0) &&
       last_election_winner != elector->get_my_rank() &&
       !elector->is_current_member(from)) {

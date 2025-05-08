@@ -14,7 +14,9 @@
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
+#include "common/perf_counters_collection.h"
 #include "common/perf_counters_key.h"
+#include "include/stringify.h"
 #include "FSMirror.h"
 #include "PeerReplayer.h"
 #include "Utils.h"
@@ -38,6 +40,10 @@ enum {
   l_cephfs_mirror_peer_replayer_snap_sync_failures,
   l_cephfs_mirror_peer_replayer_avg_sync_time,
   l_cephfs_mirror_peer_replayer_sync_bytes,
+  l_cephfs_mirror_peer_replayer_last_synced_start,
+  l_cephfs_mirror_peer_replayer_last_synced_end,
+  l_cephfs_mirror_peer_replayer_last_synced_duration,
+  l_cephfs_mirror_peer_replayer_last_synced_bytes,
   l_cephfs_mirror_peer_replayer_last,
 };
 
@@ -116,7 +122,9 @@ int opendirat(MountRef mnt, int dirfd, const std::string &relpath, int flags,
 
   int fd = r;
   r = ceph_fdopendir(mnt, fd, dirp);
-  ceph_close(mnt, fd);
+  if (r < 0) {
+    ceph_close(mnt, fd);
+  }
   return r;
 }
 
@@ -203,6 +211,14 @@ PeerReplayer::PeerReplayer(CephContext *cct, FSMirror *fs_mirror,
 		   "avg_sync_time", "Average Sync Time", "asyn", prio);
   plb.add_u64_counter(l_cephfs_mirror_peer_replayer_sync_bytes,
 		      "sync_bytes", "Sync Bytes", "sbye", prio);
+  plb.add_time(l_cephfs_mirror_peer_replayer_last_synced_start,
+	       "last_synced_start", "Last Synced Start", "lsst", prio);
+  plb.add_time(l_cephfs_mirror_peer_replayer_last_synced_end,
+	       "last_synced_end", "Last Synced End", "lsen", prio);
+  plb.add_time(l_cephfs_mirror_peer_replayer_last_synced_duration,
+	       "last_synced_duration", "Last Synced Duration", "lsdn", prio);
+  plb.add_u64_counter(l_cephfs_mirror_peer_replayer_last_synced_bytes,
+		      "last_synced_bytes", "Last Synced Bytes", "lsbt", prio);
   m_perf_counters = plb.create_perf_counters();
   m_cct->get_perfcounters_collection()->add(m_perf_counters);
 }
@@ -435,7 +451,8 @@ int PeerReplayer::try_lock_directory(const std::string &dir_root,
            << dendl;
     }
 
-    if (ceph_close(m_remote_mount, fd) < 0) {
+    r = ceph_close(m_remote_mount, fd);
+    if (r < 0) {
       derr << ": failed to close (cleanup) remote dir_root=" << dir_root << ": "
            << cpp_strerror(r) << dendl;
     }
@@ -516,8 +533,9 @@ int PeerReplayer::build_snap_map(const std::string &dir_root,
     uint64_t snap_id;
     if (is_remote) {
       if (!info.nr_snap_metadata) {
-        derr << ": snap_path=" << snap_path << " has invalid metadata in remote snapshot"
-             << dendl;
+        std::string failed_reason = "snapshot '" + snap  + "' has invalid metadata";
+        derr << ": " << failed_reason << dendl;
+        m_snap_sync_stats.at(dir_root).last_failed_reason = failed_reason;
         rv = -EINVAL;
       } else {
         auto metadata = decode_snap_metadata(info.snap_metadata, info.nr_snap_metadata);
@@ -751,8 +769,9 @@ int PeerReplayer::remote_file_op(const std::string &dir_root, const std::string 
         return r;
       }
       if (m_perf_counters) {
-	m_perf_counters->inc(l_cephfs_mirror_peer_replayer_sync_bytes, stx.stx_size);
+        m_perf_counters->inc(l_cephfs_mirror_peer_replayer_sync_bytes, stx.stx_size);
       }
+      inc_sync_bytes(dir_root, stx.stx_size);
     } else if (S_ISLNK(stx.stx_mode)) {
       // free the remote link before relinking
       r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(), 0);
@@ -1208,15 +1227,6 @@ int PeerReplayer::sync_perms(const std::string& path) {
   return 0;
 }
 
-void PeerReplayer::post_sync_close_handles(const FHandles &fh) {
-  dout(20) << dendl;
-
-  // @FHandles.r_fd_dir_root is closed in @unregister_directory since
-  // its used to acquire an exclusive lock on remote dir_root.
-  ceph_close(m_local_mount, fh.c_fd);
-  ceph_close(fh.p_mnt, fh.p_fd);
-}
-
 int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &current) {
   dout(20) << ": dir_root=" << dir_root << ", current=" << current << dendl;
   FHandles fh;
@@ -1226,10 +1236,6 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     return r;
   }
 
-  BOOST_SCOPE_EXIT_ALL( (this)(&fh) ) {
-    post_sync_close_handles(fh);
-  };
-
   // record that we are going to "dirty" the data under this
   // directory root
   auto snap_id_str{stringify(current.second)};
@@ -1238,6 +1244,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   if (r < 0) {
     derr << ": error setting \"ceph.mirror.dirty_snap_id\" on dir_root=" << dir_root
          << ": " << cpp_strerror(r) << dendl;
+    ceph_close(m_local_mount, fh.c_fd);
+    ceph_close(fh.p_mnt, fh.p_fd);
     return r;
   }
 
@@ -1249,6 +1257,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   if (r < 0) {
     derr << ": failed to stat snap=" << current.first << ": " << cpp_strerror(r)
          << dendl;
+    ceph_close(m_local_mount, fh.c_fd);
+    ceph_close(fh.p_mnt, fh.p_fd);
     return r;
   }
 
@@ -1257,8 +1267,12 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   if (r < 0) {
     derr << ": failed to open local snap=" << current.first << ": " << cpp_strerror(r)
          << dendl;
+    ceph_close(m_local_mount, fh.c_fd);
+    ceph_close(fh.p_mnt, fh.p_fd);
     return r;
   }
+  // starting from this point we shouldn't care about manual closing of fh.c_fd,
+  // it will be closed automatically when bound tdirp is closed.
 
   std::stack<SyncEntry> sync_stack;
   sync_stack.emplace(SyncEntry(".", tdirp, tstx));
@@ -1370,6 +1384,18 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     sync_stack.pop();
   }
 
+  dout(20) << " cur:" << fh.c_fd
+           << " prev:" << fh.p_fd
+           << " ret = " << r
+           << dendl;
+
+  // @FHandles.r_fd_dir_root is closed in @unregister_directory since
+  // its used to acquire an exclusive lock on remote dir_root.
+
+  // c_fd has been used in ceph_fdopendir call so
+  // there is no need to close this fd manually.
+  ceph_close(fh.p_mnt, fh.p_fd);
+
   return r;
 }
 
@@ -1389,9 +1415,6 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     return r;
   }
 
-  BOOST_SCOPE_EXIT_ALL( (this)(&fh) ) {
-    post_sync_close_handles(fh);
-  };
 
   // record that we are going to "dirty" the data under this directory root
   auto snap_id_str{stringify(current.second)};
@@ -1400,6 +1423,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   if (r < 0) {
     derr << ": error setting \"ceph.mirror.dirty_snap_id\" on dir_root=" << dir_root
          << ": " << cpp_strerror(r) << dendl;
+    ceph_close(m_local_mount, fh.c_fd);
+    ceph_close(fh.p_mnt, fh.p_fd);
     return r;
   }
 
@@ -1411,6 +1436,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   if (r < 0) {
     derr << ": failed to stat snap=" << current.first << ": " << cpp_strerror(r)
          << dendl;
+    ceph_close(m_local_mount, fh.c_fd);
+    ceph_close(fh.p_mnt, fh.p_fd);
     return r;
   }
 
@@ -1430,11 +1457,6 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
-    r = pre_sync_check_and_open_handles(dir_root, current, prev, &fh);
-    if (r < 0) {
-      dout(5) << ": cannot proceed with sync: " << cpp_strerror(r) << dendl;
-      return r;
-    }
 
     dout(20) << ": " << sync_queue.size() << " entries in queue" << dendl;
     const auto &queue_entry = sync_queue.front();
@@ -1444,12 +1466,16 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
                            stringify((*prev).first).c_str(), current.first.c_str(), &sd_info);
     if (r != 0) {
       derr << ": failed to open snapdiff, r=" << r << dendl;
+      ceph_close(m_local_mount, fh.c_fd);
+      ceph_close(fh.p_mnt, fh.p_fd);
       return r;
     }
     while (0 < (r = ceph_readdir_snapdiff(&sd_info, &sd_entry))) {
       if (r < 0) {
         derr << ": failed to read directory=" << epath << dendl;
         ceph_close_snapdiff(&sd_info);
+        ceph_close(m_local_mount, fh.c_fd);
+        ceph_close(fh.p_mnt, fh.p_fd);
         return r;
       }
 
@@ -1541,6 +1567,17 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     }
     sync_queue.pop();
   }
+
+  dout(20) << " current:" << fh.c_fd
+           << " prev:" << fh.p_fd
+           << " ret = " << r
+           << dendl;
+
+  // @FHandles.r_fd_dir_root is closed in @unregister_directory since
+  // its used to acquire an exclusive lock on remote dir_root.
+
+  ceph_close(m_local_mount, fh.c_fd);
+  ceph_close(fh.p_mnt, fh.p_fd);
   return r;
 }
 
@@ -1668,9 +1705,17 @@ int PeerReplayer::do_sync_snaps(const std::string &dir_root) {
     "cephfs_mirror_max_snapshot_sync_per_cycle");
 
   dout(10) << ": synchronizing from snap-id=" << it->first << dendl;
+  double start = 0;
+  double end = 0;
+  double duration = 0;
   for (; it != local_snap_map.end(); ++it) {
+    if (m_perf_counters) {
+      start = std::chrono::duration_cast<std::chrono::seconds>(clock::now().time_since_epoch()).count();
+      utime_t t;
+      t.set_from_double(start);
+      m_perf_counters->tset(l_cephfs_mirror_peer_replayer_last_synced_start, t);
+    }
     set_current_syncing_snap(dir_root, it->first, it->second);
-    auto start = clock::now();
     boost::optional<Snapshot> prev = boost::none;
     if (last_snap_id != 0) {
       prev = std::make_pair(last_snap_name, last_snap_id);
@@ -1684,16 +1729,18 @@ int PeerReplayer::do_sync_snaps(const std::string &dir_root) {
     }
     if (m_perf_counters) {
       m_perf_counters->inc(l_cephfs_mirror_peer_replayer_snaps_synced);
+      end = std::chrono::duration_cast<std::chrono::seconds>(clock::now().time_since_epoch()).count();
+      utime_t t;
+      t.set_from_double(end);
+      m_perf_counters->tset(l_cephfs_mirror_peer_replayer_last_synced_end, t);
+      duration = end - start;
+      t.set_from_double(duration);
+      m_perf_counters->tinc(l_cephfs_mirror_peer_replayer_avg_sync_time, t);
+      m_perf_counters->tset(l_cephfs_mirror_peer_replayer_last_synced_duration, t);
+      m_perf_counters->set(l_cephfs_mirror_peer_replayer_last_synced_bytes, m_snap_sync_stats.at(dir_root).sync_bytes);
     }
-    std::chrono::duration<double> duration = clock::now() - start;
 
-    utime_t d;
-    d.set_from_double(duration.count());
-    if (m_perf_counters) {
-      m_perf_counters->tinc(l_cephfs_mirror_peer_replayer_avg_sync_time, d);
-    }
-
-    set_last_synced_stat(dir_root, it->first, it->second, duration.count());
+    set_last_synced_stat(dir_root, it->first, it->second, duration);
     if (--snaps_per_cycle == 0) {
       break;
     }
@@ -1784,6 +1831,9 @@ void PeerReplayer::peer_status(Formatter *f) {
     f->open_object_section(dir_root);
     if (sync_stat.failed) {
       f->dump_string("state", "failed");
+      if (sync_stat.last_failed_reason) {
+	f->dump_string("failure_reason", *sync_stat.last_failed_reason);
+      }
     } else if (!sync_stat.current_syncing_snap) {
       f->dump_string("state", "idle");
     } else {
@@ -1800,6 +1850,9 @@ void PeerReplayer::peer_status(Formatter *f) {
       if (sync_stat.last_sync_duration) {
         f->dump_float("sync_duration", *sync_stat.last_sync_duration);
         f->dump_stream("sync_time_stamp") << sync_stat.last_synced;
+      }
+      if (sync_stat.last_sync_bytes) {
+	f->dump_unsigned("sync_bytes", *sync_stat.last_sync_bytes);
       }
       f->close_section();
     }

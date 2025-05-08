@@ -9,6 +9,7 @@
 #include "rgw_lua_background.h"
 #include "rgw_lua_data_filter.h"
 #include "rgw_sal_config.h"
+#include "rgw_perf_counters.h"
 
 using namespace std;
 using namespace rgw;
@@ -21,7 +22,7 @@ class CctCleaner {
 public:
   CctCleaner(CephContext* _cct) : cct(_cct) {}
   ~CctCleaner() { 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
     delete cct; 
 #else
     cct->put(); 
@@ -41,11 +42,15 @@ public:
     return 0;
   };
 
-  bool is_admin_of(const rgw_owner& o) const override {
+  bool is_admin() const override {
     return false;
   }
 
   bool is_owner_of(const rgw_owner& uid) const override {
+    return false;
+  }
+
+  bool is_root() const override {
     return false;
   }
 
@@ -184,9 +189,51 @@ inline std::unique_ptr<sal::RadosStore> make_store() {
   return std::make_unique<StoreBundle>(std::move(context_pool));
 };
 
+class TestLuaManager : public rgw::sal::StoreLuaManager {
+  public:
+    std::string lua_script;
+    unsigned read_time = 0;
+    TestLuaManager() {
+      rgw_perf_start(g_cct);
+    }
+    int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) override {
+      std::this_thread::sleep_for(std::chrono::seconds(read_time));
+      script = lua_script;
+      return 0;
+    }
+    int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) override {
+      return 0;
+    }
+    int del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) override {
+      return 0;
+    }
+    int add_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name) override {
+      return 0;
+    }
+    int remove_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name) override {
+      return 0;
+    }
+    int list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages) override {
+      return 0;
+    }
+    int reload_packages(const DoutPrefixProvider* dpp, optional_yield y) override {
+      return 0;
+    }
+    ~TestLuaManager() {
+      rgw_perf_stop(g_cct);
+    }
+};
+
+void set_script(rgw::sal::LuaManager* manager, const std::string& script) {
+  static_cast<TestLuaManager*>(manager)->lua_script = script;
+}
+void set_read_time(rgw::sal::LuaManager* manager, unsigned read_time) {
+  static_cast<TestLuaManager*>(manager)->read_time = read_time;
+}
+
 #define DEFINE_REQ_STATE RGWProcessEnv pe; \
   auto store = make_store();                   \
-  pe.lua.manager = store->get_lua_manager(""); \
+  pe.lua.manager = std::make_unique<TestLuaManager>(); \
   RGWEnv e; \
   req_state s(g_cct, pe, &e, 0);
 
@@ -850,24 +897,12 @@ TEST(TestRGWLua, OpsLog)
 }
 
 class TestBackground : public rgw::lua::Background {
-  const unsigned read_time;
-
-protected:
-  int read_script() override {
-    // don't read the object from the store
-    std::this_thread::sleep_for(std::chrono::seconds(read_time));
-    return 0;
-  }
-
 public:
-  TestBackground(sal::RadosStore* store, const std::string& script, rgw::sal::LuaManager* manager, unsigned read_time = 0) : 
+  TestBackground(sal::RadosStore* store, rgw::sal::LuaManager* manager) : 
     rgw::lua::Background(store, 
         g_cct, 
         manager,
-        1 /* run every second */),
-    read_time(read_time) {
-      // the script is passed in the constructor
-      rgw_script = script;
+        1 /* run every second */) {
     }
 
   ~TestBackground() override {
@@ -878,20 +913,19 @@ public:
 TEST(TestRGWLuaBackground, Start)
 {
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
+  auto manager = std::make_unique<TestLuaManager>();
   {
     // ctr and dtor without running
-    TestBackground lua_background(store.get(), "", manager.get());
+    TestBackground lua_background(store.get(), manager.get());
   }
   {
     // ctr and dtor with running
-    TestBackground lua_background(store.get(), "", manager.get());
+    TestBackground lua_background(store.get(), manager.get());
     lua_background.start();
   }
 }
 
-
-constexpr auto wait_time = std::chrono::seconds(3);
+constexpr auto wait_time = std::chrono::milliseconds(100);
 
 template<typename T>
 const T& get_table_value(const TestBackground& b, const std::string& index) {
@@ -903,6 +937,15 @@ const T& get_table_value(const TestBackground& b, const std::string& index) {
   }
 }
 
+#define WAIT_FOR_BACKGROUND \
+{ \
+  unsigned max_tries = 100; \
+  do { \
+    std::this_thread::sleep_for(wait_time); \
+    --max_tries; \
+  } while (perfcounter->get(l_rgw_lua_script_ok) + perfcounter->get(l_rgw_lua_script_fail) == 0 && max_tries > 0); \
+}
+
 TEST(TestRGWLuaBackground, Script)
 {
   const std::string script = R"(
@@ -912,10 +955,11 @@ TEST(TestRGWLuaBackground, Script)
   )";
 
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
-  TestBackground lua_background(store.get(), script, manager.get());
+  auto manager = std::make_unique<TestLuaManager>();
+  set_script(manager.get(), script);
+  TestBackground lua_background(store.get(), manager.get());
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   EXPECT_EQ(get_table_value<std::string>(lua_background, "hello"), "world");
 }
 
@@ -928,9 +972,10 @@ TEST(TestRGWLuaBackground, RequestScript)
   )";
 
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), background_script, pe.lua.manager.get());
+  set_script(pe.lua.manager.get(), background_script);
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
 
   const std::string request_script = R"(
     local key = "hello"
@@ -947,8 +992,9 @@ TEST(TestRGWLuaBackground, RequestScript)
   ASSERT_EQ(rc, 0);
   EXPECT_EQ(get_table_value<std::string>(lua_background, "hello"), "from request");
   // now we resume and let the background set the value
+  perfcounter->set(l_rgw_lua_script_ok, 0);
   lua_background.resume(store.get());
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   EXPECT_EQ(get_table_value<std::string>(lua_background, "hello"), "from background");
 }
 
@@ -965,14 +1011,16 @@ TEST(TestRGWLuaBackground, Pause)
   )";
 
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
-  TestBackground lua_background(store.get(), script, manager.get());
+  auto manager = std::make_unique<TestLuaManager>();
+  set_script(manager.get(), script);
+  TestBackground lua_background(store.get(), manager.get());
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   const auto value_len = get_table_value<std::string>(lua_background, "hello").size();
   EXPECT_GT(value_len, 0);
   lua_background.pause();
-  std::this_thread::sleep_for(wait_time);
+  // make sure no execution occurs
+  std::this_thread::sleep_for(wait_time*10);
   // no change in len
   EXPECT_EQ(value_len, get_table_value<std::string>(lua_background, "hello").size());
 }
@@ -991,15 +1039,17 @@ TEST(TestRGWLuaBackground, PauseWhileReading)
   )";
 
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
-  TestBackground lua_background(store.get(), script, manager.get(), 2);
+  auto manager = std::make_unique<TestLuaManager>();
+  set_script(manager.get(), script);
+  set_read_time(manager.get(), 2);
+  TestBackground lua_background(store.get(), manager.get());
   lua_background.start();
-  constexpr auto long_wait_time = std::chrono::seconds(6);
-  std::this_thread::sleep_for(long_wait_time);
+  WAIT_FOR_BACKGROUND;
   const auto value_len = get_table_value<std::string>(lua_background, "hello").size();
   EXPECT_GT(value_len, 0);
   lua_background.pause();
-  std::this_thread::sleep_for(long_wait_time);
+  // make sure no execution occurs
+  std::this_thread::sleep_for(wait_time*10);
   // one execution might occur after pause
   EXPECT_TRUE(value_len + 1 >= get_table_value<std::string>(lua_background, "hello").size());
 }
@@ -1013,14 +1063,16 @@ TEST(TestRGWLuaBackground, ReadWhilePaused)
   )";
 
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
-  TestBackground lua_background(store.get(), script, manager.get());
+  auto manager = std::make_unique<TestLuaManager>();
+  set_script(manager.get(), script);
+  TestBackground lua_background(store.get(), manager.get());
   lua_background.pause();
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  // make sure no execution occurs
+  std::this_thread::sleep_for(wait_time*10);
   EXPECT_EQ(get_table_value<std::string>(lua_background, "hello"), "");
   lua_background.resume(store.get());
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   EXPECT_EQ(get_table_value<std::string>(lua_background, "hello"), "world");
 }
 
@@ -1037,18 +1089,21 @@ TEST(TestRGWLuaBackground, PauseResume)
   )";
 
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
-  TestBackground lua_background(store.get(), script, manager.get());
+  auto manager = std::make_unique<TestLuaManager>();
+  set_script(manager.get(), script);
+  TestBackground lua_background(store.get(), manager.get());
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   const auto value_len = get_table_value<std::string>(lua_background, "hello").size();
   EXPECT_GT(value_len, 0);
   lua_background.pause();
-  std::this_thread::sleep_for(wait_time);
+  // make sure no execution occurs
+  std::this_thread::sleep_for(wait_time*10);
   // no change in len
   EXPECT_EQ(value_len, get_table_value<std::string>(lua_background, "hello").size());
+  perfcounter->set(l_rgw_lua_script_ok, 0);
   lua_background.resume(store.get());
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   // should be a change in len
   EXPECT_GT(get_table_value<std::string>(lua_background, "hello").size(), value_len);
 }
@@ -1066,18 +1121,19 @@ TEST(TestRGWLuaBackground, MultipleStarts)
   )";
 
   auto store = make_store();
-  auto manager = store->get_lua_manager("");
-  TestBackground lua_background(store.get(), script, manager.get());
+  auto manager = std::make_unique<TestLuaManager>();
+  set_script(manager.get(), script);
+  TestBackground lua_background(store.get(), manager.get());
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   const auto value_len = get_table_value<std::string>(lua_background, "hello").size();
   EXPECT_GT(value_len, 0);
   lua_background.start();
   lua_background.shutdown();
   lua_background.shutdown();
-  std::this_thread::sleep_for(wait_time);
+  perfcounter->set(l_rgw_lua_script_ok, 0);
   lua_background.start();
-  std::this_thread::sleep_for(wait_time);
+  WAIT_FOR_BACKGROUND;
   // should be a change in len
   EXPECT_GT(get_table_value<std::string>(lua_background, "hello").size(), value_len);
 }
@@ -1085,7 +1141,7 @@ TEST(TestRGWLuaBackground, MultipleStarts)
 TEST(TestRGWLuaBackground, TableValues)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["key1"] = "string value"
@@ -1107,7 +1163,7 @@ TEST(TestRGWLuaBackground, TableValues)
 TEST(TestRGWLuaBackground, TablePersist)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   std::string request_script = R"(
     RGW["key1"] = "string value"
@@ -1137,7 +1193,7 @@ TEST(TestRGWLuaBackground, TablePersist)
 TEST(TestRGWLuaBackground, TableValuesFromRequest)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
   lua_background.start();
 
   const std::string request_script = R"(
@@ -1165,7 +1221,7 @@ TEST(TestRGWLuaBackground, TableValuesFromRequest)
 TEST(TestRGWLuaBackground, TableInvalidValue)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
   lua_background.start();
 
   const std::string request_script = R"(
@@ -1191,7 +1247,7 @@ TEST(TestRGWLuaBackground, TableInvalidValue)
 TEST(TestRGWLuaBackground, TableErase)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   std::string request_script = R"(
     RGW["size"] = 0
@@ -1229,7 +1285,7 @@ TEST(TestRGWLuaBackground, TableErase)
 TEST(TestRGWLuaBackground, TableIterate)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["key1"] = "string value"
@@ -1256,7 +1312,7 @@ TEST(TestRGWLuaBackground, TableIterate)
 TEST(TestRGWLuaBackground, TableIterateWrite)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["a"] = 1
@@ -1286,7 +1342,7 @@ TEST(TestRGWLuaBackground, TableIterateWrite)
 TEST(TestRGWLuaBackground, TableIncrement)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["key1"] = 42
@@ -1306,7 +1362,7 @@ TEST(TestRGWLuaBackground, TableIncrement)
 TEST(TestRGWLuaBackground, TableIncrementBy)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["key1"] = 42
@@ -1328,7 +1384,7 @@ TEST(TestRGWLuaBackground, TableIncrementBy)
 TEST(TestRGWLuaBackground, TableDecrement)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["key1"] = 42
@@ -1348,7 +1404,7 @@ TEST(TestRGWLuaBackground, TableDecrement)
 TEST(TestRGWLuaBackground, TableDecrementBy)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   const std::string request_script = R"(
     RGW["key1"] = 42
@@ -1370,7 +1426,7 @@ TEST(TestRGWLuaBackground, TableDecrementBy)
 TEST(TestRGWLuaBackground, TableIncrementValueError)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   std::string request_script = R"(
     -- cannot increment string values
@@ -1405,7 +1461,7 @@ TEST(TestRGWLuaBackground, TableIncrementValueError)
 TEST(TestRGWLuaBackground, TableIncrementError)
 {
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
 
   std::string request_script = R"(
     -- missing argument
@@ -1494,7 +1550,7 @@ TEST(TestRGWLua, Data)
   )";
 
   DEFINE_REQ_STATE;
-  TestBackground lua_background(store.get(), "", pe.lua.manager.get());
+  TestBackground lua_background(store.get(), pe.lua.manager.get());
   s.host_id = "foo";
   pe.lua.background = &lua_background;
   lua::RGWObjFilter filter(&s, script);
@@ -1557,6 +1613,50 @@ TEST(TestRGWLua, MemoryLimit)
     end
   )";
   s.cct->_conf->rgw_lua_max_memory_per_state = 1024*32;
+  rc = lua::request::execute(nullptr, nullptr, nullptr, &s, nullptr, script);
+  ASSERT_NE(rc, 0);
+}
+
+TEST(TestRGWLua, LuaRuntimeLimit)
+{
+  std::string script = "print(\"hello world\")";
+  
+  DEFINE_REQ_STATE;
+
+  // runtime should be sufficient
+  s.cct->_conf->rgw_lua_max_runtime_per_state = 1000; // 1 second runtime limit
+  int rc = lua::request::execute(nullptr, nullptr, nullptr, &s, nullptr, script);
+  ASSERT_EQ(rc, 0);
+
+  // no runtime limit
+  s.cct->_conf->rgw_lua_max_runtime_per_state = 0;
+  rc = lua::request::execute(nullptr, nullptr, nullptr, &s, nullptr, script);
+  ASSERT_EQ(rc, 0);
+  
+  // script should exceed the runtime limit
+  script = R"(
+    local t = 0
+    for i = 1, 1e8 do
+      t = t + i
+    end
+  )";
+ 
+  s.cct->_conf->rgw_lua_max_runtime_per_state = 10; // 10 milliseconds runtime limit
+  rc = lua::request::execute(nullptr, nullptr, nullptr, &s, nullptr, script);
+  ASSERT_NE(rc, 0);
+
+  s.cct->_conf->rgw_lua_max_runtime_per_state = 0; // no runtime limit
+  rc = lua::request::execute(nullptr, nullptr, nullptr, &s, nullptr, script);
+  ASSERT_EQ(rc, 0);
+
+  // script should exceed the runtime limit
+    script = R"(
+    for i = 1, 10 do
+      os.execute("sleep 1")
+    end
+  )";
+ 
+  s.cct->_conf->rgw_lua_max_runtime_per_state = 5000; // 5 seconds runtime limit
   rc = lua::request::execute(nullptr, nullptr, nullptr, &s, nullptr, script);
   ASSERT_NE(rc, 0);
 }

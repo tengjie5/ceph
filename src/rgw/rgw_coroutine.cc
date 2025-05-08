@@ -3,12 +3,16 @@
 
 #include "include/Context.h"
 #include "common/ceph_json.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "rgw_coroutine.h"
+#include "rgw_asio_thread.h"
 
 // re-include our assert to clobber the system one; fix dout:
 #include "include/ceph_assert.h"
 
 #include <boost/asio/yield.hpp>
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rgw
 #define dout_context g_ceph_context
@@ -615,6 +619,8 @@ void RGWCoroutinesManager::io_complete(RGWCoroutine *cr, const rgw_io_id& io_id)
 
 int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesStack *>& stacks)
 {
+  maybe_warn_about_blocking(dpp);
+
   int ret = 0;
   int blocked_count = 0;
   int interval_wait_count = 0;

@@ -83,6 +83,7 @@ const static struct rgw_http_status_code http_codes[] = {
   { 500, "Internal Server Error" },
   { 501, "Not Implemented" },
   { 503, "Slow Down"},
+  { 507, "Insufficient Storage"},
   { 0, NULL },
 };
 
@@ -397,6 +398,10 @@ void dump_content_length(req_state* const s, const uint64_t len)
 
 static void dump_chunked_encoding(req_state* const s)
 {
+  // omit transfer-encoding for HEAD requests so ChunkingFilter doesn't
+  // try to write the final chunk
+  if(s->op == OP_HEAD)
+    return;
   try {
     RESTFUL_IO(s)->send_chunked_transfer_encoding();
   } catch (rgw::io::Exception& e) {
@@ -496,6 +501,11 @@ void dump_time(req_state *s, const char *name, real_time t)
   rgw_to_iso8601(t, buf, sizeof(buf));
 
   s->formatter->dump_string(name, buf);
+}
+
+void dump_time_exact_seconds(req_state *s, const char *name, real_time t)
+{
+  dump_time(s, name, std::chrono::time_point_cast<std::chrono::seconds>(t));
 }
 
 void dump_owner(req_state *s, const std::string& id, const string& name,
@@ -662,8 +672,10 @@ static void build_redirect_url(req_state *s, const string& redirect_base, string
     dest_uri = dest_uri.substr(0, dest_uri.size() - 1);
   }
   dest_uri += s->info.request_uri;
-  dest_uri += "?";
-  dest_uri += s->info.request_params;
+  if (!s->info.request_params.empty()) {
+    dest_uri += "?";
+    dest_uri += s->info.request_params;
+  }
 }
 
 void abort_early(req_state *s, RGWOp* op, int err_no,
@@ -1463,7 +1475,7 @@ int RGWPutACLs_ObjStore::get_params(optional_yield y)
 {
   const auto max_size = s->cct->_conf->rgw_max_put_param_size;
   std::tie(op_ret, data) = read_all_input(s, max_size, false);
-  ldpp_dout(s, 0) << "RGWPutACLs_ObjStore::get_params read data is: " << data.c_str() << dendl;
+  ldpp_dout(s, 20) << "RGWPutACLs_ObjStore::get_params read data is: " << data.c_str() << dendl;
   return op_ret;
 }
 
@@ -1663,7 +1675,6 @@ int RGWDeleteMultiObj_ObjStore::get_params(optional_yield y)
   std::tie(op_ret, data) = read_all_input(s, max_size, false);
   return op_ret;
 }
-
 
 void RGWRESTOp::send_response()
 {
@@ -2164,6 +2175,11 @@ int RGWREST::preprocess(req_state *s, rgw::io::BasicClient* cio)
       << " s->info.domain=" << s->info.domain
       << " s->info.request_uri=" << s->info.request_uri
       << dendl;
+  } else if (s3website_enabled && api_priority_s3website > api_priority_s3) {
+    // If the Host header is missing, but the s3website API is enabled and has
+    // a higher priority than the regular S3 API, then we should still treat
+    // the request as a website request.
+    s->prot_flags |= RGW_REST_WEBSITE;
   }
 
   if (s->info.domain.empty()) {

@@ -5,6 +5,7 @@ from enum import Enum
 from functools import wraps
 from typing import Optional, Callable, TypeVar, List, NewType, TYPE_CHECKING, Any, NamedTuple
 from orchestrator import OrchestratorError
+import hashlib
 
 if TYPE_CHECKING:
     from cephadm import CephadmOrchestrator
@@ -23,7 +24,7 @@ class CephadmNoImage(Enum):
 # NOTE: order important here as these are used for upgrade order
 CEPH_TYPES = ['mgr', 'mon', 'crash', 'osd', 'mds', 'rgw',
               'rbd-mirror', 'cephfs-mirror', 'ceph-exporter']
-GATEWAY_TYPES = ['iscsi', 'nfs', 'nvmeof']
+GATEWAY_TYPES = ['iscsi', 'nfs', 'nvmeof', 'smb']
 MONITORING_STACK_TYPES = ['node-exporter', 'prometheus',
                           'alertmanager', 'grafana', 'loki', 'promtail']
 RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES = ['haproxy', 'nfs']
@@ -154,3 +155,9 @@ def file_mode_to_str(mode: int) -> str:
             f'{"x" if (mode >> shift) & 1 else "-"}'
         ) + r
     return r
+
+
+def md5_hash(input_value: str) -> str:
+    input_str = str(input_value).encode('utf-8')
+    hash_object = hashlib.md5(input_str)
+    return hash_object.hexdigest()

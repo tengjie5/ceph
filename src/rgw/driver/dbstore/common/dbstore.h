@@ -104,15 +104,15 @@ struct DBOpObjectDataInfo {
 
 struct DBOpLCHeadInfo {
   std::string index;
-  rgw::sal::StoreLifecycle::StoreLCHead head;
+  rgw::sal::LCHead head;
 };
 
 struct DBOpLCEntryInfo {
   std::string index;
-  rgw::sal::StoreLifecycle::StoreLCEntry entry;
+  rgw::sal::LCEntry entry;
   // used for list query
   std::string min_marker;
-  std::list<rgw::sal::StoreLifecycle::StoreLCEntry> list_entries;
+  std::list<rgw::sal::LCEntry> list_entries;
 };
 
 struct DBOpInfo {
@@ -517,7 +517,7 @@ class DBOp {
        *
        * - RGWObjState. Below are omitted from that struct
        *    as they seem in-memory variables
-       *    * is_atomic, has_atts, exists, prefetch_data, keep_tail, 
+       *    * is_atomic, has_atts, exists, prefetch_data, 
        * - RGWObjManifest
        *
        * Extra field added "IsMultipart" to flag multipart uploads,
@@ -868,14 +868,14 @@ class UpdateBucketOp: virtual public DBOp {
       Zonegroup = {}, HasInstanceObj = {}, Quota = {}, RequesterPays = {}, HasWebsite = {}, \
       WebsiteConf = {}, SwiftVersioning = {}, SwiftVerLocation = {}, MdsearchConfig = {}, \
       NewBucketInstanceID = {}, ObjectLock = {}, SyncPolicyInfoGroups = {}, \
-      BucketVersion = {}, Mtime = {} WHERE BucketName = {}";
+      BucketAttrs = {}, BucketVersion = {}, Mtime = {} WHERE BucketName = {}";
     // Updates Attrs, OwnerID, Mtime, Version
     static constexpr std::string_view AttrsQuery =
       "UPDATE '{}' SET OwnerID = {}, BucketAttrs = {}, Mtime = {}, BucketVersion = {} \
       WHERE BucketName = {}";
     // Updates OwnerID, CreationTime, Mtime, Version
     static constexpr std::string_view OwnerQuery =
-      "UPDATE '{}' SET OwnerID = {}, CreationTime = {}, Mtime = {}, BucketVersion = {} WHERE BucketName = {}";
+      "UPDATE '{}' SET OwnerID = {}, CreationTime = {}, BucketAttrs = {}, Mtime = {}, BucketVersion = {} WHERE BucketName = {}";
 
   public:
     virtual ~UpdateBucketOp() {}
@@ -893,6 +893,7 @@ class UpdateBucketOp: virtual public DBOp {
             params.op.bucket.swift_ver_location, params.op.bucket.mdsearch_config,
             params.op.bucket.new_bucket_instance_id, params.op.bucket.obj_lock,
             params.op.bucket.sync_policy_info_groups,
+            params.op.bucket.bucket_attrs,
             params.op.bucket.bucket_ver, params.op.bucket.mtime,
             params.op.bucket.bucket_name);
       }
@@ -905,6 +906,7 @@ class UpdateBucketOp: virtual public DBOp {
       if (params.op.query_str == "owner") {
         return fmt::format(OwnerQuery, params.bucket_table,
             params.op.user.user_id, params.op.bucket.creation_time,
+            params.op.bucket.bucket_attrs,
             params.op.bucket.mtime,
             params.op.bucket.bucket_ver, params.op.bucket.bucket_name);
       }
@@ -1979,15 +1981,15 @@ class DB {
         RGWObjState *astate, void *arg);
 
     int get_entry(const std::string& oid, const std::string& marker,
-		  std::unique_ptr<rgw::sal::Lifecycle::LCEntry>* entry);
+		  rgw::sal::LCEntry& entry);
     int get_next_entry(const std::string& oid, const std::string& marker,
-		  std::unique_ptr<rgw::sal::Lifecycle::LCEntry>* entry);
-    int set_entry(const std::string& oid, rgw::sal::Lifecycle::LCEntry& entry);
+		  rgw::sal::LCEntry& entry);
+    int set_entry(const std::string& oid, const rgw::sal::LCEntry& entry);
     int list_entries(const std::string& oid, const std::string& marker,
-			   uint32_t max_entries, std::vector<std::unique_ptr<rgw::sal::Lifecycle::LCEntry>>& entries);
-    int rm_entry(const std::string& oid, rgw::sal::Lifecycle::LCEntry& entry);
-    int get_head(const std::string& oid, std::unique_ptr<rgw::sal::Lifecycle::LCHead>* head);
-    int put_head(const std::string& oid, rgw::sal::Lifecycle::LCHead& head);
+			   uint32_t max_entries, std::vector<rgw::sal::LCEntry>& entries);
+    int rm_entry(const std::string& oid, const rgw::sal::LCEntry& entry);
+    int get_head(const std::string& oid, rgw::sal::LCHead& head);
+    int put_head(const std::string& oid, const rgw::sal::LCHead& head);
     int delete_stale_objs(const DoutPrefixProvider *dpp, const std::string& bucket,
                           uint32_t min_wait);
     int createGC(const DoutPrefixProvider *_dpp);

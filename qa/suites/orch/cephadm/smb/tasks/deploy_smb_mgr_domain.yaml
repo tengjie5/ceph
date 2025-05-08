@@ -17,6 +17,7 @@ tasks:
 - cephadm.deploy_samba_ad_dc:
     role: host.b
 - cephadm:
+    single_host_defaults: true
 
 - cephadm.shell:
     host.a:
@@ -39,6 +40,7 @@ tasks:
           --domain-realm=domain1.sink.test
           --domain-join-user-pass=Administrator%Passw0rd
           --custom-dns={{ctx.samba_ad_dc_ip}}
+          --placement=count:1
       - cmd: ceph smb share create modtest1 share1 cephfs / --subvolume=smb/sv1
       - cmd: ceph smb share create modtest1 share2 cephfs / --subvolume=smb/sv2
 # Wait for the smb service to start

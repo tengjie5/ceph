@@ -19,28 +19,31 @@
 
 #include "include/types.h"
 
-#include "MDSContext.h"
+#include "Capability.h"
+#include "Mutation.h" // for MDRequestRef
 
 #include <map>
 #include <list>
 #include <set>
 #include <string_view>
 
-#include "messages/MExportCaps.h"
-#include "messages/MExportCapsAck.h"
-#include "messages/MExportDir.h"
-#include "messages/MExportDirAck.h"
-#include "messages/MExportDirCancel.h"
-#include "messages/MExportDirDiscover.h"
-#include "messages/MExportDirDiscoverAck.h"
-#include "messages/MExportDirFinish.h"
-#include "messages/MExportDirNotify.h"
-#include "messages/MExportDirNotifyAck.h"
-#include "messages/MExportDirPrep.h"
-#include "messages/MExportDirPrepAck.h"
-#include "messages/MGatherCaps.h"
-
+class MDCache;
+class MDSContext;
+class MDSMap;
 class MDSRank;
+class MExportCaps;
+class MExportCapsAck;
+class MExportDir;
+class MExportDirAck;
+class MExportDirCancel;
+class MExportDirDiscover;
+class MExportDirDiscoverAck;
+class MExportDirFinish;
+class MExportDirNotify;
+class MExportDirNotifyAck;
+class MExportDirPrep;
+class MExportDirPrepAck;
+class MGatherCaps;
 class CDir;
 class CInode;
 class CDentry;
@@ -212,7 +215,7 @@ public:
 				std::map<client_t,client_metadata_t>& exported_client_metadata_map);
   void finish_export_inode(CInode *in, mds_rank_t target,
 			   std::map<client_t,Capability::Import>& peer_imported,
-			   MDSContext::vec& finished);
+			   std::vector<MDSContext*>& finished);
   void finish_export_inode_caps(CInode *in, mds_rank_t target,
 			        std::map<client_t,Capability::Import>& peer_imported);
 
@@ -224,7 +227,7 @@ public:
                         uint64_t &num_exported);
   void finish_export_dir(CDir *dir, mds_rank_t target,
 			 std::map<inodeno_t,std::map<client_t,Capability::Import> >& peer_imported,
-			 MDSContext::vec& finished, int *num_dentries);
+			 std::vector<MDSContext*>& finished, int *num_dentries);
 
   void clear_export_proxy_pins(CDir *dir);
 
@@ -252,6 +255,8 @@ public:
 
   void import_finish(CDir *dir, bool notify, bool last=true);
 
+  void dump_export_states(Formatter *f);
+
 protected:
   struct export_base_t {
     export_base_t(dirfrag_t df, mds_rank_t d, unsigned c, uint64_t g) :
@@ -267,7 +272,31 @@ protected:
   struct export_state_t {
     export_state_t() {}
 
-    int state = 0;
+    void set_state(int s) {
+      ceph_assert(s != state);
+      if (state != EXPORT_CANCELLED) {
+	auto& t = state_history.at(state);
+	t.second = double(ceph_clock_now()) - double(t.first);
+      }
+      state = s;
+      state_history[state] = std::pair<utime_t, double>(ceph_clock_now(), 0.0);
+    }
+    utime_t get_start_time(int s) const {
+      ceph_assert(state_history.count(s) > 0);
+      return state_history.at(s).first;
+    }
+    double get_time_spent(int s) const {
+      ceph_assert(state_history.count(s) > 0);
+      const auto& t = state_history.at(s);
+      return s == state ? double(ceph_clock_now()) - double(t.first) : t.second;
+    }
+    double get_freeze_tree_time() const {
+      ceph_assert(state >= EXPORT_DISCOVERING);
+      ceph_assert(state_history.count((int)EXPORT_DISCOVERING) > 0);
+      return double(ceph_clock_now()) - double(state_history.at((int)EXPORT_DISCOVERING).first);
+    };
+
+    int state = EXPORT_CANCELLED;
     mds_rank_t peer = MDS_RANK_NONE;
     uint64_t tid = 0;
     std::set<mds_rank_t> warning_ack_waiting;
@@ -275,6 +304,10 @@ protected:
     std::map<inodeno_t,std::map<client_t,Capability::Import> > peer_imported;
     MutationRef mut;
     size_t approx_size = 0;
+    // record the start time and time spent of each export state
+    std::map<int, std::pair<utime_t, double> > state_history;
+    // record the clients whose sessions need to be flushed
+    std::set<client_t> export_client_set;
     // for freeze tree deadlock detection
     utime_t last_cum_auth_pins_change;
     int last_cum_auth_pins = 0;
@@ -327,7 +360,7 @@ protected:
   void child_export_finish(std::shared_ptr<export_base_t>& parent, bool success);
   void encode_export_prep_trace(bufferlist& bl, CDir *bound, CDir *dir, export_state_t &es,
                                std::set<inodeno_t> &inodes_added, std::set<dirfrag_t> &dirfrags_added);
-  void decode_export_prep_trace(bufferlist::const_iterator& blp, mds_rank_t oldauth, MDSContext::vec &finished);
+  void decode_export_prep_trace(bufferlist::const_iterator& blp, mds_rank_t oldauth, std::vector<MDSContext*> &finished);
 
   void handle_gather_caps(const cref_t<MGatherCaps> &m);
 

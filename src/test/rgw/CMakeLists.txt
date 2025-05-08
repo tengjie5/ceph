@@ -21,6 +21,21 @@ if(WITH_JAEGER)
 endif()
 
 if(WITH_RADOSGW_D4N)
+add_executable(ceph_test_rgw_d4n_filter
+  test_d4n_filter.cc
+  )
+target_include_directories(ceph_test_rgw_d4n_filter
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/d4n")
+target_link_libraries(ceph_test_rgw_d4n_filter PRIVATE
+  rgw_common
+  librados
+  ceph-common
+  ${rgw_libs}
+  ${UNITTEST_LIBS}
+  ${EXTRALIBS}
+  )
+install(TARGETS ceph_test_rgw_d4n_filter DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 add_executable(ceph_test_rgw_d4n_directory
   test_d4n_directory.cc
   )
@@ -268,6 +283,14 @@ target_include_directories(unittest_rgw_lc
 target_link_libraries(unittest_rgw_lc
   rgw_common ${rgw_libs} ${EXPAT_LIBRARIES})
 
+# unittest_rgw_cksum
+add_executable(unittest_rgw_cksum test_rgw_cksum.cc)
+add_ceph_unittest(unittest_rgw_cksum)
+target_include_directories(unittest_rgw_cksum
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+target_link_libraries(unittest_rgw_cksum
+  rgw_common ${rgw_libs})
+
 # unittest_rgw_arn
 add_executable(unittest_rgw_arn test_rgw_arn.cc)
 add_ceph_unittest(unittest_rgw_arn)
@@ -295,22 +318,22 @@ target_include_directories(ceph_test_rgw_gc_log
 target_link_libraries(ceph_test_rgw_gc_log ${rgw_libs} radostest-cxx)
 install(TARGETS ceph_test_rgw_gc_log DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+add_executable(unittest_rgw_shard_io test_rgw_shard_io.cc)
+add_ceph_unittest(unittest_rgw_shard_io)
+target_link_libraries(unittest_rgw_shard_io ${rgw_libs} unit-main ${UNITTEST_LIBS})
+
 add_ceph_test(test-ceph-diff-sorted.sh
   ${CMAKE_CURRENT_SOURCE_DIR}/test-ceph-diff-sorted.sh)
-
-# unittest_cls_fifo_legacy
-add_executable(unittest_cls_fifo_legacy test_cls_fifo_legacy.cc)
-target_include_directories(unittest_cls_fifo_legacy
-  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
-target_link_libraries(unittest_cls_fifo_legacy radostest-cxx ${UNITTEST_LIBS}
-  ${rgw_libs})
 
 # unittest_log_backing
 add_executable(unittest_log_backing test_log_backing.cc)
 target_include_directories(unittest_log_backing
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/store/rados")
-target_link_libraries(unittest_log_backing radostest-cxx ${UNITTEST_LIBS}
+target_link_libraries(unittest_log_backing
+  libneorados
+  neoradostest-support
+  ${UNITTEST_LIBS}
   ${rgw_libs})
 
 add_executable(unittest_rgw_lua test_rgw_lua.cc)
@@ -340,4 +363,46 @@ if(WITH_RADOSGW_POSIX)
     SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/posix")
   target_link_libraries(unittest_posix_bucket_cache  ${UNITTEST_LIBS}
     ${rgw_libs} ${LMDB_LIBRARIES})
+
+# unittest_rgw_posix_driver
+add_executable(unittest_rgw_posix_driver
+	test_rgw_posix_driver.cc)
+add_ceph_unittest(unittest_rgw_posix_driver)
+target_compile_definitions(unittest_rgw_posix_driver PUBLIC LMDB_SAFE_NO_CPP_UTILITIES)
+target_include_directories(unittest_rgw_posix_driver
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/posix")
+target_link_libraries(unittest_rgw_posix_driver  ${UNITTEST_LIBS}
+  ${rgw_libs} ${LMDB_LIBRARIES})
 endif(WITH_RADOSGW_POSIX)
+
+# ceph_test_datalog
+add_executable(ceph_test_datalog test_datalog.cc)
+target_include_directories(ceph_test_datalog
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/store/rados")
+target_link_libraries(ceph_test_datalog
+  libneorados
+  neoradostest-support
+  ${UNITTEST_LIBS}
+  ${rgw_libs})
+install(TARGETS ceph_test_datalog DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(WITH_CATCH2)
+ add_executable(unittest_rgw_hex
+  test_rgw_hex.cc)
+
+ target_include_directories(unittest_rgw_hex
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+
+ target_link_libraries(unittest_rgw_hex 
+  rgw_common
+  librados
+  ceph-common
+  ${rgw_libs}
+  ${EXTRALIBS}
+  Catch2WithMain)
+
+ add_ceph_unittest(unittest_rgw_hex)
+
+endif(WITH_CATCH2)

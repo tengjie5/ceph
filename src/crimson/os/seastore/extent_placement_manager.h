@@ -177,7 +177,7 @@ public:
       return false;
     }
     assert(t.get_src() == transaction_type_t::TRIM_DIRTY);
-    ceph_assert_always(extent->get_type() == extent_types_t::ROOT ||
+    ceph_assert_always(is_root_type(extent->get_type()) ||
 	extent->get_paddr().is_absolute());
     return crimson::os::seastore::can_inplace_rewrite(extent->get_type());
   }
@@ -190,6 +190,12 @@ public:
   }
 #endif
 private:
+  struct write_info_t {
+    paddr_t offset;
+    ceph::bufferptr bp;
+    RandomBlockManager* rbm;
+    std::list<ceph::bufferptr> mergeable_bps;
+  };
   alloc_write_iertr::future<> do_write(
     Transaction& t,
     std::list<CachedExtentRef> &extent);
@@ -230,9 +236,9 @@ struct io_usage_t {
   cleaner_usage_t cleaner_usage;
   friend std::ostream &operator<<(std::ostream &out, const io_usage_t &usage) {
     return out << "io_usage_t("
-               << "inline_usage=" << usage.inline_usage
-               << ", main_cleaner_usage=" << usage.cleaner_usage.main_usage
-               << ", cold_cleaner_usage=" << usage.cleaner_usage.cold_ool_usage
+               << "inline_usage=0x" << std::hex << usage.inline_usage
+               << ", main_cleaner_usage=0x" << usage.cleaner_usage.main_usage
+               << ", cold_cleaner_usage=0x" << usage.cleaner_usage.cold_ool_usage << std::dec
                << ")";
   }
 };
@@ -298,7 +304,8 @@ public:
 
   device_stats_t get_device_stats(
     const writer_stats_t &journal_stats,
-    bool report_detail) const;
+    bool report_detail,
+    double seconds) const;
 
   using mount_ertr = crimson::errorator<
       crimson::ct_error::input_output_error>;
@@ -364,9 +371,7 @@ public:
 
     // XXX: bp might be extended to point to different memory (e.g. PMem)
     // according to the allocator.
-    auto bp = ceph::bufferptr(
-      buffer::create_page_aligned(length));
-    bp.zero();
+    auto bp = create_extent_ptr_zero(length);
 
     return alloc_result_t{addr, std::move(bp), gen};
   }
@@ -398,9 +403,7 @@ public:
 #ifdef UNIT_TESTS_BUILT
     if (unlikely(external_paddr.has_value())) {
       assert(external_paddr->is_fake());
-      auto bp = ceph::bufferptr(
-        buffer::create_page_aligned(length));
-      bp.zero();
+      auto bp = create_extent_ptr_zero(length);
       allocs.emplace_back(alloc_result_t{*external_paddr, std::move(bp), gen});
     } else {
 #else
@@ -411,15 +414,17 @@ public:
       for (auto &ext : addrs) {
         auto left = ext.len;
         while (left > 0) {
-          auto len = std::min(max_data_allocation_size, left);
-          auto bp = ceph::bufferptr(buffer::create_page_aligned(len));
-          bp.zero();
+          auto len = left;
+          if (max_data_allocation_size) {
+            len = std::min(max_data_allocation_size, len);
+          }
+          auto bp = create_extent_ptr_zero(len);
           auto start = ext.start.is_delayed()
                         ? ext.start
                         : ext.start + (ext.len - left);
           allocs.emplace_back(alloc_result_t{start, std::move(bp), gen});
           SUBDEBUGT(seastore_epm,
-                    "allocated {} {}B extent at {}, hint={}, gen={}",
+                    "allocated {} 0x{:x}B extent at {}, hint={}, gen={}",
                     t, type, len, start, hint, gen);
           left -= len;
         }
@@ -551,13 +556,25 @@ public:
     return background_process.run_until_halt();
   }
 
+  bool get_checksum_needed(paddr_t addr) {
+    // checksum offloading only for blocks physically stored in the device
+#ifdef UNIT_TESTS_BUILT
+    if (addr.is_fake()) {
+      return true;
+    }
+#endif
+    assert(addr.is_absolute());
+    return !devices_by_id[addr.get_device_id()]->is_end_to_end_data_protection();
+  }
+
 private:
   rewrite_gen_t adjust_generation(
       data_category_t category,
       extent_types_t type,
       placement_hint_t hint,
       rewrite_gen_t gen) {
-    if (type == extent_types_t::ROOT) {
+    assert(is_real_type(type));
+    if (is_root_type(type)) {
       gen = INLINE_GENERATION;
     } else if (get_main_backend_type() == backend_type_t::SEGMENTED &&
                is_lba_backref_node(type)) {
@@ -1082,9 +1099,6 @@ private:
   // TODO: drop once paddr->journal_seq_t is introduced
   SegmentSeqAllocatorRef ool_segment_seq_allocator;
   extent_len_t max_data_allocation_size = 0;
-
-  mutable seastar::lowres_clock::time_point last_tp =
-    seastar::lowres_clock::time_point::min();
 
   friend class ::transaction_manager_test_t;
 };

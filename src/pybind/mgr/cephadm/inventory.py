@@ -8,11 +8,19 @@ import logging
 import math
 import socket
 from typing import TYPE_CHECKING, Dict, List, Iterator, Optional, Any, Tuple, Set, Mapping, cast, \
-    NamedTuple, Type, ValuesView
+    NamedTuple, Type, ValuesView, Union
 
 import orchestrator
 from ceph.deployment import inventory
-from ceph.deployment.service_spec import ServiceSpec, PlacementSpec, TunedProfileSpec, IngressSpec
+from ceph.deployment.service_spec import (
+    ServiceSpec,
+    PlacementSpec,
+    TunedProfileSpec,
+    IngressSpec,
+    RGWSpec,
+    IscsiServiceSpec,
+    NvmeofServiceSpec,
+)
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
 from orchestrator import OrchestratorError, HostSpec, OrchestratorEvent, service_to_daemon_types
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
@@ -36,6 +44,26 @@ class HostCacheStatus(enum.Enum):
     stray = 'stray'
     host = 'host'
     devices = 'devices'
+
+
+class OrchSecretNotFound(OrchestratorError):
+    def __init__(
+        self,
+        message: Optional[str] = '',
+        entity: Optional[str] = '',
+        service_name: Optional[str] = '',
+        hostname: Optional[str] = ''
+    ):
+        if not message:
+            message = f'No secret found for entity {entity}'
+            if service_name:
+                message += f' with service name {service_name}'
+            if hostname:
+                message += f' with hostname {hostname}'
+        super().__init__(message)
+        self.entity = entity
+        self.service_name = service_name
+        self.hostname = hostname
 
 
 class Inventory:
@@ -110,6 +138,15 @@ class Inventory:
                 return stored_name
         return host
 
+    def get_fqdn(self, hname: str) -> Optional[str]:
+        if hname in self._inventory:
+            if hname in self._all_known_names:
+                all_names = self._all_known_names[hname]  # [hostname, shortname, fqdn]
+                if all_names:
+                    return all_names[2]
+            return hname  # names info is not yet available!
+        return None
+
     def update_known_hostnames(self, hostname: str, shortname: str, fqdn: str) -> None:
         for hname in [hostname, shortname, fqdn]:
             # if we know the host by any of the names, store the full set of names
@@ -148,11 +185,12 @@ class Inventory:
 
     def add_label(self, host: str, label: str) -> None:
         host = self._get_stored_name(host)
-
+        labels = label.split(',') if ',' in label else [label]
         if 'labels' not in self._inventory[host]:
             self._inventory[host]['labels'] = list()
-        if label not in self._inventory[host]['labels']:
-            self._inventory[host]['labels'].append(label)
+        for label in labels:
+            if label not in self._inventory[host]['labels']:
+                self._inventory[host]['labels'].append(label)
         self.save()
 
     def rm_label(self, host: str, label: str) -> None:
@@ -233,6 +271,20 @@ class SpecStore():
                                self.spec_created[name],
                                self.spec_deleted.get(name, None))
 
+    def get_by_service_type(self, service_type: str) -> List[SpecDescription]:
+        matching_specs: List[SpecDescription] = []
+        for name, spec in self._specs.items():
+            if spec.service_type == service_type:
+                matching_specs.append(
+                    SpecDescription(
+                        spec,
+                        self._rank_maps.get(name),
+                        self.spec_created[name],
+                        self.spec_deleted.get(name, None)
+                    )
+                )
+        return matching_specs
+
     @property
     def active_specs(self) -> Mapping[str, ServiceSpec]:
         return {k: v for k, v in self._specs.items() if k not in self.spec_deleted}
@@ -309,6 +361,7 @@ class SpecStore():
         if update_create:
             self.spec_created[name] = datetime_now()
         self._save(name)
+        self._save_certs_and_keys(spec)
 
     def save_rank_map(self,
                       name: str,
@@ -337,6 +390,76 @@ class SpecStore():
                                     OrchestratorEvent.INFO,
                                     'service was created')
 
+    def _save_certs_and_keys(self, spec: ServiceSpec) -> None:
+        if spec.service_type == 'rgw':
+            rgw_spec = cast(RGWSpec, spec)
+            if rgw_spec.rgw_frontend_ssl_certificate:
+                rgw_cert: Union[str, List[str]] = rgw_spec.rgw_frontend_ssl_certificate
+                if isinstance(rgw_cert, list):
+                    cert_str = '\n'.join(rgw_cert)
+                else:
+                    cert_str = rgw_cert
+                assert isinstance(cert_str, str)
+                self.mgr.cert_mgr.save_cert(
+                    'rgw_frontend_ssl_cert',
+                    cert_str,
+                    service_name=rgw_spec.service_name(),
+                    user_made=True)
+        elif spec.service_type == 'iscsi':
+            iscsi_spec = cast(IscsiServiceSpec, spec)
+            if iscsi_spec.ssl_cert:
+                self.mgr.cert_mgr.save_cert(
+                    'iscsi_ssl_cert',
+                    iscsi_spec.ssl_cert,
+                    service_name=iscsi_spec.service_name(),
+                    user_made=True)
+            if iscsi_spec.ssl_key:
+                self.mgr.cert_mgr.save_key(
+                    'iscsi_ssl_key',
+                    iscsi_spec.ssl_key,
+                    service_name=iscsi_spec.service_name(),
+                    user_made=True)
+        elif spec.service_type == 'ingress':
+            ingress_spec = cast(IngressSpec, spec)
+            if ingress_spec.ssl_cert:
+                self.mgr.cert_mgr.save_cert(
+                    'ingress_ssl_cert',
+                    ingress_spec.ssl_cert,
+                    service_name=ingress_spec.service_name(),
+                    user_made=True)
+            if ingress_spec.ssl_key:
+                self.mgr.cert_mgr.save_key(
+                    'ingress_ssl_key',
+                    ingress_spec.ssl_key,
+                    service_name=ingress_spec.service_name(),
+                    user_made=True)
+        elif spec.service_type == 'nvmeof':
+            nvmeof_spec = cast(NvmeofServiceSpec, spec)
+            for cert_attr in [
+                'server_cert',
+                'client_cert',
+                'root_ca_cert'
+            ]:
+                cert = getattr(nvmeof_spec, cert_attr, None)
+                if cert:
+                    self.mgr.cert_mgr.save_cert(
+                        f'nvmeof_{cert_attr}',
+                        cert,
+                        service_name=nvmeof_spec.service_name(),
+                        user_made=True)
+            for key_attr in [
+                'server_key',
+                'client_key',
+                'encryption_key',
+            ]:
+                key = getattr(nvmeof_spec, key_attr, None)
+                if key:
+                    self.mgr.cert_mgr.save_key(
+                        f'nvmeof_{key_attr}',
+                        key,
+                        service_name=nvmeof_spec.service_name(),
+                        user_made=True)
+
     def rm(self, service_name: str) -> bool:
         if service_name not in self._specs:
             return False
@@ -353,6 +476,7 @@ class SpecStore():
         # type: (str) -> bool
         found = service_name in self._specs
         if found:
+            self._rm_certs_and_keys(self._specs[service_name])
             del self._specs[service_name]
             if service_name in self._rank_maps:
                 del self._rank_maps[service_name]
@@ -363,6 +487,23 @@ class SpecStore():
                 del self._needs_configuration[service_name]
             self.mgr.set_store(SPEC_STORE_PREFIX + service_name, None)
         return found
+
+    def _rm_certs_and_keys(self, spec: ServiceSpec) -> None:
+        if spec.service_type == 'rgw':
+            self.mgr.cert_mgr.rm_cert('rgw_frontend_ssl_cert', service_name=spec.service_name())
+        if spec.service_type == 'iscsi':
+            self.mgr.cert_mgr.rm_cert('iscsi_ssl_cert', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_key('iscsi_ssl_key', service_name=spec.service_name())
+        if spec.service_type == 'ingress':
+            self.mgr.cert_mgr.rm_cert('ingress_ssl_cert', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_key('ingress_ssl_key', service_name=spec.service_name())
+        if spec.service_type == 'nvmeof':
+            self.mgr.cert_mgr.rm_cert('nvmeof_server_cert', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_cert('nvmeof_client_cert', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_cert('nvmeof_root_ca_cert', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_key('nvmeof_server_key', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_key('nvmeof_client_key', service_name=spec.service_name())
+            self.mgr.cert_mgr.rm_key('nvmeof_encryption_key', service_name=spec.service_name())
 
     def get_created(self, spec: ServiceSpec) -> Optional[datetime.datetime]:
         return self.spec_created.get(spec.service_name())
@@ -392,6 +533,13 @@ class SpecStore():
             self._save(name)
         else:
             self.mgr.log.warning(f'Attempted to mark unknown service "{name}" as having been configured')
+
+    def get_specs_by_type(self, service_type: str) -> Mapping[str, ServiceSpec]:
+        return {
+            service_name: spec
+            for service_name, spec in self._specs.items()
+            if service_type == spec.service_type
+        }
 
 
 class ClientKeyringSpec(object):
@@ -511,6 +659,9 @@ class TunedProfileStore():
             logger.error(
                 f'Attempted to set setting "{setting}" for nonexistent os tuning profile "{profile}"')
 
+    def add_settings(self, profile: str, settings: dict) -> None:
+        self.process_settings(profile, settings, action='add')
+
     def rm_setting(self, profile: str, setting: str) -> None:
         if profile in self.profiles:
             if setting in self.profiles[profile].settings:
@@ -523,6 +674,39 @@ class TunedProfileStore():
         else:
             logger.error(
                 f'Attempted to remove setting "{setting}" from nonexistent os tuning profile "{profile}"')
+
+    def rm_settings(self, profile: str, settings: List[str]) -> None:
+        self.process_settings(profile, settings, action='remove')
+
+    def process_settings(self, profile: str, settings: Union[dict, list], action: str) -> None:
+        """
+        Process settings by either adding or removing them based on the action specified.
+        """
+        if profile not in self.profiles:
+            logger.error(f'Attempted to {action} settings for nonexistent os tuning profile "{profile}"')
+            return
+        profile_settings = self.profiles[profile].settings
+        if action == 'remove' and isinstance(settings, list):
+            invalid_settings = [s for s in settings if '=' in s or s not in profile_settings]
+            if invalid_settings:
+                raise OrchestratorError(
+                    f"Invalid settings: {', '.join(invalid_settings)}. "
+                    "Ensure settings are specified without '=' and exist in the profile. Correct format: key1,key2"
+                )
+        if action == 'add' and isinstance(settings, dict):
+            for setting, value in settings.items():
+                self.profiles[profile].settings[setting] = value
+        elif action == 'remove' and isinstance(settings, list):
+            for setting in settings:
+                self.profiles[profile].settings.pop(setting, '')
+        else:
+            logger.error(
+                f'Invalid action "{action}" for settings modification for tuned profile '
+                f'"{profile}". Valid actions are "add" and "remove"'
+            )
+            return
+        self.profiles[profile]._last_updated = datetime_to_str(datetime_now())
+        self.save()
 
     def add_profile(self, spec: TunedProfileSpec) -> None:
         spec._last_updated = datetime_to_str(datetime_now())
@@ -1173,10 +1357,15 @@ class HostCache():
 
     def get_daemons_by_type(self, service_type: str, host: str = '') -> List[orchestrator.DaemonDescription]:
         assert service_type not in ['keepalived', 'haproxy']
-
         daemons = self.daemons[host].values() if host else self._get_daemons()
-
         return [d for d in daemons if d.daemon_type in service_to_daemon_types(service_type)]
+
+    def get_daemons_by_types(self, daemon_types: List[str]) -> List[str]:
+        daemon_names = []
+        for daemon_type in daemon_types:
+            for dd in self.get_daemons_by_type(daemon_type):
+                daemon_names.append(dd.name())
+        return daemon_names
 
     def get_daemon_types(self, hostname: str) -> Set[str]:
         """Provide a list of the types of daemons on the host"""

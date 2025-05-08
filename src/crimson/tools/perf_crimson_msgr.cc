@@ -1,6 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <iomanip>
 #include <map>
 #include <boost/program_options.hpp>
 #include <boost/iterator/counting_iterator.hpp>
@@ -368,7 +369,7 @@ static seastar::future<> run(
                   return seastar::smp::invoke_on_all([&report, this] {
                     auto &server = container().local();
                     server.get_report(report.reports[seastar::this_shard_id()]);
-                  }).then([&report, this] {
+                  }).then([&report] {
                     auto now = mono_clock::now();
                     auto prv = report.start_time;
                     report.start_time = now;
@@ -416,7 +417,7 @@ static seastar::future<> run(
               });
             }
           );
-        }).then([this] {
+        }).then([] {
           logger().info("report is stopped!");
         }).forward_to(std::move(pr_report));
       }
@@ -1107,8 +1108,8 @@ static seastar::future<> run(
           "ms_crc_data", crc_enabled ? "true" : "false");
     })
   ).then([=](auto&& ret) {
-    auto server = std::move(std::get<0>(ret).get0());
-    auto client = std::move(std::get<1>(ret).get0());
+    auto server = std::move(std::get<0>(ret).get());
+    auto client = std::move(std::get<1>(ret).get());
     // reserve core 0 for potentially better performance
     if (mode == perf_mode_t::both) {
       logger().info("\nperf settings:\n  smp={}\n  {}\n  {}\n",

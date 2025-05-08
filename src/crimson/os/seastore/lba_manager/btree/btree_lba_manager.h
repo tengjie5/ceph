@@ -23,11 +23,13 @@
 #include "crimson/os/seastore/lba_manager/btree/lba_btree_node.h"
 #include "crimson/os/seastore/btree/btree_range_pin.h"
 
+namespace crimson::os::seastore {
+class LogicalCachedExtent;
+}
+
 namespace crimson::os::seastore::lba_manager::btree {
 
-struct LBALeafNode;
-
-class BtreeLBAMapping : public BtreeNodeMapping<laddr_t, paddr_t> {
+class BtreeLBAMapping : public LBAMapping {
 // To support cloning, there are two kinds of lba mappings:
 // 	1. physical lba mapping: the pladdr in the value of which is the paddr of
 // 	   the corresponding extent;
@@ -61,14 +63,14 @@ class BtreeLBAMapping : public BtreeNodeMapping<laddr_t, paddr_t> {
 // their keys.
 public:
   BtreeLBAMapping(op_context_t<laddr_t> ctx)
-    : BtreeNodeMapping(ctx) {}
+    : LBAMapping(ctx) {}
   BtreeLBAMapping(
     op_context_t<laddr_t> c,
     LBALeafNodeRef parent,
     uint16_t pos,
     lba_map_val_t &val,
     lba_node_meta_t meta)
-    : BtreeNodeMapping(
+    : LBAMapping(
 	c,
 	parent,
 	pos,
@@ -82,7 +84,11 @@ public:
       raw_val(val.pladdr),
       map_val(val),
       parent_modifications(parent->modifications)
-  {}
+  {
+    if (!parent->is_pending()) {
+      this->child_pos = {parent, pos};
+    }
+  }
 
   lba_map_val_t get_map_val() const {
     return map_val;
@@ -128,7 +134,7 @@ public:
     assert(intermediate_key >= intermediate_base);
     assert((intermediate_key == L_ADDR_NULL)
       == (intermediate_base == L_ADDR_NULL));
-    return intermediate_key - intermediate_base;
+    return intermediate_key.get_byte_distance<extent_len_t>(intermediate_base);
   }
 
   extent_len_t get_intermediate_length() const final {
@@ -163,21 +169,40 @@ public:
 
   bool parent_modified() const final {
     ceph_assert(parent);
-    ceph_assert(is_parent_valid());
+    ceph_assert(is_parent_viewable());
     auto &p = static_cast<LBALeafNode&>(*parent);
     return p.modified_since(parent_modifications);
   }
 
   void maybe_fix_pos() final {
-    assert(is_parent_valid());
+    assert(is_parent_viewable());
     if (!parent_modified()) {
       return;
     }
+    LOG_PREFIX(BtreeLBAMapping::maybe_fix_pos);
     auto &p = static_cast<LBALeafNode&>(*parent);
     p.maybe_fix_mapping_pos(*this);
+    SUBDEBUGT(seastore_lba, "fixed pin {}",
+              ctx.trans, static_cast<LBAMapping&>(*this));
   }
+
+  LBAMappingRef refresh_with_pending_parent() final {
+    LOG_PREFIX(BtreeLBAMapping::refresh_with_pending_parent);
+    assert(is_parent_valid() && !is_parent_viewable());
+    auto &p = static_cast<LBALeafNode&>(*parent);
+    auto &viewable_p = static_cast<LBALeafNode&>(
+      *p.find_pending_version(ctx.trans, get_key()));
+    auto new_pin = viewable_p.get_mapping(ctx, get_key());
+    SUBDEBUGT(seastore_lba, "new pin {}", ctx.trans, static_cast<LBAMapping&>(*new_pin));
+    return new_pin;
+  }
+  bool is_stable() const final;
+  bool is_data_stable() const final;
+  get_child_ret_t<lba_manager::btree::LBALeafNode, LogicalChildNode>
+  get_logical_extent(Transaction &t);
+
 protected:
-  std::unique_ptr<BtreeNodeMapping<laddr_t, paddr_t>> _duplicate(
+  LBAMappingRef _duplicate(
     op_context_t<laddr_t> ctx) const final {
     auto pin = std::unique_ptr<BtreeLBAMapping>(new BtreeLBAMapping(ctx));
     pin->key = key;
@@ -210,7 +235,7 @@ using BtreeLBAMappingRef = std::unique_ptr<BtreeLBAMapping>;
 
 using LBABtree = FixedKVBtree<
   laddr_t, lba_map_val_t, LBAInternalNode,
-  LBALeafNode, BtreeLBAMapping, LBA_BLOCK_SIZE, true>;
+  LBALeafNode, BtreeLBAMapping, LBA_BLOCK_SIZE>;
 
 /**
  * BtreeLBAManager
@@ -244,14 +269,9 @@ public:
     Transaction &t,
     laddr_t offset, extent_len_t length) final;
 
-  get_mappings_ret get_mappings(
-    Transaction &t,
-    laddr_list_t &&list) final;
-
   get_mapping_ret get_mapping(
     Transaction &t,
     laddr_t offset) final;
-
 
   struct alloc_mapping_info_t {
     laddr_t key = L_ADDR_NULL; // once assigned, the allocation to
@@ -259,10 +279,15 @@ public:
     extent_len_t len = 0;
     pladdr_t val;
     uint32_t checksum = 0;
-    LogicalCachedExtent* extent = nullptr;
+    LogicalChildNode* extent = nullptr;
 
     static alloc_mapping_info_t create_zero(extent_len_t len) {
-      return {L_ADDR_NULL, len, P_ADDR_ZERO, 0, nullptr};
+      return {
+	L_ADDR_NULL,
+	len,
+	P_ADDR_ZERO,
+	0,
+	static_cast<LogicalChildNode*>(get_reserved_ptr<LBALeafNode, laddr_t>())};
     }
     static alloc_mapping_info_t create_indirect(
       laddr_t laddr,
@@ -274,15 +299,15 @@ public:
 	intermediate_key,
 	0,	// crc will only be used and checked with LBA direct mappings
 		// also see pin_to_extent(_by_type)
-	nullptr};
+	static_cast<LogicalChildNode*>(get_reserved_ptr<LBALeafNode, laddr_t>())};
     }
     static alloc_mapping_info_t create_direct(
       laddr_t laddr,
       extent_len_t len,
       paddr_t paddr,
       uint32_t checksum,
-      LogicalCachedExtent *extent) {
-      return {laddr, len, paddr, checksum, extent};
+      LogicalChildNode& extent) {
+      return {laddr, len, paddr, checksum, &extent};
     }
   };
 
@@ -347,7 +372,7 @@ public:
   alloc_extent_ret alloc_extent(
     Transaction &t,
     laddr_t hint,
-    LogicalCachedExtent &ext,
+    LogicalChildNode &ext,
     extent_ref_count_t refcount = EXTENT_DEFAULT_REF_COUNT) final
   {
     // The real checksum will be updated upon transaction commit
@@ -359,7 +384,7 @@ public:
 	ext.get_length(),
 	ext.get_paddr(),
 	ext.get_last_committed_crc(),
-	&ext)};
+	ext)};
     return seastar::do_with(
       std::move(alloc_infos),
       [this, &t, hint, refcount](auto &alloc_infos) {
@@ -379,18 +404,19 @@ public:
   alloc_extents_ret alloc_extents(
     Transaction &t,
     laddr_t hint,
-    std::vector<LogicalCachedExtentRef> extents,
+    std::vector<LogicalChildNodeRef> extents,
     extent_ref_count_t refcount) final
   {
     std::vector<alloc_mapping_info_t> alloc_infos;
     for (auto &extent : extents) {
+      assert(extent);
       alloc_infos.emplace_back(
 	alloc_mapping_info_t::create_direct(
 	  extent->has_laddr() ? extent->get_laddr() : L_ADDR_NULL,
 	  extent->get_length(),
 	  extent->get_paddr(),
 	  extent->get_last_committed_crc(),
-	  extent.get()));
+	  *extent));
     }
     return seastar::do_with(
       std::move(alloc_infos),
@@ -399,19 +425,10 @@ public:
     });
   }
 
-  ref_ret decref_extent(
+  ref_ret remove_mapping(
     Transaction &t,
     laddr_t addr) final {
     return update_refcount(t, addr, -1, true
-    ).si_then([](auto res) {
-      return std::move(res.ref_update_res);
-    });
-  }
-
-  ref_ret incref_extent(
-    Transaction &t,
-    laddr_t addr) final {
-    return update_refcount(t, addr, 1, false
     ).si_then([](auto res) {
       return std::move(res.ref_update_res);
     });
@@ -421,7 +438,7 @@ public:
     Transaction &t,
     LBAMappingRef orig_mapping,
     std::vector<remap_entry> remaps,
-    std::vector<LogicalCachedExtentRef> extents) final {
+    std::vector<LogicalChildNodeRef> extents) final {
     LOG_PREFIX(BtreeLBAManager::remap_mappings);
     assert((orig_mapping->is_indirect())
       == (remaps.size() != extents.size()));
@@ -457,7 +474,7 @@ public:
 	      : L_ADDR_NULL;
 	    auto remap_offset = remap.offset;
 	    auto remap_len = remap.len;
-	    auto remap_laddr = orig_laddr + remap_offset;
+	    auto remap_laddr = (orig_laddr + remap_offset).checked_to_laddr();
 	    ceph_assert(intermediate_base != L_ADDR_NULL);
 	    ceph_assert(intermediate_key != L_ADDR_NULL);
 	    ceph_assert(remap_len < orig_len);
@@ -468,7 +485,7 @@ public:
 	      " intermediate_base: {}, intermediate_key: {}", t,
 	      remap_laddr, orig_paddr, remap_len,
 	      intermediate_base, intermediate_key);
-	    auto remapped_intermediate_key = intermediate_key + remap_offset;
+	    auto remapped_intermediate_key = (intermediate_key + remap_offset).checked_to_laddr();
 	    alloc_infos.emplace_back(
 	      alloc_mapping_info_t::create_indirect(
 		remap_laddr,
@@ -477,7 +494,7 @@ public:
 	  }
 	  fut = alloc_cloned_mappings(
 	    t,
-	    remaps.front().offset + orig_laddr,
+	    (remaps.front().offset + orig_laddr).checked_to_laddr(),
 	    std::move(alloc_infos)
 	  ).si_then([&orig_mapping](auto imappings) mutable {
 	    std::vector<LBAMappingRef> mappings;
@@ -496,7 +513,7 @@ public:
 	} else { // !orig_mapping->is_indirect()
 	  fut = alloc_extents(
 	    t,
-	    remaps.front().offset + orig_laddr,
+	    (remaps.front().offset + orig_laddr).checked_to_laddr(),
 	    std::move(extents),
 	    EXTENT_DEFAULT_REF_COUNT);
 	}
@@ -544,7 +561,9 @@ public:
     Transaction &t,
     CachedExtentRef e) final;
 
+#ifdef UNIT_TESTS_BUILT
   check_child_trackers_ret check_child_trackers(Transaction &t) final;
+#endif
 
   scan_mappings_ret scan_mappings(
     Transaction &t,
@@ -561,10 +580,11 @@ public:
     laddr_t laddr,
     extent_len_t prev_len,
     paddr_t prev_addr,
-    extent_len_t len,
-    paddr_t paddr,
-    uint32_t checksum,
-    LogicalCachedExtent*) final;
+    LogicalChildNode&) final;
+
+  update_mappings_ret update_mappings(
+    Transaction& t,
+    const std::list<LogicalChildNodeRef>& extents);
 
   get_physical_extent_if_live_ret get_physical_extent_if_live(
     Transaction &t,
@@ -574,7 +594,6 @@ public:
     extent_len_t len) final;
 private:
   Cache &cache;
-
 
   struct {
     uint64_t num_alloc_extents = 0;
@@ -625,7 +644,7 @@ private:
     Transaction &t,
     laddr_t addr,
     update_func_t &&f,
-    LogicalCachedExtent*);
+    LogicalChildNode*);
 
   alloc_extents_ret _alloc_extents(
     Transaction &t,
@@ -669,7 +688,7 @@ private:
 	auto ait = alloc_infos.begin();
 	for (; mit != mappings.end(); mit++, ait++) {
 	  auto mapping = static_cast<BtreeLBAMapping*>(mit->release());
-	  auto &alloc_info = *ait;
+	  [[maybe_unused]] auto &alloc_info = *ait;
 	  assert(mapping->get_key() == alloc_info.key);
 	  assert(mapping->get_raw_val().get_laddr() ==
 	    alloc_info.val.get_laddr());
@@ -683,13 +702,24 @@ private:
 
   using _get_mapping_ret = get_mapping_iertr::future<BtreeLBAMappingRef>;
   _get_mapping_ret _get_mapping(
-    Transaction &t,
+    op_context_t<laddr_t> c,
+    LBABtree& btree,
     laddr_t offset);
 
-  using _get_original_mappings_ret = get_mappings_ret;
-  _get_original_mappings_ret _get_original_mappings(
+  using _get_mappings_ret = get_mappings_iertr::future<std::list<BtreeLBAMappingRef>>;
+  _get_mappings_ret _get_mappings(
     op_context_t<laddr_t> c,
-    std::list<BtreeLBAMappingRef> &pin_list);
+    LBABtree& btree,
+    laddr_t offset,
+    extent_len_t length);
+
+  using get_indirect_pin_ret = get_mappings_iertr::future<BtreeLBAMappingRef>;
+  get_indirect_pin_ret get_indirect_pin(
+    op_context_t<laddr_t> c,
+    LBABtree& btree,
+    laddr_t key,
+    laddr_t intermediate_key,
+    extent_len_t length);
 
   using _decref_intermediate_ret = ref_iertr::future<
     std::optional<ref_update_result_t>>;

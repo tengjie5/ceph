@@ -4,17 +4,18 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Collection,
+    ContextManager,
     Dict,
     Iterator,
     List,
     Optional,
     Tuple,
-    TypeVar,
 )
 
 import sys
 
 from ceph.deployment.service_spec import SMBSpec
+from ceph.fs.earmarking import EarmarkTopScope
 
 # this uses a version check as opposed to a try/except because this
 # form makes mypy happy and try/except doesn't.
@@ -49,6 +50,7 @@ class Simplifiable(Protocol):
 
 
 EntryKey = Tuple[str, str]
+FindParams = Dict[str, Any]
 
 
 class ConfigEntry(Protocol):
@@ -100,6 +102,35 @@ class ConfigStore(ConfigStoreListing, Protocol):
         ...  # pragma: no cover
 
     def remove(self, ns: EntryKey) -> bool:
+        ...  # pragma: no cover
+
+
+class FindingConfigStore(ConfigStore, Protocol):
+    """A protocol for a config store that can more efficiently find
+    items within the the store.
+    """
+
+    def find_entries(
+        self, ns: str, params: FindParams
+    ) -> Collection[ConfigEntry]:
+        """Find entries in the store matching the given params.
+        Params is a dict that will be compared to the same keys/attributes of
+        the objects being searched. Only exact matches will be returned.
+        """
+        ...  # pragma: no cover
+
+
+class TransactingConfigStore(ConfigStore, Protocol):
+    """A protocol for a config store that supports transactions.
+    Using the transactions can make using the store more robust or
+    efficient.
+    """
+
+    def transaction(self) -> ContextManager[None]:
+        """Return a context manager that wraps a transaction. What exactly
+        this means depends on the store. Typically this would wrap a database
+        transaction.
+        """
         ...  # pragma: no cover
 
 
@@ -157,25 +188,16 @@ class AccessAuthorizer(Protocol):
         ...  # pragma: no cover
 
 
-T = TypeVar('T')
+class EarmarkResolver(Protocol):
+    """A protocol for a type that can resolve earmarks for subvolumes."""
 
+    def get_earmark(self, path: str, volume: str) -> Optional[str]:
+        ...  # pragma: no cover
 
-# TODO: move to a utils.py
-def one(lst: List[T]) -> T:
-    if len(lst) != 1:
-        raise ValueError("list does not contain exactly one element")
-    return lst[0]
+    def set_earmark(self, path: str, volume: str, earmark: str) -> None:
+        ...  # pragma: no cover
 
-
-class IsNoneError(ValueError):
-    pass
-
-
-def checked(v: Optional[T]) -> T:
-    """Ensures the provided value is not a None or raises a IsNoneError.
-    Intended use is similar to an `assert v is not None` but more usable in
-    one-liners and list/dict/etc comprehensions.
-    """
-    if v is None:
-        raise IsNoneError('value is None')
-    return v
+    def check_earmark(
+        self, earmark: str, top_level_scope: EarmarkTopScope
+    ) -> bool:
+        ...  # pragma: no cover

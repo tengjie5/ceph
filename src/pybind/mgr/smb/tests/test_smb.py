@@ -5,6 +5,12 @@ import pytest
 import smb
 
 
+def _cluster(**kwargs):
+    if 'clustering' not in kwargs:
+        kwargs['clustering'] = smb.enums.SMBClustering.NEVER
+    return smb.resources.Cluster(**kwargs)
+
+
 @pytest.fixture
 def tmodule():
     internal_store = smb.config_store.MemConfigStore()
@@ -20,6 +26,7 @@ def tmodule():
         path_resolver=smb.handler._FakePathResolver(),
         authorizer=smb.handler._FakeAuthorizer(),
         update_orchestration=False,
+        earmark_resolver=smb.handler._FakeEarmarkResolver(),
     )
 
 
@@ -34,7 +41,7 @@ def test_share_ls_empty(tmodule):
 
 
 def test_internal_apply_cluster(tmodule):
-    cluster = smb.resources.Cluster(
+    cluster = _cluster(
         cluster_id='foo',
         auth_mode=smb.enums.AuthMode.USER,
         user_group_settings=[
@@ -49,7 +56,7 @@ def test_internal_apply_cluster(tmodule):
 
 
 def test_cluster_add_cluster_ls(tmodule):
-    cluster = smb.resources.Cluster(
+    cluster = _cluster(
         cluster_id='foo',
         auth_mode=smb.enums.AuthMode.USER,
         user_group_settings=[
@@ -67,7 +74,7 @@ def test_cluster_add_cluster_ls(tmodule):
 
 
 def test_internal_apply_cluster_and_share(tmodule):
-    cluster = smb.resources.Cluster(
+    cluster = _cluster(
         cluster_id='foo',
         auth_mode=smb.enums.AuthMode.USER,
         user_group_settings=[
@@ -134,6 +141,7 @@ def test_internal_apply_remove_shares(tmodule):
                 'cluster_id': 'foo',
                 'auth_mode': 'user',
                 'intent': 'present',
+                'clustering': 'never',
                 'user_group_settings': [
                     {
                         'source_type': 'empty',
@@ -214,6 +222,7 @@ def test_internal_apply_add_joinauth(tmodule):
                 'cluster_id': 'foo',
                 'auth_mode': 'user',
                 'intent': 'present',
+                'clustering': 'never',
                 'user_group_settings': [
                     {
                         'source_type': 'empty',
@@ -245,6 +254,7 @@ def test_internal_apply_add_usergroups(tmodule):
                 'cluster_id': 'foo',
                 'auth_mode': 'user',
                 'intent': 'present',
+                'clustering': 'never',
                 'user_group_settings': [
                     {
                         'source_type': 'empty',
@@ -276,6 +286,7 @@ def _example_cfg_1(tmodule):
                 'cluster_id': 'foo',
                 'auth_mode': 'active-directory',
                 'intent': 'present',
+                'clustering': 'never',
                 'domain_settings': {
                     'realm': 'dom1.example.com',
                     'join_sources': [
@@ -399,71 +410,6 @@ def test_cmd_apply_share(tmodule):
     assert bdata["results"][0]["state"] == "created"
 
 
-def test_share_dump_config(tmodule):
-    _example_cfg_1(tmodule)
-
-    cfg = tmodule.dump_config('foo')
-    assert cfg == {
-        'samba-container-config': "v0",
-        'configs': {
-            'foo': {
-                'instance_name': 'foo',
-                'instance_features': [],
-                'shares': ['Ess One', 'Ess Two'],
-                'globals': ['default', 'foo'],
-            },
-        },
-        'shares': {
-            'Ess One': {
-                'options': {
-                    'path': '/',
-                    'read only': 'No',
-                    'browseable': 'Yes',
-                    'kernel share modes': 'no',
-                    'x:ceph:id': 'foo.s1',
-                    'vfs objects': 'ceph',
-                    'ceph:config_file': '/etc/ceph/ceph.conf',
-                    'ceph:filesystem': 'cephfs',
-                    'ceph:user_id': 'smb.fs.cluster.foo',
-                },
-            },
-            'Ess Two': {
-                'options': {
-                    'path': '/two',
-                    'read only': 'No',
-                    'browseable': 'Yes',
-                    'kernel share modes': 'no',
-                    'x:ceph:id': 'foo.stwo',
-                    'vfs objects': 'ceph',
-                    'ceph:config_file': '/etc/ceph/ceph.conf',
-                    'ceph:filesystem': 'cephfs',
-                    'ceph:user_id': 'smb.fs.cluster.foo',
-                },
-            },
-        },
-        'globals': {
-            'default': {
-                'options': {
-                    'server min protocol': 'SMB2',
-                    'load printers': 'No',
-                    'printing': 'bsd',
-                    'printcap name': '/dev/null',
-                    'disable spoolss': 'Yes',
-                },
-            },
-            'foo': {
-                'options': {
-                    'idmap config * : backend': 'autorid',
-                    'idmap config * : range': '2000-9999999',
-                    'realm': 'dom1.example.com',
-                    'security': 'ads',
-                    'workgroup': 'DOM1',
-                },
-            },
-        },
-    }
-
-
 def test_cluster_create_ad1(tmodule):
     _example_cfg_1(tmodule)
 
@@ -472,6 +418,7 @@ def test_cluster_create_ad1(tmodule):
         smb.enums.AuthMode.ACTIVE_DIRECTORY,
         domain_realm='fizzle.example.net',
         domain_join_user_pass=['Administrator%Passw0rd'],
+        clustering='never',
     )
     assert result.success
     assert result.status['state'] == 'created'
@@ -518,6 +465,7 @@ def test_cluster_create_ad2(tmodule):
         smb.enums.AuthMode.ACTIVE_DIRECTORY,
         domain_realm='sizzle.example.net',
         domain_join_ref=['jaad2'],
+        clustering='never',
     )
     assert result.success
     assert result.status['state'] == 'created'
@@ -548,11 +496,31 @@ def test_cluster_create_user1(tmodule):
         'dizzle',
         smb.enums.AuthMode.USER,
         user_group_ref=['ug1'],
+        clustering='never',
     )
     assert result.success
     assert result.status['state'] == 'created'
     assert result.src.cluster_id == 'dizzle'
     assert len(result.src.user_group_settings) == 1
+
+
+def test_cluster_create_user2(tmodule):
+    _example_cfg_1(tmodule)
+
+    result = tmodule.cluster_create(
+        'dizzle',
+        smb.enums.AuthMode.USER,
+        define_user_pass=['alice%123letmein', 'bob%1n0wh4t1t15'],
+        clustering='never',
+    )
+    assert result.success
+    assert result.status['state'] == 'created'
+    assert result.src.cluster_id == 'dizzle'
+    assert len(result.src.user_group_settings) == 1
+    assert (
+        result.src.user_group_settings[0].source_type
+        == smb.enums.UserGroupSourceType.RESOURCE
+    )
 
 
 def test_cluster_create_badpass(tmodule):
@@ -564,6 +532,7 @@ def test_cluster_create_badpass(tmodule):
             smb.enums.AuthMode.ACTIVE_DIRECTORY,
             domain_realm='fizzle.example.net',
             domain_join_user_pass=['Administrator'],
+            clustering='never',
         )
 
 
@@ -578,31 +547,158 @@ def test_cluster_rm(tmodule):
     assert result.success
 
 
-def test_dump_service_spec(tmodule):
-    _example_cfg_1(tmodule)
-    tmodule._public_store.overwrite(
-        {
-            'foo.config.smb': '',
-        }
-    )
-    tmodule._priv_store.overwrite(
-        {
-            'foo.join.2b9902c05d08bcba.json': '',
-            'foo.join.08129d4d3b8c37c7.json': '',
-        }
-    )
-
-    cfg = tmodule.dump_service_spec('foo')
-    assert cfg
-    assert cfg['service_id'] == 'foo'
-    assert cfg['spec']['cluster_id'] == 'foo'
-    assert cfg['spec']['features'] == ['domain']
-    assert cfg['spec']['config_uri'] == 'mem:foo/config.smb'
-    assert len(cfg['spec']['join_sources']) == 2
-
-
 def test_cmd_show_resource_json(tmodule):
     _example_cfg_1(tmodule)
+
+    res, body, status = tmodule.show.command(['ceph.smb.cluster.foo'])
+    assert res == 0
+    assert (
+        body.strip()
+        == """
+{
+  "resource_type": "ceph.smb.cluster",
+  "cluster_id": "foo",
+  "auth_mode": "active-directory",
+  "intent": "present",
+  "domain_settings": {
+    "realm": "dom1.example.com",
+    "join_sources": [
+      {
+        "source_type": "resource",
+        "ref": "foo"
+      }
+    ]
+  },
+  "clustering": "never"
+}
+    """.strip()
+    )
+
+
+def test_cmd_show_resource_yaml(tmodule):
+    _example_cfg_1(tmodule)
+
+    res, body, status = tmodule.show.command(
+        ['ceph.smb.cluster.foo'], format='yaml'
+    )
+    assert res == 0
+    assert (
+        body.strip()
+        == """
+resource_type: ceph.smb.cluster
+cluster_id: foo
+auth_mode: active-directory
+intent: present
+domain_settings:
+  realm: dom1.example.com
+  join_sources:
+  - source_type: resource
+    ref: foo
+clustering: never
+""".strip()
+    )
+
+
+def test_apply_invalid_res(tmodule):
+    result = tmodule.apply_resources(
+        """
+resource_type: ceph.smb.cluster
+cluster_id: ""
+auth_mode: doop
+"""
+    )
+    assert not result.success
+    assert 'doop' in result.to_simplified()['results'][0]['msg']
+
+
+def test_show_all(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show()
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 4
+    assert {r['resource_type'] for r in res} == {
+        'ceph.smb.cluster',
+        'ceph.smb.share',
+        'ceph.smb.join.auth',
+    }
+
+
+def test_show_shares(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(['ceph.smb.share'])
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 2
+    assert {r['resource_type'] for r in res} == {
+        'ceph.smb.share',
+    }
+
+
+def test_show_shares_in_cluster(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(['ceph.smb.share.foo'])
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 2
+    assert {r['resource_type'] for r in res} == {
+        'ceph.smb.share',
+    }
+    assert {r['cluster_id'] for r in res} == {'foo'}
+
+
+def test_show_specific_share(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(['ceph.smb.share.foo.s1'])
+    assert 'resources' not in out
+    assert out['resource_type'] == 'ceph.smb.share'
+    assert out['cluster_id'] == 'foo'
+    assert out['share_id'] == 's1'
+
+
+def test_show_nomatches(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(['ceph.smb.share.foo.whoops'])
+    assert 'resources' in out
+    assert out['resources'] == []
+
+
+def test_show_invalid_input(tmodule):
+    _example_cfg_1(tmodule)
+    with pytest.raises(smb.cli.InvalidInputValue):
+        tmodule.show(['ceph.smb.export'])
+
+
+def test_show_cluster_without_shares(tmodule):
+    # this cluster will have no shares associated with it
+    tmodule._internal_store.overwrite(
+        {
+            'clusters.foo': {
+                'resource_type': 'ceph.smb.cluster',
+                'cluster_id': 'foo',
+                'auth_mode': 'active-directory',
+                'intent': 'present',
+                'domain_settings': {
+                    'realm': 'dom1.example.com',
+                    'join_sources': [
+                        {
+                            'source_type': 'resource',
+                            'ref': 'foo',
+                        }
+                    ],
+                },
+            },
+            'join_auths.foo': {
+                'resource_type': 'ceph.smb.join.auth',
+                'auth_id': 'foo',
+                'intent': 'present',
+                'auth': {
+                    'username': 'testadmin',
+                    'password': 'Passw0rd',
+                },
+            },
+        }
+    )
 
     res, body, status = tmodule.show.command(['ceph.smb.cluster.foo'])
     assert res == 0
@@ -628,24 +724,107 @@ def test_cmd_show_resource_json(tmodule):
     )
 
 
-def test_cmd_show_resource_yaml(tmodule):
+def test_show_password_filter_hidden(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(password_filter=smb.enums.PasswordFilter.HIDDEN)
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 4
+    ja = [r for r in res if r['resource_type'] == 'ceph.smb.join.auth']
+    assert ja
+    join_auth = ja[0]
+    assert join_auth['auth']['username'] == 'testadmin'
+    assert join_auth['auth']['password'] == '****************'
+
+
+def test_show_password_filter_b64(tmodule):
+    _example_cfg_1(tmodule)
+    out = tmodule.show(password_filter=smb.enums.PasswordFilter.BASE64)
+    assert 'resources' in out
+    res = out['resources']
+    assert len(res) == 4
+    ja = [r for r in res if r['resource_type'] == 'ceph.smb.join.auth']
+    assert ja
+    join_auth = ja[0]
+    assert join_auth['auth']['username'] == 'testadmin'
+    assert join_auth['auth']['password'] == 'UGFzc3cwcmQ='
+
+
+def test_apply_password_filter(tmodule):
     _example_cfg_1(tmodule)
 
-    res, body, status = tmodule.show.command(
-        ['ceph.smb.cluster.foo'], format='yaml'
+    txt = json.dumps(
+        {
+            'resource_type': 'ceph.smb.usersgroups',
+            'users_groups_id': 'ug1',
+            'intent': 'present',
+            'values': {
+                'users': [
+                    {'username': 'foo', 'password': 'YWJyYWNhZGFicmE='},
+                    {'username': 'bar', 'password': 'eHl6enk='},
+                ],
+                'groups': [],
+            },
+        }
     )
-    assert res == 0
-    assert (
-        body.strip()
-        == """
-resource_type: ceph.smb.cluster
-cluster_id: foo
-auth_mode: active-directory
-intent: present
-domain_settings:
-  realm: dom1.example.com
-  join_sources:
-  - source_type: resource
-    ref: foo
-""".strip()
+
+    rg = tmodule.apply_resources(
+        txt, password_filter=smb.enums.InputPasswordFilter.BASE64
     )
+    assert rg.success, rg.to_simplified()
+    ts = rg.to_simplified()
+    assert len(ts['results']) == 1
+    r = ts['results'][0]['resource']
+    assert r['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(r['values']['users']) == 2
+    # filtered passwords of command output should match input by default
+    assert r['values']['users'][0]['password'] == 'YWJyYWNhZGFicmE='
+    assert r['values']['users'][1]['password'] == 'eHl6enk='
+
+    # get unfiltered object
+    out = tmodule.show(['ceph.smb.usersgroups.ug1'])
+    assert out['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(out['values']['users']) == 2
+    assert out['values']['users'][0]['password'] == 'abracadabra'
+    assert out['values']['users'][1]['password'] == 'xyzzy'
+
+
+def test_apply_password_filter_in_out(tmodule):
+    _example_cfg_1(tmodule)
+
+    txt = json.dumps(
+        {
+            'resource_type': 'ceph.smb.usersgroups',
+            'users_groups_id': 'ug1',
+            'intent': 'present',
+            'values': {
+                'users': [
+                    {'username': 'foo', 'password': 'YWJyYWNhZGFicmE='},
+                    {'username': 'bar', 'password': 'eHl6enk='},
+                ],
+                'groups': [],
+            },
+        }
+    )
+
+    rg = tmodule.apply_resources(
+        txt,
+        password_filter=smb.enums.InputPasswordFilter.BASE64,
+        password_filter_out=smb.enums.PasswordFilter.HIDDEN,
+    )
+    assert rg.success, rg.to_simplified()
+    ts = rg.to_simplified()
+    assert len(ts['results']) == 1
+    r = ts['results'][0]['resource']
+    assert r['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(r['values']['users']) == 2
+    # filtered passwords of command output should match input by default
+    assert r['values']['users'][0]['password'] == '****************'
+    assert r['values']['users'][1]['password'] == '****************'
+
+    # get unfiltered object
+    out = tmodule.show(['ceph.smb.usersgroups.ug1'])
+    assert out['resource_type'] == 'ceph.smb.usersgroups'
+    assert len(out['values']['users']) == 2
+    assert out['values']['users'][0]['password'] == 'abracadabra'
+    assert out['values']['users'][1]['password'] == 'xyzzy'

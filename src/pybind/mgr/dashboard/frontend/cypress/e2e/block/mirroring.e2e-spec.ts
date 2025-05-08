@@ -71,10 +71,9 @@ describe('Mirroring page', () => {
           cy.get('cd-pool-list').should('exist');
 
           cy.visit('#/block/mirroring').wait(1000);
-          cy.get('.table-actions button.dropdown-toggle').first().click();
           cy.get('[aria-label="Import Bootstrap Token"]').click();
           cy.get('cd-bootstrap-import-modal').within(() => {
-            cy.get(`label[for=${name}]`).click();
+            cy.get(`input[name=${name}]`).click({ force: true });
             cy.get('textarea[id=token]').wait(100).type(bootstrapToken);
             cy.get('button[type=submit]').click();
           });
@@ -101,18 +100,19 @@ describe('Mirroring page', () => {
 
     it('tests editing mode for pools', () => {
       mirroring.navigateTo();
-
-      mirroring.editMirror(poolName, 'Pool');
-      mirroring.getFirstTableCell('pool').should('be.visible');
-      mirroring.editMirror(poolName, 'Image');
-      mirroring.getFirstTableCell('image').should('be.visible');
-      mirroring.editMirror(poolName, 'Disabled');
-      mirroring.getFirstTableCell('disabled').should('be.visible');
+      cy.get('cd-mirroring-pools').within(() => {
+        mirroring.editMirror(poolName, 'Pool');
+        mirroring.getFirstTableCell('pool').should('be.visible');
+        mirroring.editMirror(poolName, 'Image');
+        mirroring.getFirstTableCell('image').should('be.visible');
+        mirroring.editMirror(poolName, 'Disabled');
+        mirroring.getFirstTableCell('disabled').should('be.visible');
+      });
     });
 
     afterEach(() => {
       pools.navigateTo();
-      pools.delete(poolName);
+      pools.delete(poolName, null, null, true, false, false, true);
     });
   });
 });

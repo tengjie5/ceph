@@ -16,7 +16,6 @@
  */
 
 #include "PGLog.h"
-#include "include/unordered_map.h"
 #include "common/ceph_context.h"
 
 using std::make_pair;
@@ -225,7 +224,8 @@ void PGLog::proc_replica_log(
   pg_info_t &oinfo,
   const pg_log_t &olog,
   pg_missing_t& omissing,
-  pg_shard_t from) const
+  pg_shard_t from,
+  bool ec_optimizations_enabled) const
 {
   dout(10) << "proc_replica_log for osd." << from << ": "
 	   << oinfo << " " << olog << " " << omissing << dendl;
@@ -302,6 +302,7 @@ void PGLog::proc_replica_log(
     olog.get_can_rollback_to(),
     omissing,
     0,
+    ec_optimizations_enabled,
     this);
 
   if (lu < oinfo.last_update) {
@@ -334,7 +335,8 @@ void PGLog::proc_replica_log(
  */
 void PGLog::rewind_divergent_log(eversion_t newhead,
 				 pg_info_t &info, LogEntryHandler *rollbacker,
-				 bool &dirty_info, bool &dirty_big_info)
+				 bool &dirty_info, bool &dirty_big_info,
+				 bool ec_optimizations_enabled)
 {
   dout(10) << "rewind_divergent_log truncate divergent future " <<
     newhead << dendl;
@@ -363,6 +365,7 @@ void PGLog::rewind_divergent_log(eversion_t newhead,
     original_crt,
     missing,
     rollbacker,
+    ec_optimizations_enabled,
     this);
 
   dirty_info = true;
@@ -370,8 +373,10 @@ void PGLog::rewind_divergent_log(eversion_t newhead,
 }
 
 void PGLog::merge_log(pg_info_t &oinfo, pg_log_t&& olog, pg_shard_t fromosd,
-                      pg_info_t &info, LogEntryHandler *rollbacker,
-                      bool &dirty_info, bool &dirty_big_info)
+                      pg_info_t &info, const pg_pool_t &pool, pg_shard_t toosd,
+		      LogEntryHandler *rollbacker,
+                      bool &dirty_info, bool &dirty_big_info,
+		      bool ec_optimizations_enabled)
 {
   dout(10) << "merge_log " << olog << " from osd." << fromosd
            << " into " << log << dendl;
@@ -429,7 +434,8 @@ void PGLog::merge_log(pg_info_t &oinfo, pg_log_t&& olog, pg_shard_t fromosd,
 
   // do we have divergent entries to throw out?
   if (olog.head < log.head) {
-    rewind_divergent_log(olog.head, info, rollbacker, dirty_info, dirty_big_info);
+    rewind_divergent_log(olog.head, info, rollbacker,
+			 dirty_info, dirty_big_info, ec_optimizations_enabled);
     changed = true;
   }
 
@@ -466,7 +472,7 @@ void PGLog::merge_log(pg_info_t &oinfo, pg_log_t&& olog, pg_shard_t fromosd,
     for (auto &&oe: divergent) {
       dout(10) << "merge_log divergent " << oe << dendl;
     }
-    log.roll_forward_to(log.head, rollbacker);
+    log.roll_forward_to(log.head, &info, rollbacker);
 
     mempool::osd_pglog::list<pg_log_entry_t> new_entries;
     new_entries.splice(new_entries.end(), olog.log, from, to);
@@ -477,6 +483,8 @@ void PGLog::merge_log(pg_info_t &oinfo, pg_log_t&& olog, pg_shard_t fromosd,
       &log,
       missing,
       rollbacker,
+      pool,
+      toosd.shard,
       this);
 
     _merge_divergent_entries(
@@ -486,6 +494,7 @@ void PGLog::merge_log(pg_info_t &oinfo, pg_log_t&& olog, pg_shard_t fromosd,
       original_crt,
       missing,
       rollbacker,
+      ec_optimizations_enabled,
       this);
 
     info.last_update = log.head = olog.head;
@@ -1071,7 +1080,7 @@ void PGLog::rebuild_missing_set_with_deletes(
   set_missing_may_contain_deletes();
 }
 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
 
 namespace {
   struct FuturizedShardStoreLogReader {
@@ -1206,86 +1215,4 @@ seastar::future<> PGLog::read_log_and_missing_crimson(
   });
 }
 
-seastar::future<> PGLog::rebuild_missing_set_with_deletes_crimson(
-  crimson::os::FuturizedStore::Shard &store,
-  crimson::os::CollectionRef ch,
-  const pg_info_t &info)
-{
-  // save entries not generated from the current log (e.g. added due
-  // to repair, EIO handling, or divergent_priors).
-  map<hobject_t, pg_missing_item> extra_missing;
-  for (const auto& p : missing.get_items()) {
-    if (!log.logged_object(p.first)) {
-      ldpp_dout(this, 20) << __func__ << " extra missing entry: " << p.first
-	       << " " << p.second << dendl;
-      extra_missing[p.first] = p.second;
-    }
-  }
-  missing.clear();
-
-  // go through the log and add items that are not present or older
-  // versions on disk, just as if we were reading the log + metadata
-  // off disk originally
-  return seastar::do_with(
-    set<hobject_t>(),
-    log.log.rbegin(),
-    [this, &store, ch, &info](auto &did, auto &it) {
-    return seastar::repeat([this, &store, ch, &info, &it, &did] {
-      if (it == log.log.rend()) {
-	return seastar::make_ready_future<seastar::stop_iteration>(
-	  seastar::stop_iteration::yes);
-      }
-      auto &log_entry = *it;
-      it++;
-      if (log_entry.version <= info.last_complete)
-	return seastar::make_ready_future<seastar::stop_iteration>(
-	  seastar::stop_iteration::yes);
-      if (log_entry.soid > info.last_backfill ||
-	  log_entry.is_error() ||
-	  did.find(log_entry.soid) != did.end())
-	return seastar::make_ready_future<seastar::stop_iteration>(
-	  seastar::stop_iteration::no);
-      did.insert(log_entry.soid);
-      return store.get_attr(
-	ch,
-	ghobject_t(log_entry.soid, ghobject_t::NO_GEN, info.pgid.shard),
-	OI_ATTR
-      ).safe_then([this, &log_entry](auto bv) {
-	object_info_t oi(bv);
-	ldpp_dout(this, 20)
-	  << "rebuild_missing_set_with_deletes_crimson found obj "
-	  << log_entry.soid
-	  << " version = " << oi.version << dendl;
-	if (oi.version < log_entry.version) {
-	  ldpp_dout(this, 20)
-	    << "rebuild_missing_set_with_deletes_crimson missing obj "
-	    << log_entry.soid
-	    << " for version = " << log_entry.version << dendl;
-	  missing.add(
-	    log_entry.soid,
-	    log_entry.version,
-	    oi.version,
-	    log_entry.is_delete());
-	}
-      },
-      crimson::ct_error::enoent::handle([this, &log_entry] {
-	ldpp_dout(this, 20)
-	  << "rebuild_missing_set_with_deletes_crimson missing object "
-	  << log_entry.soid << dendl;
-	missing.add(
-	  log_entry.soid,
-	  log_entry.version,
-	  eversion_t(),
-	  log_entry.is_delete());
-	return seastar::now();
-      }),
-      crimson::ct_error::enodata::assert_failure{"unexpected enodata"}
-      ).then([] {
-	return seastar::stop_iteration::no;
-      });
-    });
-  }).then([this] {
-    set_missing_may_contain_deletes();
-  });
-}
 #endif

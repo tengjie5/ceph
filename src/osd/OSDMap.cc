@@ -15,15 +15,19 @@
  *
  */
 
+#include "OSDMap.h"
+
 #include <algorithm>
 #include <bit>
+#include <iomanip>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <fmt/format.h>
 
 #include <boost/algorithm/string.hpp>
 
-#include "OSDMap.h"
+#include "common/ceph_context.h"
 #include "common/config.h"
 #include "common/errno.h"
 #include "common/Formatter.h"
@@ -883,7 +887,7 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
     return;
   }
   {
-    DECODE_START(8, bl); // client-usable data
+    DECODE_START(9, bl); // client-usable data
     decode(fsid, bl);
     decode(epoch, bl);
     decode(modified, bl);
@@ -942,7 +946,7 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
   }
 
   {
-    DECODE_START(10, bl); // extended, osd-only data
+    DECODE_START(12, bl); // extended, osd-only data
     decode(new_hb_back_up, bl);
     decode(new_up_thru, bl);
     decode(new_last_clean_interval, bl);
@@ -1642,12 +1646,10 @@ void OSDMap::get_out_of_subnet_osd_counts(CephContext *cct,
   for (int i = 0; i < max_osd; i++) {
     if (exists(i) && is_up(i)) {
       if (const auto& addrs = get_addrs(i).v; addrs.size() >= 2) {
-        auto v1_addr = addrs[0].ip_only_to_str();
-        if (!is_addr_in_subnet(cct, public_network, v1_addr)) {
+        if (!is_addr_in_subnet(cct, public_network, addrs[0])) {
           unreachable->emplace(i);
         }
-        auto v2_addr = addrs[1].ip_only_to_str();
-        if (!is_addr_in_subnet(cct, public_network, v2_addr)) {
+        if (!is_addr_in_subnet(cct, public_network, addrs[1])) {
           unreachable->emplace(i);
         }
       }
@@ -1766,13 +1768,17 @@ uint64_t OSDMap::get_features(int entity_type, uint64_t *pmask) const
     features |= CEPH_FEATURE_CRUSH_TUNABLES5;
   if (crush->has_incompat_choose_args())
     features |= CEPH_FEATUREMASK_CRUSH_CHOOSE_ARGS;
-  if (crush->has_nondefault_tunables_msr())
-    features |= CEPH_FEATURE_CRUSH_MSR;
+  if (crush->has_nondefault_tunables_msr() ||
+      crush->has_msr_rules())
+    features |= CEPH_FEATUREMASK_CRUSH_MSR;
   mask |= CEPH_FEATURES_CRUSH;
 
-  if (!pg_upmap.empty() || !pg_upmap_items.empty() || !pg_upmap_primaries.empty())
+  if (!pg_upmap.empty() || !pg_upmap_items.empty())
     features |= CEPH_FEATUREMASK_OSDMAP_PG_UPMAP;
   mask |= CEPH_FEATUREMASK_OSDMAP_PG_UPMAP;
+  if (!pg_upmap_primaries.empty())
+    features |= CEPH_FEATUREMASK_SERVER_REEF;
+  mask |= CEPH_FEATUREMASK_SERVER_REEF;
 
   for (auto &pool: pools) {
     if (pool.second.has_flag(pg_pool_t::FLAG_HASHPSPOOL)) {
@@ -1790,8 +1796,6 @@ uint64_t OSDMap::get_features(int entity_type, uint64_t *pmask) const
 	features |= CEPH_FEATURE_CRUSH_TUNABLES3;
       if (crush->is_v5_rule(ruleid))
 	features |= CEPH_FEATURE_CRUSH_TUNABLES5;
-      if (crush->is_msr_rule(ruleid))
-	features |= CEPH_FEATURE_CRUSH_MSR;
     }
   }
   mask |= CEPH_FEATURE_OSDHASHPSPOOL | CEPH_FEATURE_OSD_CACHEPOOL;
@@ -1848,6 +1852,9 @@ ceph_release_t OSDMap::get_min_compat_client() const
 
   if (HAVE_FEATURE(f, CRUSH_MSR)) {
     return ceph_release_t::squid;        // v19.2.0
+  }
+  if (HAVE_FEATURE(f, SERVER_REEF)) {	 // v18.2.3 (upmap-primary; see #61948)
+    return ceph_release_t::reef;
   }
   if (HAVE_FEATURE(f, OSDMAP_PG_UPMAP) ||      // v12.0.0-1733-g27d6f43
       HAVE_FEATURE(f, CRUSH_CHOOSE_ARGS)) {    // v12.0.1-2172-gef1ef28
@@ -2845,6 +2852,73 @@ void OSDMap::_apply_primary_affinity(ps_t seed,
   }
 }
 
+/* EC pools with allow_ec_optimizations set have some shards that cannot
+ * become the primary because they are not updated on every I/O. To avoid
+ * requiring clients to be upgraded to use these new pools the logic in
+ * OSDMap which selects a primary cannot be changed. Instead choose_acting
+ * is modified to set pgtemp when it is necessary to override the choice
+ * of primary, and this vector is reordered so that shards that are
+ * permitted to be the primary are listed first. The existing OSDMap code
+ * will then choose a suitable shard as primary except when the pg is
+ * incomplete and the choice of primary doesn't matter. This function is
+ * called by OSDMonitor when setting pg_temp to transform the vector.
+ *
+ * Example: Optimized EC pool 4+2
+ * acting_set = {NONE, 6, 7, 8, 9, 10}
+ * non_primary_shards = {1, 2, 3} # data shards other than shard 0
+ * pg_temp = {NONE, 9, 10, 6, 7, 8} # non-primary shards at end
+ * primary will be OSD 9(1)
+ */
+const std::vector<int> OSDMap::pgtemp_primaryfirst(const pg_pool_t& pool,
+			 const std::vector<int>& pg_temp) const
+{
+  // Only perform the transform for pools with allow_ec_optimizations set
+  if (pool.allows_ecoptimizations()) {
+    std::vector<int> result;
+    std::vector<int> nonprimary;
+    int shard = 0;
+    for (auto osd : pg_temp) {
+      if (pool.is_nonprimary_shard(shard_id_t(shard))) {
+	nonprimary.emplace_back(osd);
+      } else {
+	result.emplace_back(osd);
+      }
+      shard++;
+    }
+    result.insert(result.end(), nonprimary.begin(), nonprimary.end());
+    return result;
+  }
+  return pg_temp;
+}
+
+/* The function above reorders the pg_temp vector. This transformation needs
+ * to be reversed by OSDs (but not clients) and is called by PeeringState
+ * when initializing the the acting set.
+ */
+const std::vector<int> OSDMap::pgtemp_undo_primaryfirst(const pg_pool_t& pool,
+	const pg_t pg, const std::vector<int>& acting) const
+{
+  // Only perform the transform for pools with allow_ec_optimizations set
+  // that also have pg_temp set
+  if (pool.allows_ecoptimizations()) {
+    if (pg_temp->find(pool.raw_pg_to_pg(pg)) != pg_temp->end()) {
+      std::vector<int> result;
+      int primaryshard = 0;
+      int nonprimaryshard = pool.size - pool.nonprimary_shards.size();
+      assert(acting.size() == pool.size);
+      for (auto shard = 0; shard < pool.size; shard++) {
+	if (pool.is_nonprimary_shard(shard_id_t(shard))) {
+	  result.emplace_back(acting[nonprimaryshard++]);
+	} else {
+	  result.emplace_back(acting[primaryshard++]);
+	}
+      }
+      return result;
+    }
+  }
+  return acting;
+}
+
 void OSDMap::_get_temp_osds(const pg_pool_t& pool, pg_t pg,
                             vector<int> *temp_pg, int *temp_primary) const
 {
@@ -2993,8 +3067,8 @@ int OSDMap::calc_pg_role(pg_shard_t who, const vector<int>& acting)
       }
     }
   } else {
-    if (who.shard < nrep && acting[who.shard] == who.osd) {
-      return who.shard;
+    if (who.shard < nrep && acting[static_cast<int>(who.shard)] == who.osd) {
+      return static_cast<int>(who.shard);
     }
   }
   return -1;
@@ -3021,6 +3095,9 @@ bool OSDMap::primary_changed_broken(
 uint64_t OSDMap::get_encoding_features() const
 {
   uint64_t f = SIGNIFICANT_FEATURES;
+  if (require_osd_release < ceph_release_t::tentacle) {
+    f &= ~CEPH_FEATURE_SERVER_TENTACLE;
+  }
   if (require_osd_release < ceph_release_t::reef) {
     f &= ~CEPH_FEATURE_SERVER_REEF;
   }
@@ -3548,7 +3625,7 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
    * Since we made it past that hurdle, we can use our normal paths.
    */
   {
-    DECODE_START(9, bl); // client-usable data
+    DECODE_START(10, bl); // client-usable data
     // base
     decode(fsid, bl);
     decode(epoch, bl);
@@ -3634,7 +3711,7 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
   }
 
   {
-    DECODE_START(10, bl); // extended, osd-only data
+    DECODE_START(12, bl); // extended, osd-only data
     decode(osd_addrs->hb_back_addrs, bl);
     decode(osd_info, bl);
     decode(blocklist, bl);
@@ -5210,6 +5287,20 @@ void OSDMap::rm_all_upmap_prims(CephContext *cct, OSDMap::Incremental *pending_i
         pending_inc->old_pg_upmap_primary.insert(pg);
       }
     }
+  }
+}
+
+void OSDMap::rm_all_upmap_prims(
+  CephContext *cct,
+  OSDMap::Incremental *pending_inc)
+{
+  for (const auto& [pg, _] : pg_upmap_primaries) {
+    if (pending_inc->new_pg_upmap_primary.contains(pg)) {
+        ldout(cct, 30) << __func__ << "Removing pending pg_upmap_prim for pg " << pg << dendl;
+        pending_inc->new_pg_upmap_primary.erase(pg);
+      }
+    ldout(cct, 30) << __func__ << "Removing pg_upmap_prim for pg " << pg << dendl;
+    pending_inc->old_pg_upmap_primary.insert(pg);
   }
 }
 
@@ -7862,6 +7953,10 @@ unsigned OSDMap::get_device_class_flags(int id) const
 
 std::optional<std::string> OSDMap::pending_require_osd_release() const
 {
+  if (HAVE_FEATURE(get_up_osd_features(), SERVER_TENTACLE) &&
+      require_osd_release < ceph_release_t::tentacle) {
+    return "tentacle";
+  }
   if (HAVE_FEATURE(get_up_osd_features(), SERVER_SQUID) &&
       require_osd_release < ceph_release_t::squid) {
     return "squid";

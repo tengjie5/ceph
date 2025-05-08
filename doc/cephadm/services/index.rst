@@ -20,6 +20,8 @@ for details on individual services:
     snmp-gateway
     tracing
     smb
+    mgmt-gateway
+    oauth2-proxy
 
 Service Status
 ==============
@@ -354,6 +356,8 @@ Or in YAML:
       label: "mylabel"
 
 * See :ref:`orchestrator-host-labels`
+
+.. _cephadm-services-placement-by-pattern-matching:
 
 Placement by pattern matching
 -----------------------------

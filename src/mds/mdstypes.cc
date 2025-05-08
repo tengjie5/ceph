@@ -4,9 +4,11 @@
 #include "mdstypes.h"
 #include "include/cephfs/types.h"
 #include "MDSContext.h"
+#include "common/ceph_json.h"
 #include "common/Formatter.h"
 #include "common/StackStringStream.h"
 
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -21,6 +23,19 @@ using std::vector;
 
 using ceph::bufferlist;
 using ceph::Formatter;
+
+void mds_role_t::print(std::ostream& out) const {
+  out << fscid << ":" << rank;
+}
+
+std::ostream& operator<<(std::ostream &out, const vinodeno_t &vino) {
+  out << vino.ino;
+  if (vino.snapid == CEPH_NOSNAP)
+    out << ".head";
+  else if (vino.snapid)
+    out << '.' << vino.snapid;
+  return out;
+}
 
 /*
  * frag_info_t
@@ -436,6 +451,10 @@ void old_rstat_t::generate_test_instances(std::list<old_rstat_t*>& ls)
   ls.back()->accounted_rstat = *nls.front();
 }
 
+void old_rstat_t::print(std::ostream& out) const {
+  out << "old_rstat(first " << first << " " << rstat << " " << accounted_rstat << ")";
+}
+
 /*
  * feature_bitset_t
  */
@@ -528,6 +547,15 @@ void feature_bitset_t::dump(Formatter *f) const {
   f->dump_string("feature_bits", css->strv());
 }
 
+void feature_bitset_t::generate_test_instances(std::list<feature_bitset_t*>& ls)
+{
+  ls.push_back(new feature_bitset_t());
+  ls.push_back(new feature_bitset_t());
+  ls.back()->_vec.push_back(1);
+  ls.back()->_vec.push_back(2);
+  ls.back()->_vec.push_back(3);
+}
+
 void feature_bitset_t::print(ostream& out) const
 {
   std::ios_base::fmtflags f(out.flags());
@@ -562,6 +590,13 @@ void metric_spec_t::decode(bufferlist::const_iterator &p) {
 
 void metric_spec_t::dump(Formatter *f) const {
   f->dump_object("metric_flags", metric_flags);
+}
+
+void metric_spec_t::generate_test_instances(std::list<metric_spec_t*>& ls)
+{
+  ls.push_back(new metric_spec_t());
+  ls.push_back(new metric_spec_t());
+  ls.back()->metric_flags = 1;
 }
 
 void metric_spec_t::print(ostream& out) const
@@ -599,6 +634,16 @@ void client_metadata_t::dump(Formatter *f) const
   f->dump_object("metric_spec", metric_spec);
   for (const auto& [name, val] : kv_map)
     f->dump_string(name.c_str(), val);
+}
+
+void client_metadata_t::generate_test_instances(std::list<client_metadata_t*>& ls)
+{
+  ls.push_back(new client_metadata_t());
+  ls.push_back(new client_metadata_t());
+  ls.back()->kv_map["key1"] = "val1";
+  ls.back()->kv_map["key2"] = "val2";
+  ls.back()->features = 0x12345678;
+  ls.back()->metric_spec.metric_flags = 0x12345678;
 }
 
 /*
@@ -689,10 +734,33 @@ void session_info_t::generate_test_instances(std::list<session_info_t*>& ls)
   // we can't add used inos; they're cleared on decode
 }
 
+/*
+ * dentry_key_t
+ */
+void dentry_key_t::print(std::ostream& out) const {
+  out << "(" << name << "," << snapid << ")";
+}
+
+void dentry_key_t::encode(std::string& key) const {
+  char b[20];
+  if (snapid != CEPH_NOSNAP) {
+    uint64_t val(snapid);
+    snprintf(b, sizeof(b), "%" PRIx64, val);
+  } else {
+    snprintf(b, sizeof(b), "%s", "head");
+  }
+  CachedStackStringStream css;
+  *css << name << "_" << b;
+  key = css->strv();
+}
 
 /*
  * string_snap_t
  */
+void string_snap_t::print(std::ostream& out) const {
+  out << "(" << name << "," << snapid << ")";
+}
+
 void string_snap_t::encode(bufferlist& bl) const
 {
   ENCODE_START(2, 2, bl);
@@ -758,6 +826,17 @@ void MDSCacheObjectInfo::dump(Formatter *f) const
   f->dump_unsigned("snapid", snapid);
 }
 
+void MDSCacheObjectInfo::print(std::ostream& out) const {
+  if (ino) {
+    out << ino << "." << snapid;
+  } else if (dname.length()) {
+    out << dirfrag << "/" << dname
+        << " snap " << snapid;
+  } else {
+    out << dirfrag;
+  }
+}
+
 void MDSCacheObjectInfo::generate_test_instances(std::list<MDSCacheObjectInfo*>& ls)
 {
   ls.push_back(new MDSCacheObjectInfo);
@@ -813,6 +892,36 @@ void mds_table_pending_t::generate_test_instances(std::list<mds_table_pending_t*
 void metareqid_t::dump(ceph::Formatter* f) const {
   f->dump_object("entity", name);
   f->dump_unsigned("tid", tid);
+}
+
+void metareqid_t::print(std::ostream& out) const {
+  out << name << ":" << tid;
+}
+
+void metareqid_t::generate_test_instances(std::list<metareqid_t*>& ls) {
+  ls.push_back(new metareqid_t);
+  ls.push_back(new metareqid_t(entity_name_t::CLIENT(123), 456));
+}
+
+/*
+ * dirfrag_t
+ */
+void dirfrag_t::print(std::ostream& out) const {
+  out << ino;
+  if (!frag.is_root()) {
+    out << "." << frag;
+  }
+}
+
+void dirfrag_t::dump(ceph::Formatter *f) const {
+  f->dump_unsigned("ino", ino);
+  f->dump_unsigned("frag", frag);
+}
+
+void dirfrag_t::generate_test_instances(std::list<dirfrag_t*>& ls) {
+  ls.push_back(new dirfrag_t);
+  ls.push_back(new dirfrag_t(1, frag_t()));
+  ls.push_back(new dirfrag_t(2, frag_t(3)));
 }
 
 /*
@@ -877,6 +986,19 @@ void dirfrag_load_vec_t::dump(Formatter *f, const DecayRate& rate) const
   f->dump_float("STORE", get(META_POP_STORE).get());
 }
 
+void dirfrag_load_vec_t::print(std::ostream& out) const {
+  CachedStackStringStream css;
+  *css << std::setprecision(1) << std::fixed
+       << "[pop"
+          " IRD:" << vec[0]
+       << " IWR:" << vec[1]
+       << " RDR:" << vec[2]
+       << " FET:" << vec[3]
+       << " STR:" << vec[4]
+       << " *LOAD:" << meta_load() << "]";
+  out << css->strv();
+}
+
 void dirfrag_load_vec_t::generate_test_instances(std::list<dirfrag_load_vec_t*>& ls)
 {
   ls.push_back(new dirfrag_load_vec_t(DecayRate()));
@@ -885,6 +1007,15 @@ void dirfrag_load_vec_t::generate_test_instances(std::list<dirfrag_load_vec_t*>&
 /*
  * mds_load_t
  */
+void mds_load_t::print(std::ostream& out) const {
+  out << "mdsload<" << auth << "/" << all
+      << ", req " << req_rate
+      << ", hr " << cache_hit_rate
+      << ", qlen " << queue_len
+	<< ", cpu " << cpu_load_avg
+      << ">";
+}
+
 void mds_load_t::encode(bufferlist &bl) const {
   ENCODE_START(2, 2, bl);
   encode(auth, bl);
@@ -1015,4 +1146,50 @@ void snaprealm_reconnect_t::generate_test_instances(std::list<snaprealm_reconnec
   ls.back()->realm.ino = 0x10000000001ULL;
   ls.back()->realm.seq = 2;
   ls.back()->realm.parent = 1;
+}
+
+void EstimatedReplayTime::print(std::ostream& out) {
+  out << "replay: " << percent_complete << "% complete - elapsed time: "
+      << elapsed_time << ", estimated time remaining: " << estimated_time;
+}
+
+/*
+ * file block diffs
+ */
+void BlockDiff::encode(bufferlist& bl) const {
+  using ceph::encode;
+  ENCODE_START(1, 1, bl);
+  encode(rval, bl);
+  encode(scan_idx, bl);
+  encode(blocks, bl);
+  ENCODE_FINISH(bl);
+}
+
+void BlockDiff::decode(bufferlist::const_iterator &p) {
+  using ceph::decode;
+  DECODE_START(1, p);
+  decode(rval, p);
+  decode(scan_idx, p);
+  decode(blocks, p);
+  DECODE_FINISH(p);
+}
+
+void BlockDiff::dump(Formatter *f) const {
+  f->dump_int("rval", rval);
+  f->dump_unsigned("scan_idx", scan_idx);
+  f->dump_stream("blocks") << blocks;
+}
+
+void BlockDiff::generate_test_instances(std::list<BlockDiff*>& ls)
+{
+  ls.push_back(new BlockDiff());
+  ls.push_back(new BlockDiff());
+  ls.back()->rval = 0;
+  ls.back()->scan_idx = 1;
+  ls.back()->blocks.union_insert(0, 200);
+}
+
+void BlockDiff::print(ostream& out) const
+{
+  out << "{rval: " << rval << ", scan_idx=" << scan_idx << ", blocks=" << blocks << "}";
 }

@@ -131,7 +131,7 @@ void segments_info_t::add_segment_manager(
   auto ssize = segment_manager.get_segment_size();
   auto nsegments = segment_manager.get_num_segments();
   auto sm_size = segment_manager.get_available_size();
-  INFO("adding segment manager {}, size={}, ssize={}, segments={}",
+  INFO("adding segment manager {}, size=0x{:x}, segment size=0x{:x}, segments={}",
        device_id_printer_t{d_id}, sm_size, ssize, nsegments);
   ceph_assert(ssize > 0);
   ceph_assert(nsegments > 0);
@@ -329,9 +329,9 @@ std::ostream &operator<<(std::ostream &os, const segments_info_t &infos)
             << ", closed=" << infos.get_num_closed()
             << ", type_journal=" << infos.get_num_type_journal()
             << ", type_ool=" << infos.get_num_type_ool()
-            << ", total=" << infos.get_total_bytes() << "B"
-            << ", available=" << infos.get_available_bytes() << "B"
-            << ", unavailable=" << infos.get_unavailable_bytes() << "B"
+            << ", total=0x" << std::hex << infos.get_total_bytes() << "B"
+            << ", available=0x" << infos.get_available_bytes() << "B"
+            << ", unavailable=0x" << infos.get_unavailable_bytes() << "B" << std::dec
             << ", available_ratio=" << infos.get_available_ratio()
             << ", submitted_head=" << infos.get_submitted_journal_head()
             << ", time_bound=" << sea_time_point_printer_t{infos.get_time_bound()}
@@ -598,10 +598,18 @@ JournalTrimmerImpl::trim_alloc()
 {
   LOG_PREFIX(JournalTrimmerImpl::trim_alloc);
   assert(background_callback->is_ready());
-  return repeat_eagain([this, FNAME] {
+
+  auto& shard_stats = extent_callback->get_shard_stats();
+  ++(shard_stats.trim_alloc_num);
+  ++(shard_stats.pending_bg_num);
+
+  return repeat_eagain([this, FNAME, &shard_stats] {
+    ++(shard_stats.repeat_trim_alloc_num);
+
     return extent_callback->with_transaction_intr(
       Transaction::src_t::TRIM_ALLOC,
       "trim_alloc",
+      CACHE_HINT_NOCACHE,
       [this, FNAME](auto &t)
     {
       auto target = get_alloc_tail_target();
@@ -622,8 +630,11 @@ JournalTrimmerImpl::trim_alloc()
         return seastar::now();
       });
     });
-  }).safe_then([this, FNAME] {
+  }).finally([this, FNAME, &shard_stats] {
     DEBUG("finish, alloc_tail={}", journal_alloc_tail);
+
+    assert(shard_stats.pending_bg_num);
+    --(shard_stats.pending_bg_num);
   });
 }
 
@@ -632,10 +643,18 @@ JournalTrimmerImpl::trim_dirty()
 {
   LOG_PREFIX(JournalTrimmerImpl::trim_dirty);
   assert(background_callback->is_ready());
-  return repeat_eagain([this, FNAME] {
+
+  auto& shard_stats = extent_callback->get_shard_stats();
+  ++(shard_stats.trim_dirty_num);
+  ++(shard_stats.pending_bg_num);
+
+  return repeat_eagain([this, FNAME, &shard_stats] {
+    ++(shard_stats.repeat_trim_dirty_num);
+
     return extent_callback->with_transaction_intr(
       Transaction::src_t::TRIM_DIRTY,
       "trim_dirty",
+      CACHE_HINT_NOCACHE,
       [this, FNAME](auto &t)
     {
       auto target = get_dirty_tail_target();
@@ -662,8 +681,11 @@ JournalTrimmerImpl::trim_dirty()
         return extent_callback->submit_transaction_direct(t);
       });
     });
-  }).safe_then([this, FNAME] {
+  }).finally([this, FNAME, &shard_stats] {
     DEBUG("finish, dirty_tail={}", journal_dirty_tail);
+
+    assert(shard_stats.pending_bg_num);
+    --(shard_stats.pending_bg_num);
   });
 }
 
@@ -745,10 +767,10 @@ int64_t SpaceTrackerDetailed::SegmentMap::allocate(
   for (auto i = b; i < e; ++i) {
     if (bitmap[i]) {
       if (!error) {
-        ERROR("found allocated in {}, {} ~ {}", segment, offset, len);
+        ERROR("found allocated in {}, 0x{:x}~0x{:x}", segment, offset, len);
 	error = true;
       }
-      DEBUG("block {} allocated", i * block_size);
+      DEBUG("block 0x{:x}B allocated", i * block_size);
     }
     bitmap[i] = true;
   }
@@ -772,10 +794,10 @@ int64_t SpaceTrackerDetailed::SegmentMap::release(
   for (auto i = b; i < e; ++i) {
     if (!bitmap[i]) {
       if (!error) {
-	ERROR("found unallocated in {}, {} ~ {}", segment, offset, len);
+	ERROR("found unallocated in {}, 0x{:x}~0x{:x}", segment, offset, len);
 	error = true;
       }
-      DEBUG("block {} unallocated", i * block_size);
+      DEBUG("block 0x{:x}B unallocated", i * block_size);
     }
     bitmap[i] = false;
   }
@@ -811,7 +833,7 @@ void SpaceTrackerDetailed::SegmentMap::dump_usage(extent_len_t block_size) const
   INFO("dump start");
   for (unsigned i = 0; i < bitmap.size(); ++i) {
     if (bitmap[i]) {
-      LOCAL_LOGGER.info("    {} still live", i * block_size);
+      LOCAL_LOGGER.info("    0x{:x}B still live", i * block_size);
     }
   }
 }
@@ -827,7 +849,7 @@ void SpaceTrackerDetailed::dump_usage(segment_id_t id) const
 void SpaceTrackerSimple::dump_usage(segment_id_t id) const
 {
   LOG_PREFIX(SpaceTrackerSimple::dump_usage);
-  INFO("id: {}, live_bytes: {}",
+  INFO("id: {}, live_bytes: 0x{:x}",
        id, live_bytes_by_segment[id].live_bytes);
 }
 
@@ -1073,6 +1095,14 @@ SegmentCleaner::do_reclaim_space(
     std::size_t &reclaimed,
     std::size_t &runs)
 {
+  auto& shard_stats = extent_callback->get_shard_stats();
+  if (is_cold) {
+    ++(shard_stats.cleaner_cold_num);
+  } else {
+    ++(shard_stats.cleaner_main_num);
+  }
+  ++(shard_stats.pending_bg_num);
+
   // Extents satisfying any of the following requirements
   // are considered DEAD:
   // 1. can't find the corresponding mapping in both the
@@ -1082,17 +1112,22 @@ SegmentCleaner::do_reclaim_space(
   // 	tree doesn't match the extent's paddr
   // 3. the extent is physical and doesn't exist in the
   // 	lba tree, backref tree or backref cache;
-  return repeat_eagain([this, &backref_extents,
+  return repeat_eagain([this, &backref_extents, &shard_stats,
                         &pin_list, &reclaimed, &runs] {
     reclaimed = 0;
     runs++;
-    auto src = Transaction::src_t::CLEANER_MAIN;
+    transaction_type_t src;
     if (is_cold) {
       src = Transaction::src_t::CLEANER_COLD;
+      ++(shard_stats.repeat_cleaner_cold_num);
+    } else {
+      src = Transaction::src_t::CLEANER_MAIN;
+      ++(shard_stats.repeat_cleaner_main_num);
     }
     return extent_callback->with_transaction_intr(
       src,
       "clean_reclaim_space",
+      CACHE_HINT_NOCACHE,
       [this, &backref_extents, &pin_list, &reclaimed](auto &t)
     {
       return seastar::do_with(
@@ -1110,8 +1145,7 @@ SegmentCleaner::do_reclaim_space(
             pin->get_key(),
             pin->get_val(),
             pin->get_length(),
-            pin->get_type(),
-            JOURNAL_SEQ_NULL);
+            pin->get_type());
         }
         for (auto &cached_backref : cached_backref_entries) {
           if (cached_backref.laddr == L_ADDR_NULL) {
@@ -1133,7 +1167,7 @@ SegmentCleaner::do_reclaim_space(
 	    [this, &extents, &t](auto &ent)
 	  {
 	    LOG_PREFIX(SegmentCleaner::do_reclaim_space);
-	    TRACET("getting extent of type {} at {}~{}",
+	    TRACET("getting extent of type {} at {}~0x{:x}",
 	      t,
 	      ent.type,
 	      ent.paddr,
@@ -1167,6 +1201,9 @@ SegmentCleaner::do_reclaim_space(
         return extent_callback->submit_transaction_direct(t);
       });
     });
+  }).finally([&shard_stats] {
+    assert(shard_stats.pending_bg_num);
+    --(shard_stats.pending_bg_num);
   });
 }
 
@@ -1202,9 +1239,11 @@ SegmentCleaner::clean_space_ret SegmentCleaner::clean_space()
     std::pair<std::vector<CachedExtentRef>, backref_pin_list_t>(),
     [this](auto &weak_read_ret) {
     return repeat_eagain([this, &weak_read_ret] {
+      // Note: not tracked by shard_stats_t intentionally.
       return extent_callback->with_transaction_intr(
 	  Transaction::src_t::READ,
 	  "retrieve_from_backref_tree",
+	  CACHE_HINT_NOCACHE,
 	  [this, &weak_read_ret](auto &t) {
 	return backref_manager.get_mappings(
 	  t,
@@ -1336,20 +1375,33 @@ SegmentCleaner::mount_ret SegmentCleaner::mount()
         segment_id
       ).safe_then([this, FNAME, segment_id, header](auto tail)
         -> scan_extents_ertr::future<> {
-        if (tail.segment_nonce != header.segment_nonce) {
+	bool tail_valid = (tail.segment_nonce == header.segment_nonce);
+        if (!tail_valid && header.type == segment_type_t::JOURNAL) {
           return scan_no_tail_segment(header, segment_id);
         }
-        ceph_assert(header.get_type() == tail.get_type());
+        ceph_assert(header.get_type() == tail.get_type() || !tail_valid);
 
-        sea_time_point modify_time = mod_to_timepoint(tail.modify_time);
-        std::size_t num_extents = tail.num_extents;
-        if ((modify_time == NULL_TIME && num_extents == 0) ||
-            (modify_time != NULL_TIME && num_extents != 0)) {
-          segments.update_modify_time(segment_id, modify_time, num_extents);
-        } else {
-          ERROR("illegal modify time {}", tail);
-          return crimson::ct_error::input_output_error::make();
-        }
+	sea_time_point header_time = mod_to_timepoint(header.modify_time);
+	if (tail_valid) {
+	  sea_time_point tail_time = mod_to_timepoint(tail.modify_time);
+	  std::size_t num_extents = tail.num_extents;
+	  DEBUG("updating modify time for segment {}, "
+		"mod time {}-{}, num_extents {}",
+		segment_id, header_time, tail_time, num_extents);
+	  if (num_extents == 0) {
+	    ceph_assert(tail_time == NULL_TIME);
+	  } else {
+	    ceph_assert(header_time != NULL_TIME);
+	    ceph_assert(tail_time != NULL_TIME);
+	    sea_time_point avg_time = get_average_time(
+	      header_time, 1, tail_time, 1);
+	    segments.update_modify_time(segment_id, avg_time, num_extents);
+	  }
+	} else {
+	  DEBUG("updating modify time for segment {}, mod time {}, without tail",
+		segment_id, header_time);
+	  segments.init_modify_time(segment_id, header_time);
+	}
 
         init_mark_segment_closed(
           segment_id,
@@ -1360,8 +1412,22 @@ SegmentCleaner::mount_ret SegmentCleaner::mount()
         return seastar::now();
       }).handle_error(
         crimson::ct_error::enodata::handle(
-          [this, header, segment_id](auto) {
-          return scan_no_tail_segment(header, segment_id);
+          [this, header, segment_id, FNAME](auto) {
+	  if (header.type == segment_type_t::JOURNAL) {
+	    return scan_no_tail_segment(header, segment_id);
+	  } else {
+	    sea_time_point modify_time = mod_to_timepoint(header.modify_time);
+	    DEBUG("updating modify time for segment {}, mod time {}",
+	      segment_id, modify_time);
+	    segments.init_modify_time(segment_id, modify_time);
+	    init_mark_segment_closed(
+	      segment_id,
+	      header.segment_seq,
+	      header.type,
+	      header.category,
+	      header.generation);
+	    return scan_extents_ertr::now();
+	  }
         }),
         crimson::ct_error::pass_further_all{}
       );
@@ -1444,6 +1510,7 @@ bool SegmentCleaner::check_usage()
   SpaceTrackerIRef tracker(space_tracker->make_empty());
   extent_callback->with_transaction_weak(
       "check_usage",
+      CACHE_HINT_NOCACHE,
       [this, &tracker](auto &t) {
     return backref_manager.scan_mapped_space(
       t,
@@ -1454,10 +1521,11 @@ bool SegmentCleaner::check_usage()
         extent_types_t type,
         laddr_t laddr)
     {
-      if (paddr.get_addr_type() == paddr_types_t::SEGMENT) {
+      if (paddr.is_absolute_segmented()) {
         if (is_backref_node(type)) {
 	  assert(laddr == L_ADDR_NULL);
-	  assert(backref_key != P_ADDR_NULL);
+	  assert(backref_key.is_absolute_segmented()
+                 || backref_key == P_ADDR_MIN);
           tracker->allocate(
             paddr.as_seg_paddr().get_segment_id(),
             paddr.as_seg_paddr().get_segment_off(),
@@ -1477,7 +1545,7 @@ bool SegmentCleaner::check_usage()
         }
       }
     });
-  }).unsafe_get0();
+  }).unsafe_get();
   return space_tracker->equals(*tracker);
 }
 
@@ -1489,7 +1557,7 @@ void SegmentCleaner::mark_space_used(
   assert(background_callback->get_state() >= state_t::SCAN_SPACE);
   assert(len);
   // TODO: drop
-  if (addr.get_addr_type() != paddr_types_t::SEGMENT) {
+  if (!addr.is_absolute_segmented()) {
     return;
   }
 
@@ -1505,7 +1573,7 @@ void SegmentCleaner::mark_space_used(
 
   background_callback->maybe_wake_background();
   assert(ret > 0);
-  DEBUG("segment {} new len: {}~{}, live_bytes: {}",
+  DEBUG("segment {} new len: {}~0x{:x}, live_bytes: 0x{:x}",
         seg_addr.get_segment_id(),
         addr,
         len,
@@ -1520,7 +1588,7 @@ void SegmentCleaner::mark_space_free(
   assert(background_callback->get_state() >= state_t::SCAN_SPACE);
   assert(len);
   // TODO: drop
-  if (addr.get_addr_type() != paddr_types_t::SEGMENT) {
+  if (!addr.is_absolute_segmented()) {
     return;
   }
 
@@ -1528,7 +1596,7 @@ void SegmentCleaner::mark_space_free(
   stats.used_bytes -= len;
   auto& seg_addr = addr.as_seg_paddr();
 
-  DEBUG("segment {} free len: {}~{}",
+  DEBUG("segment {} free len: {}~0x{:x}",
         seg_addr.get_segment_id(), addr, len);
   auto old_usage = calc_utilization(seg_addr.get_segment_id());
   [[maybe_unused]] auto ret = space_tracker->release(
@@ -1539,7 +1607,7 @@ void SegmentCleaner::mark_space_free(
   adjust_segment_util(old_usage, new_usage);
   background_callback->maybe_wake_blocked_io();
   assert(ret >= 0);
-  DEBUG("segment {} free len: {}~{}, live_bytes: {}",
+  DEBUG("segment {} free len: {}~0x{:x}, live_bytes: 0x{:x}",
         seg_addr.get_segment_id(),
         addr,
         len,
@@ -1624,11 +1692,11 @@ void SegmentCleaner::print(std::ostream &os, bool is_detailed) const
      << ", reclaim_ratio=" << get_reclaim_ratio()
      << ", alive_ratio=" << get_alive_ratio();
   if (is_detailed) {
-    os << ", unavailable_unreclaimable="
+    os << ", unavailable_unreclaimable=0x" << std::hex
        << get_unavailable_unreclaimable_bytes() << "B"
-       << ", unavailable_reclaimble="
+       << ", unavailable_reclaimble=0x"
        << get_unavailable_reclaimable_bytes() << "B"
-       << ", alive=" << stats.used_bytes << "B"
+       << ", alive=0x" << stats.used_bytes << "B" << std::dec
        << ", " << segments;
   }
   os << ")";
@@ -1654,12 +1722,12 @@ void RBMCleaner::mark_space_used(
   extent_len_t len)
 {
   LOG_PREFIX(RBMCleaner::mark_space_used);
-  assert(addr.get_addr_type() == paddr_types_t::RANDOM_BLOCK);
+  assert(addr.is_absolute_random_block());
   auto rbms = rb_group->get_rb_managers();
   for (auto rbm : rbms) {
     if (addr.get_device_id() == rbm->get_device_id()) {
       if (rbm->get_start() <= addr) {
-	DEBUG("allocate addr: {} len: {}", addr, len);
+	DEBUG("allocate addr: {} len: 0x{:x}", addr, len);
 	stats.used_bytes += len;
 	rbm->mark_space_used(addr, len);
       }
@@ -1673,12 +1741,12 @@ void RBMCleaner::mark_space_free(
   extent_len_t len)
 {
   LOG_PREFIX(RBMCleaner::mark_space_free);
-  assert(addr.get_addr_type() == paddr_types_t::RANDOM_BLOCK);
+  assert(addr.is_absolute_random_block());
   auto rbms = rb_group->get_rb_managers();
   for (auto rbm : rbms) {
     if (addr.get_device_id() == rbm->get_device_id()) {
       if (rbm->get_start() <= addr) {
-	DEBUG("free addr: {} len: {}", addr, len);
+	DEBUG("free addr: {} len: 0x{:x}", addr, len);
 	ceph_assert(stats.used_bytes >= len);
 	stats.used_bytes -= len;
 	rbm->mark_space_free(addr, len);
@@ -1750,6 +1818,7 @@ bool RBMCleaner::check_usage()
   RBMSpaceTracker tracker(rbms);
   extent_callback->with_transaction_weak(
       "check_usage",
+      CACHE_HINT_NOCACHE,
       [this, &tracker, &rbms](auto &t) {
     return backref_manager.scan_mapped_space(
       t,
@@ -1764,7 +1833,8 @@ bool RBMCleaner::check_usage()
 	if (rbm->get_device_id() == paddr.get_device_id()) {
 	  if (is_backref_node(type)) {
 	    assert(laddr == L_ADDR_NULL);
-	    assert(backref_key != P_ADDR_NULL);
+	    assert(backref_key.is_absolute_random_block()
+	           || backref_key == P_ADDR_MIN);
 	    tracker.allocate(
 	      paddr,
 	      len);
@@ -1782,7 +1852,7 @@ bool RBMCleaner::check_usage()
 	}
       }
     });
-  }).unsafe_get0();
+  }).unsafe_get();
   return equals(tracker);
 }
 

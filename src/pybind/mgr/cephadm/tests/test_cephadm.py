@@ -8,8 +8,13 @@ import pytest
 
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection
 from cephadm.serve import CephadmServe
-from cephadm.inventory import HostCacheStatus, ClientKeyringSpec
+from cephadm.inventory import (
+    HostCacheStatus,
+    ClientKeyringSpec,
+    SpecDescription,
+)
 from cephadm.services.osd import OSD, OSDRemovalQueue, OsdIdClaims
+from cephadm.services.nvmeof import NvmeofService
 from cephadm.utils import SpecialHostLabels
 
 try:
@@ -129,7 +134,7 @@ def with_osd_daemon(cephadm_module: CephadmOrchestrator, _run_cephadm, host: str
         mock.call(host, 'osd', 'ceph-volume',
                   ['--', 'lvm', 'list', '--format', 'json'],
                   no_fsid=False, error_ok=False, image='', log_output=True, use_current_daemon_image=False),
-        mock.call(host, f'osd.{osd_id}', ['_orch', 'deploy'], [], stdin=mock.ANY, use_current_daemon_image=False),
+        mock.call(host, f'osd.{osd_id}', ['_orch', 'deploy'], [], stdin=mock.ANY, error_ok=True, use_current_daemon_image=False),
         mock.call(host, 'osd', 'ceph-volume',
                   ['--', 'raw', 'list', '--format', 'json'],
                   no_fsid=False, error_ok=False, image='', log_output=True, use_current_daemon_image=False),
@@ -151,6 +156,36 @@ class TestCephadm(object):
         match_glob(new_mon, 'myhost')
         new_mgr = cephadm_module.get_unique_name('mgr', 'myhost', existing)
         match_glob(new_mgr, 'myhost.*')
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    def test_valid_url(self, cephadm_module):
+        # Test with valid IPv4 and IPv6 urls
+        test_cases = [
+            ("http://192.168.100.100:9090", "prometheus multi-cluster targets updated"),  # Valid IPv4
+            ("https://192.168.100.100/prometheus", "prometheus multi-cluster targets updated"),       # Valid IPv4 without port
+            ("http://[2001:0db8:85a3::8a2e:0370:7334]:9090", "prometheus multi-cluster targets updated"),  # Valid IPv6 with port
+            ("https://[2001:0db8:85a3::8a2e:0370:7334]/prometheus", "prometheus multi-cluster targets updated"),  # Valid IPv6 without port
+        ]
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, ServiceSpec(service_type='prometheus'), CephadmOrchestrator.apply_prometheus, 'test'):
+                for url, expected_output in test_cases:
+                    c = cephadm_module.set_prometheus_target(url)
+                    assert wait(cephadm_module, c) == expected_output
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    def test_invalid_url(self, cephadm_module):
+        # Test with invalid IPv4 and IPv6 urls
+        test_cases = [
+            ("https://192.168.100.100:99999", "Invalid url. Port out of range 0-65535"),  # Port out of range
+            ("http://[2001:0db8:85a3::8a2e:0370:7334]:99999", "Invalid url. Port out of range 0-65535"),  # IPv6 with invalid port
+            ("https://192.168.100.999:9090", "Invalid url. '192.168.100.999' does not appear to be an IPv4 or IPv6 address"),  # Invalid IPv4
+            ("http://[fe80:2030:31:24]:9090", "Invalid url. 'fe80:2030:31:24' does not appear to be an IPv4 or IPv6 address")  # Invalid IPv6
+        ]
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, ServiceSpec(service_type='prometheus'), CephadmOrchestrator.apply_prometheus, 'test'):
+                for url, expected_output in test_cases:
+                    c = cephadm_module.set_prometheus_target(url)
+                    assert wait(cephadm_module, c) == expected_output
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     def test_host(self, cephadm_module):
@@ -211,6 +246,7 @@ class TestCephadm(object):
                         'status_desc': 'starting',
                         'is_active': False,
                         'ports': [],
+                        'pending_daemon_config': False,
                     }
                 ]
 
@@ -237,6 +273,7 @@ class TestCephadm(object):
                             'service_id': 'r.z',
                             'service_name': 'rgw.r.z',
                             'service_type': 'rgw',
+                            'spec': {'rgw_exit_timeout_secs': 120},
                             'status': {'created': mock.ANY, 'running': 1, 'size': 1,
                                        'ports': [80]},
                         }
@@ -339,8 +376,8 @@ class TestCephadm(object):
     ))
     def test_list_daemons(self, cephadm_module: CephadmOrchestrator):
         cephadm_module.service_cache_timeout = 10
-        with with_host(cephadm_module, 'test'):
-            CephadmServe(cephadm_module)._refresh_host_daemons('test')
+        with with_host(cephadm_module, 'myhost'):
+            CephadmServe(cephadm_module)._refresh_host_daemons('myhost')
             dds = wait(cephadm_module, cephadm_module.list_daemons())
             assert {d.name() for d in dds} == {'rgw.myrgw.foobar', 'haproxy.test.bar'}
 
@@ -357,11 +394,19 @@ class TestCephadm(object):
                 assert wait(cephadm_module,
                             c) == f"Scheduled to redeploy rgw.{daemon_id} on host 'test'"
 
-                for what in ('start', 'stop', 'restart'):
+                for what in ('start', 'stop'):
                     c = cephadm_module.daemon_action(what, d_name)
                     assert wait(cephadm_module,
                                 c) == F"Scheduled to {what} {d_name} on host 'test'"
 
+                for what in ('start', 'stop', 'restart'):
+                    c = cephadm_module.daemon_action(what, d_name, force=True)
+                    assert wait(cephadm_module,
+                                c) == F"Scheduled to {what} {d_name} on host 'test'"
+
+                with pytest.raises(OrchestratorError, match=f"Unable to restart daemon {d_name}"):
+                    c = cephadm_module.daemon_action('restart', d_name)
+                    wait(cephadm_module, c)
                 # Make sure, _check_daemons does a redeploy due to monmap change:
                 cephadm_module._store['_ceph_get/mon_map'] = {
                     'modified': datetime_to_str(datetime_now()),
@@ -462,7 +507,7 @@ class TestCephadm(object):
 
                 CephadmServe(cephadm_module)._check_daemons()
 
-                assert _save_host.called_with('test')
+                _save_host.assert_called_with('test')
                 assert cephadm_module.cache.get_scheduled_daemon_action('test', daemon_name) is None
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -526,6 +571,7 @@ class TestCephadm(object):
                             },
                         },
                     }),
+                    error_ok=True,
                     use_current_daemon_image=True,
                 )
 
@@ -581,6 +627,7 @@ class TestCephadm(object):
                             "crush_location": "datacenter=a",
                         },
                     }),
+                    error_ok=True,
                     use_current_daemon_image=False,
                 )
 
@@ -623,6 +670,7 @@ class TestCephadm(object):
                             "keyring": "[client.crash.test]\nkey = None\n",
                         },
                     }),
+                    error_ok=True,
                     use_current_daemon_image=False,
                 )
 
@@ -665,6 +713,7 @@ class TestCephadm(object):
                         },
                         "config_blobs": {},
                     }),
+                    error_ok=True,
                     use_current_daemon_image=False,
                 )
 
@@ -715,6 +764,7 @@ class TestCephadm(object):
                         },
                         "config_blobs": {},
                     }),
+                    error_ok=True,
                     use_current_daemon_image=False,
                 )
 
@@ -769,6 +819,7 @@ class TestCephadm(object):
                         },
                         "config_blobs": {},
                     }),
+                    error_ok=True,
                     use_current_daemon_image=False,
                 )
 
@@ -847,12 +898,26 @@ class TestCephadm(object):
                 with mock.patch("cephadm.module.CephadmOrchestrator.mon_command") as _mon_cmd:
                     CephadmServe(cephadm_module)._check_daemons()
                     _mon_cmd.assert_any_call(
-                        {'prefix': 'dashboard set-grafana-api-url', 'value': 'https://[1::4]:3000'},
+                        {'prefix': 'dashboard set-grafana-api-url', 'value': 'https://host_fqdn:3000'},
+                        None)
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, ServiceSpec(service_type='prometheus'), CephadmOrchestrator.apply_prometheus, 'test'):
+                with mock.patch("cephadm.module.CephadmOrchestrator.mon_command") as _mon_cmd:
+                    CephadmServe(cephadm_module)._check_daemons()
+                    _mon_cmd.assert_any_call(
+                        {'prefix': 'dashboard set-prometheus-api-host', 'value': 'http://host_fqdn:9095'},
+                        None)
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, ServiceSpec(service_type='alertmanager'), CephadmOrchestrator.apply_alertmanager, 'test'):
+                with mock.patch("cephadm.module.CephadmOrchestrator.mon_command") as _mon_cmd:
+                    CephadmServe(cephadm_module)._check_daemons()
+                    _mon_cmd.assert_any_call(
+                        {'prefix': 'dashboard set-alertmanager-api-host', 'value': 'http://host_fqdn:9093'},
                         None)
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     @mock.patch("cephadm.module.CephadmOrchestrator.get_mgr_ip", lambda _: '1.2.3.4')
-    def test_iscsi_post_actions_with_missing_daemon_in_cache(self, cephadm_module: CephadmOrchestrator):
+    def test_iscsi_post_actions(self, cephadm_module: CephadmOrchestrator):
         # https://tracker.ceph.com/issues/52866
         with with_host(cephadm_module, 'test1'):
             with with_host(cephadm_module, 'test2'):
@@ -860,55 +925,10 @@ class TestCephadm(object):
 
                     CephadmServe(cephadm_module)._apply_all_services()
                     assert len(cephadm_module.cache.get_daemons_by_type('iscsi')) == 2
-
-                    # get a daemons from postaction list (ARRGH sets!!)
-                    tempset = cephadm_module.requires_post_actions.copy()
-                    tempdaemon1 = tempset.pop()
-                    tempdaemon2 = tempset.pop()
-
-                    # make sure post actions has 2 daemons in it
-                    assert len(cephadm_module.requires_post_actions) == 2
-
-                    # replicate a host cache that is not in sync when check_daemons is called
-                    tempdd1 = cephadm_module.cache.get_daemon(tempdaemon1)
-                    tempdd2 = cephadm_module.cache.get_daemon(tempdaemon2)
-                    host = 'test1'
-                    if 'test1' not in tempdaemon1:
-                        host = 'test2'
-                    cephadm_module.cache.rm_daemon(host, tempdaemon1)
-
-                    # Make sure, _check_daemons does a redeploy due to monmap change:
-                    cephadm_module.mock_store_set('_ceph_get', 'mon_map', {
-                        'modified': datetime_to_str(datetime_now()),
-                        'fsid': 'foobar',
-                    })
-                    cephadm_module.notify('mon_map', None)
-                    cephadm_module.mock_store_set('_ceph_get', 'mgr_map', {
-                        'modules': ['dashboard']
-                    })
-
-                    with mock.patch("cephadm.module.IscsiService.config_dashboard") as _cfg_db:
-                        CephadmServe(cephadm_module)._check_daemons()
-                        _cfg_db.assert_called_once_with([tempdd2])
-
-                        # post actions still has the other daemon in it and will run next _check_daemons
-                        assert len(cephadm_module.requires_post_actions) == 1
-
-                        # post actions was missed for a daemon
-                        assert tempdaemon1 in cephadm_module.requires_post_actions
-
-                        # put the daemon back in the cache
-                        cephadm_module.cache.add_daemon(host, tempdd1)
-
-                        _cfg_db.reset_mock()
-                        # replicate serve loop running again
-                        CephadmServe(cephadm_module)._check_daemons()
-
-                        # post actions should have been called again
-                        _cfg_db.asset_called()
-
-                        # post actions is now empty
-                        assert len(cephadm_module.requires_post_actions) == 0
+                    for host in ['test1', 'test2']:
+                        d = cephadm_module.cache.daemons[host]
+                        for name, dd in d.items():
+                            assert dd.pending_daemon_config is True
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     def test_mon_add(self, cephadm_module):
@@ -1189,7 +1209,7 @@ class TestCephadm(object):
                                 data_devices=DeviceSelection(paths=['']))
             c = cephadm_module.create_osds(dg)
             out = wait(cephadm_module, c)
-            assert out == "Created no osd(s) on host test; already created?"
+            assert "Error: No devices found for host test." in out
             bad_dg = DriveGroupSpec(placement=PlacementSpec(host_pattern='invalid_host'),
                                     data_devices=DeviceSelection(paths=['']))
             c = cephadm_module.create_osds(bad_dg)
@@ -1203,7 +1223,7 @@ class TestCephadm(object):
                                 data_devices=DeviceSelection(paths=['']))
             c = cephadm_module.create_osds(dg)
             out = wait(cephadm_module, c)
-            assert out == "Created no osd(s) on host test; already created?"
+            assert "Error: No devices found for host test." in out
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     @mock.patch('cephadm.services.osd.OSDService._run_ceph_volume_command')
@@ -1825,7 +1845,7 @@ class TestCephadm(object):
             ), CephadmOrchestrator.apply_iscsi),
             (CustomContainerSpec(
                 service_id='hello-world',
-                image='docker.io/library/hello-world:latest',
+                image='quay.io/hello-world/hello-world:latest',
                 uid=65534,
                 gid=65534,
                 dirs=['foo/bar'],
@@ -2505,6 +2525,7 @@ Traceback (most recent call last):
             cephadm_module.cache.facts = facts
             assert cephadm_module._validate_tunedprofile_settings(spec) == expected_value
 
+    @mock.patch("cephadm.CephadmOrchestrator.set_maintenance_healthcheck", lambda _: None)
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     def test_tuned_profiles_validation(self, cephadm_module):
         with with_host(cephadm_module, 'test'):
@@ -2625,16 +2646,33 @@ Traceback (most recent call last):
             with cephadm_module.async_timeout_handler('hostC', 'very slow', 999):
                 cephadm_module.wait_async(_timeout())
 
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     @mock.patch("cephadm.CephadmOrchestrator.remove_osds")
     @mock.patch("cephadm.CephadmOrchestrator.add_host_label", lambda *a, **kw: None)
     @mock.patch("cephadm.inventory.HostCache.get_daemons_by_host", lambda *a, **kw: [])
     def test_host_drain_zap(self, _rm_osds, cephadm_module):
         # pass force=true in these tests to bypass _admin label check
-        cephadm_module.drain_host('host1', force=True, zap_osd_devices=False)
-        assert _rm_osds.called_with([], zap=False)
+        with with_host(cephadm_module, 'test', refresh_hosts=False, rm_with_force=True):
+            cephadm_module.drain_host('test', force=True, zap_osd_devices=False)
+            _rm_osds.assert_called_with([], zap=False)
 
-        cephadm_module.drain_host('host1', force=True, zap_osd_devices=True)
-        assert _rm_osds.called_with([], zap=True)
+        with with_host(cephadm_module, 'test', refresh_hosts=False, rm_with_force=True):
+            cephadm_module.drain_host('test', force=True, zap_osd_devices=True)
+            _rm_osds.assert_called_with([], zap=True)
+
+        with pytest.raises(OrchestratorError, match=r"Cannot find host 'host1' in the inventory."):
+            cephadm_module.drain_host('host1', force=True, zap_osd_devices=True)
+            _rm_osds.assert_called_with([], zap=True)
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    @mock.patch("cephadm.CephadmOrchestrator.stop_remove_osds")
+    @mock.patch("cephadm.inventory.HostCache.get_daemons_by_host", lambda *a, **kw: [])
+    def test_stop_host_drain(self, _stop_rm_osds, cephadm_module):
+        # pass force=true in these tests to bypass _admin label check
+        with with_host(cephadm_module, 'host1', refresh_hosts=False, rm_with_force=True):
+            cephadm_module.drain_host('host1')
+            cephadm_module.stop_drain_host('host1')
+            _stop_rm_osds.assert_called_with([])
 
     def test_process_ls_output(self, cephadm_module):
         sample_ls_output = """[
@@ -2792,3 +2830,60 @@ Traceback (most recent call last):
             assert osd.cpu_percentage == '6.54%'
             assert osd.memory_usage == 73410805
             assert osd.created == str_to_datetime('2023-09-22T22:41:03.615080Z')
+
+    @mock.patch("cephadm.inventory.HostCache.get_daemons_by_service")
+    @mock.patch("cephadm.inventory.SpecStore.get_specs_by_type")
+    @mock.patch("cephadm.inventory.SpecStore.__getitem__")
+    def test_nvmeof_build_blocking_daemon_hosts(
+        self,
+        _spec_store_get_item,
+        _get_specs_by_type,
+        _get_daemons_by_service,
+        cephadm_module: CephadmOrchestrator
+    ):
+        # for nvmeof, the blocking daemon host list should be all hosts with an nvmeof
+        # daemon that belongs to a service with a different "group" parameter
+        nvmeof_services = [
+            ServiceSpec(service_type='nvmeof', pool='foo', group='foo', service_id='foo.foo'),
+            ServiceSpec(service_type='nvmeof', pool='bar', group='bar', service_id='bar.bar')
+        ]
+        nvmeof_foo_daemons = [
+            DaemonDescription(daemon_type='nvmeof', daemon_id='foo.foo.host1', hostname='host1'),
+            DaemonDescription(daemon_type='nvmeof', daemon_id='foo.foo.host2', hostname='host2')
+        ]
+        nvmeof_bar_daemons = [
+            DaemonDescription(daemon_type='nvmeof', daemon_id='bar.bar.host3', hostname='host3')
+        ]
+
+        def _get_nvmeof_specs(sname) -> SpecDescription:
+            if sname == 'nvmeof.foo.foo':
+                return SpecDescription(
+                    nvmeof_services[0], {}, None, None
+                )
+            elif sname == 'nvmeof.bar.bar':
+                return SpecDescription(
+                    nvmeof_services[1], {}, None, None
+                )
+
+        def _get_nvmeof_daemons(sname) -> List[DaemonDescription]:
+            if sname == 'nvmeof.foo.foo':
+                return nvmeof_foo_daemons
+            elif sname == 'nvmeof.bar.bar':
+                return nvmeof_bar_daemons
+
+        _get_specs_by_type.return_value = {
+            'nvmeof.foo.foo': nvmeof_services[0],
+            'nvmeof.bar.bar': nvmeof_services[1],
+        }
+        _spec_store_get_item.side_effect = _get_nvmeof_specs
+        _get_daemons_by_service.side_effect = _get_nvmeof_daemons
+
+        # first test for nvmeof.foo.foo, which should get blocking host based
+        # on nvmeof.bar.bar's daemons
+        nvmeof_foo_blocking_hosts = NvmeofService(cephadm_module).get_blocking_daemon_hosts('nvmeof.foo.foo')
+        assert set([h.hostname for h in nvmeof_foo_blocking_hosts]) == set(['host3'])
+
+        # now test for nvmeof.bar.bar, which should get blocking host based
+        # on nvmeof.foo.foo's daemons
+        nvmeof_bar_blocking_hosts = NvmeofService(cephadm_module).get_blocking_daemon_hosts('nvmeof.bar.bar')
+        assert set([h.hostname for h in nvmeof_bar_blocking_hosts]) == set(['host1', 'host2'])

@@ -99,11 +99,11 @@ function init_first_zone {
   secret=$7
 
 # initialize realm
-  x $(rgw_admin $cid) realm create --rgw-realm=$realm
+  x $(rgw_admin $cid) realm create --rgw-realm=$realm --default
 
 # create zonegroup, zone
   x $(rgw_admin $cid) zonegroup create --rgw-zonegroup=$zg --master --default
-  x $(rgw_admin $cid) zone create --rgw-zonegroup=$zg --rgw-zone=$zone --access-key=${access_key} --secret=${secret} --endpoints=$endpoints --default
+  x $(rgw_admin $cid) zone create --rgw-zonegroup=$zg --rgw-zone=$zone --access-key=${access_key} --secret=${secret} --endpoints=$endpoints --master --default
   x $(rgw_admin $cid) user create --uid=zone.user --display-name=ZoneUser --access-key=${access_key} --secret=${secret} --system
 
   x $(rgw_admin $cid) period update --commit
@@ -128,7 +128,7 @@ function init_zone_in_existing_zg {
   x $(rgw_admin $cid) period update --commit
 }
 
-function init_first_zone_in_slave_zg {
+function init_first_zone_in_peer_zg {
   [ $# -ne 8 ] && echo "init_first_zone_in_slave_zg() needs 8 params" && exit 1
 
   cid=$1

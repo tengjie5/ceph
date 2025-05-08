@@ -1,7 +1,6 @@
 set(libos_srcs
   ObjectStore.cc
   Transaction.cc
-  DBObjectMap.cc
   memstore/MemStore.cc
   kstore/KStore.cc
   kstore/kstore_types.cc
@@ -10,11 +9,13 @@ set(libos_srcs
 if(WITH_BLUESTORE)
   list(APPEND libos_srcs
     bluestore/Allocator.cc
+    bluestore/AllocatorBase.cc
     bluestore/BitmapFreelistManager.cc
     bluestore/BlueFS.cc
     bluestore/bluefs_types.cc
     bluestore/BlueRocksEnv.cc
     bluestore/BlueStore.cc
+    bluestore/BlueStore_debug.cc
     bluestore/simple_bitmap.cc
     bluestore/bluestore_types.cc
     bluestore/fastbmap_allocator_impl.cc
@@ -23,7 +24,11 @@ if(WITH_BLUESTORE)
     bluestore/BitmapAllocator.cc
     bluestore/AvlAllocator.cc
     bluestore/BtreeAllocator.cc
+    bluestore/Btree2Allocator.cc
     bluestore/HybridAllocator.cc
+    bluestore/Writer.cc
+    bluestore/Compression.cc
+    bluestore/BlueAdmin.cc
   )
 endif(WITH_BLUESTORE)
 
@@ -37,20 +42,13 @@ if(HAVE_LIBXFS)
     fs/XFS.cc)
 endif()
 
-if(HAVE_LIBZFS)
-  add_library(os_zfs_objs OBJECT
-    filestore/ZFSFileStoreBackend.cc
-    fs/ZFS.cc)
-  target_include_directories(os_zfs_objs SYSTEM PRIVATE
-    ${ZFS_INCLUDE_DIRS})
-  list(APPEND libos_srcs $<TARGET_OBJECTS:os_zfs_objs>)
-endif()
-
 add_library(os STATIC ${libos_srcs})
 target_link_libraries(os
   legacy-option-headers
-  blk)
+  blk
+  ${FMT_LIB})
 
+target_compile_definitions(os PRIVATE -DWITH_KSTORE)
 target_link_libraries(os heap_profiler kv)
 
 if(WITH_BLUEFS)
@@ -64,10 +62,6 @@ endif(WITH_BLUEFS)
 
 if(WITH_FUSE)
   target_link_libraries(os FUSE::FUSE)
-endif()
-
-if(HAVE_LIBZFS)
-  target_link_libraries(os ${ZFS_LIBRARIES})
 endif()
 
 if(WITH_LTTNG)

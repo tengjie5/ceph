@@ -14,11 +14,11 @@ abstractions:
 
 * FS volumes, an abstraction for CephFS file systems
 
-* FS subvolumes, an abstraction for independent CephFS directory trees
-
 * FS subvolume groups, an abstraction for a directory level higher than FS
   subvolumes. Used to effect policies (e.g., :doc:`/cephfs/file-layouts`)
   across a set of subvolumes
+
+* FS subvolumes, an abstraction for independent CephFS directory trees
 
 Possible use-cases for the export abstractions:
 
@@ -44,11 +44,14 @@ Create a volume by running the following command:
 
 .. prompt:: bash #
 
-   ceph fs volume create <vol_name> [placement]
+   ceph fs volume create <vol_name> [placement] [--data-pool <data-pool-name>] [--meta-pool <metadata-pool-name>]
 
-This creates a CephFS file system and its data and metadata pools. This command
-can also deploy MDS daemons for the filesystem using a Ceph Manager orchestrator
-module (for example Rook). See :doc:`/mgr/orchestrator`.
+This creates a CephFS file system and its data and metadata pools. Alternately,
+if the data pool and/or metadata pool needed for creating a CephFS volume
+already exist, these pool names can be passed to this command so that the
+volume is created using these existing pools. This command can also deploy MDS
+daemons for the filesystem using a Ceph Manager orchestrator module (for
+example Rook). See :doc:`/mgr/orchestrator`.
 
 ``<vol_name>`` is the volume name (an arbitrary string). ``[placement]`` is an
 optional string that specifies the :ref:`orchestrator-cli-placement-spec` for
@@ -71,6 +74,14 @@ tries to remove MDS daemons using the enabled Ceph Manager orchestrator module.
    file system is created on the same cluster and the subvolume interface is
    being used. See https://tracker.ceph.com/issues/49605#note-5 for more
    details.
+
+.. note:: If the snap-schedule Ceph Manager module is being used for a volume
+   and the volume is deleted, then the snap-schedule Ceph Manager module will
+   continue to hold references to the old pools. This will lead to the
+   snap-schedule Ceph Manager module faulting and logging errors. To remedy
+   this scenario, we recommend that the snap-schedule Ceph Manager module
+   be restarted after volume deletion. If the faults still persist, then we
+   recommend restarting `ceph-mgr`.
 
 List volumes by running the following command:
 
@@ -276,7 +287,7 @@ Use a command of the following form to create a subvolume:
 
 .. prompt:: bash #
 
-   ceph fs subvolume create <vol_name> <subvol_name> [--size <size_in_bytes>] [--group_name <subvol_group_name>] [--pool_layout <data_pool_name>] [--uid <uid>] [--gid <gid>] [--mode <octal_mode>] [--namespace-isolated]
+   ceph fs subvolume create <vol_name> <subvol_name> [--size <size_in_bytes>] [--group_name <subvol_group_name>] [--pool_layout <data_pool_name>] [--uid <uid>] [--gid <gid>] [--mode <octal_mode>] [--namespace-isolated] [--earmark <earmark>] [--normalization <form>] [--casesensitive <bool>]
 
 
 The command succeeds even if the subvolume already exists.
@@ -289,6 +300,56 @@ The subvolume can be created in a separate RADOS namespace by specifying the
 default subvolume group with an octal file mode of ``755``, a uid of its
 subvolume group, a gid of its subvolume group, a data pool layout of its parent
 directory, and no size limit.
+You can also assign an earmark to a subvolume using the ``--earmark`` option.
+The earmark is a unique identifier that tags the subvolume for specific purposes,
+such as NFS or SMB services. By default, no earmark is set, allowing for flexible
+assignment based on administrative needs. An empty string ("") can be used to remove
+any existing earmark from a subvolume.
+
+The earmarking mechanism ensures that subvolumes are correctly tagged and managed,
+helping to avoid conflicts and ensuring that each subvolume is associated
+with the intended service or use case.
+
+Valid Earmarks
+~~~~~~~~~~~~~~~~~~~~
+
+- **For NFS:**
+   - The valid earmark format is the top-level scope: ``'nfs'``.
+
+- **For SMB:**
+   - The valid earmark formats are:
+      - The top-level scope: ``'smb'``.
+      - The top-level scope with an intra-module level scope: ``'smb.cluster.{cluster_id}'``, where ``cluster_id`` is a short string uniquely identifying the cluster.
+      - Example without intra-module scope: ``smb``
+      - Example with intra-module scope: ``smb.cluster.cluster_1``
+
+.. note:: If you are changing an earmark from one scope to another (e.g., from nfs to smb or vice versa),
+   be aware that user permissions and ACLs associated with the previous scope might still apply. Ensure that
+   any necessary permissions are updated as needed to maintain proper access control.
+
+When creating a subvolume you can also specify an unicode normalization form by
+using the ``--normalization`` option. This will be used to internally mangle
+file names so that unicode characters that can be represented by different
+unicode code point sequences are all mapped to the representation, which means
+that they will all access the same file. However, users will continue to see
+the same name that they used when the file was created.
+
+The valid values for the unicode normalization form are:
+
+    - nfd: canonical decomposition (default)
+    - nfc: canonical decomposition, followed by canonical composition
+    - nfkd: compatibility decomposition
+    - nfkc: compatibility decomposition, followed by canonical composition
+
+To learn more about unicode normalization forms see https://unicode.org/reports/tr15
+
+It's also possible to configure a subvolume for case insensitive access when
+the ``--casesensitive=0`` option is used. When this option is added, file
+names that only differ in the case of its characters will be mapped to the same
+file. The case of the file name used when the file was created is preserved.
+
+.. note:: Setting ``--casesensitive=0`` option implicitly enables
+   unicode normalization on the subvolume.
 
 Removing a subvolume
 ~~~~~~~~~~~~~~~~~~~~
@@ -418,6 +479,7 @@ The output format is JSON and contains the following fields.
 * ``pool_namespace``: RADOS namespace of the subvolume
 * ``features``: features supported by the subvolume
 * ``state``: current state of the subvolume
+* ``earmark``: earmark of the subvolume
 
 If a subvolume has been removed but its snapshots have been retained, the
 output contains only the following fields.
@@ -522,6 +584,33 @@ subvolume using the metadata key:
 Using the ``--force`` flag allows the command to succeed when it would
 otherwise fail (if the metadata key did not exist).
 
+Getting earmark of a subvolume
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use a command of the following form to get the earmark of a subvolume:
+
+.. prompt:: bash #
+
+   ceph fs subvolume earmark get <vol_name> <subvol_name> [--group_name <subvol_group_name>]
+
+Setting earmark of a subvolume
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use a command of the following form to set the earmark of a subvolume:
+
+.. prompt:: bash #
+
+   ceph fs subvolume earmark set <vol_name> <subvol_name> [--group_name <subvol_group_name>] <earmark>
+
+Removing earmark of a subvolume
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use a command of the following form to remove the earmark of a subvolume:
+
+.. prompt:: bash #
+
+   ceph fs subvolume earmark rm <vol_name> <subvol_name> [--group_name <subvol_group_name>]
+
 Creating a Snapshot of a Subvolume
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -545,6 +634,15 @@ Using the ``--force`` flag allows the command to succeed when it would
 otherwise fail (if the snapshot did not exist).
 
 .. note:: if the last snapshot within a snapshot retained subvolume is removed, the subvolume is also removed
+
+Fetching Path of a Snapshot of a Subvolume
+------------------------------------------
+Use a command of the following form to fetch the absolute path of a snapshot of
+a subvolume:
+
+.. prompt:: base #
+
+    ceph fs subvolume snapshot getpath <volname> <subvol_name> <snap_name> [<group_name>]
 
 Listing the Snapshots of a Subvolume
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -676,7 +774,7 @@ Cloning Snapshots
 
 Subvolumes can be created by cloning subvolume snapshots. Cloning is an
 asynchronous operation that copies data from a snapshot to a subvolume. Because
-cloning is an operation that involves bulk copying, it is inefficient for
+cloning is an operation that involves bulk copying, it is slow for
 very large data sets.
 
 .. note:: Removing a snapshot (source subvolume) fails when there are
@@ -758,15 +856,39 @@ Here is an example of an ``in-progress`` clone:
 ::
 
     {
-        "status": {
-            "state": "in-progress",
-            "source": {
-                "volume": "cephfs",
-                "subvolume": "subvol1",
-                "snapshot": "snap1"
-            }
+      "status": {
+        "state": "in-progress",
+        "source": {
+          "volume": "cephfs",
+          "subvolume": "subvol1",
+          "snapshot": "snap1"
+        },
+        "progress_report": {
+          "percentage cloned": "12.24%",
+          "amount cloned": "376M/3.0G",
+          "files cloned": "4/6"
         }
+      }
     }
+
+A progress report is also printed in the output when clone is ``in-progress``.
+Here the progress is reported only for the specific clone. For collective
+progress made by all ongoing clones, a progress bar is printed at the bottom
+in ouput of ``ceph status`` command::
+
+  progress:
+    3 ongoing clones - average progress is 47.569% (10s)
+      [=============...............] (remaining: 11s)
+
+If the number of clone jobs are more than cloner threads, two progress bars
+are printed, one for ongoing clones (same as above) and other for all
+(ongoing+pending) clones::
+
+  progress:
+    4 ongoing clones - average progress is 27.669% (15s)
+      [=======.....................] (remaining: 41s)
+    Total 5 clones - average progress is 41.667% (3s)
+      [===========.................] (remaining: 4s)
 
 .. note:: The ``failure`` section will be shown only if the clone's state is ``failed`` or ``cancelled``
 
@@ -872,6 +994,32 @@ Configure the maximum number of concurrent clone operations. The default is 4:
 
    ceph config set mgr mgr/volumes/max_concurrent_clones <value>
 
+Pause the threads that asynchronously purge trashed subvolumes. This option is
+useful during cluster recovery scenarios:
+
+.. prompt:: bash #
+
+    ceph config set mgr/volumes/pause_purging true
+
+To resume purging threads:
+
+.. prompt:: bash #
+
+    ceph config set mgr/volumes/pause_purging false
+
+Pause the threads that asynchronously clone subvolume snapshots. This option is
+useful during cluster recovery scenarios:
+
+.. prompt:: bash #
+
+    ceph config set mgr/volumes/pause_cloning true
+
+To resume cloning threads:
+
+.. prompt:: bash #
+
+    ceph config set mgr/volumes/pause_cloning false
+
 Configure the ``snapshot_clone_no_wait`` option:
 
 The ``snapshot_clone_no_wait`` config option is used to reject clone-creation
@@ -929,6 +1077,121 @@ group:
 This enables distributed subtree partitioning policy for the "csi" subvolume
 group. This will cause every subvolume within the group to be automatically
 pinned to one of the available ranks on the file system.
+
+Normalization and Case Sensitivity
+----------------------------------
+
+The subvolumegroup and subvolume interefaces have a porcelain layer API to
+manipulate the ``ceph.dir.charmap`` configurations (see also :ref:`charmap`).
+
+
+Configuring the charmap
+~~~~~~~~~~~~~~~~~~~~~~~
+
+To configure the charmap, for a subvolumegroup:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap set <vol_name> <group_name> <setting> <value>
+
+Or for a subvolume:
+
+.. prompt:: bash #
+
+    ceph fs subvolume charmap set <vol_name> <subvol> <--group_name=name> <setting> <value>
+
+For example:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap set vol csi normalization nfd
+
+outputs:
+
+::
+
+    {"casesensitive":true,"normalization":"nfd","encoding":"utf8"}
+
+
+Reading the charmap
+~~~~~~~~~~~~~~~~~~~
+
+To read the configuration, for a subvolumegroup:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap get <vol_name> <group_name> <setting>
+
+Or for a subvolume:
+
+.. prompt:: bash #
+
+    ceph fs subvolume charmap get <vol_name> <subvol> <--group_name=name> <setting>
+
+For example:
+
+.. prompt:: bash #
+
+    ceph fs subvolume charmap get vol subvol --group_name=csi casesensitive
+
+::
+
+    0
+
+To read the full ``charmap``, for a subvolumegroup:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap get <vol_name> <group_name>
+
+Or for a subvolume:
+
+.. prompt:: bash #
+
+    ceph fs subvolume charmap get <vol_name> <subvol> <--group_name=name>
+
+For example:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap get vol csi
+
+outputs:
+
+::
+
+    {"casesensitive":false,"normalization":"nfd","encoding":"utf8"}
+
+
+Removing the charmap
+~~~~~~~~~~~~~~~~~~~~
+
+To remove the configuration, for a subvolumegroup:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap rm <vol_name> <group_name
+
+Or for a subvolume:
+
+.. prompt:: bash #
+
+    ceph fs subvolume charmap rm <vol_name> <subvol> <--group_name=name>
+
+For example:
+
+.. prompt:: bash #
+
+    ceph fs subvolumegroup charmap rm vol csi
+
+outputs:
+
+::
+
+    {}
+
+.. note:: A charmap can only be removed when a subvolumegroup or subvolume is empty.
+
 
 Subvolume quiesce
 -----------------
@@ -1339,6 +1602,30 @@ set with this id was present in the database
 .. prompt:: bash $ auto
 
   $ ceph fs quiesce fs1 sub1 sub2 sub3 --set-id="external-id" --if-version=0
+
+
+.. _disabling-volumes-plugin:
+
+Disabling Volumes Plugin
+------------------------
+By default the volumes plugin is enabled and set to ``always on``. However, in
+certain cases it might be appropriate to disable it. For example, when a CephFS
+is in a degraded state, the volumes plugin commands may accumulate in MGR
+instead of getting served. Which eventually causes policy throttles to kick in
+and the MGR becomes unresponsive.
+
+In this event, volumes plugin can be disabled even though it is an
+``always on`` module in MGR. To do so, run ``ceph mgr module disable volumes
+--yes-i-really-mean-it``. Do note that this command will disable operations
+and remove commands of volumes plugin since it will disable all CephFS
+services on the Ceph cluster accessed through this plugin.
+
+Before resorting to a measure as drastic as this, it is a good idea to try less
+drastic measures and then assess if the file system experience has improved due
+to it. One example of such less drastic measure is to disable asynchronous
+threads launched by volumes plugins for cloning and purging trash. For details
+on these see: :ref:`pause-purge-threads` and :ref:`pause-clone-threads`.
+
 
 .. _manila: https://github.com/openstack/manila
 .. _CSI: https://github.com/ceph/ceph-csi

@@ -34,6 +34,7 @@ import { RbdFormEditRequestModel } from './rbd-form-edit-request.model';
 import { RbdFormMode } from './rbd-form-mode.enum';
 import { RbdFormResponseModel } from './rbd-form-response.model';
 import { CdValidators } from '~/app/shared/forms/cd-validators';
+import { RBDActionHelpers } from '../rbd-contants';
 
 class ExternalData {
   rbd: RbdFormResponseModel;
@@ -69,34 +70,28 @@ export class RbdFormComponent extends CdForm implements OnInit {
 
   pool: string;
   peerConfigured = false;
-
   advancedEnabled = false;
-
   public rbdFormMode = RbdFormMode;
   mode: RbdFormMode;
-
   response: RbdFormResponseModel;
   snapName: string;
-
   defaultObjectSize = '4 MiB';
 
   mirroringOptions = [
     {
       value: 'journal',
-      text:
-        'Ensures reliable replication by logging changes before updating the image, but doubles write time, impacting performance. Not recommended for high-speed data processing tasks.'
+      text: RBDActionHelpers.journalTooltipText
     },
     {
       value: 'snapshot',
-      text:
-        'This mode replicates RBD images between clusters using snapshots, efficiently copying data changes but requiring complete delta syncing during failover. Ideal for less demanding tasks due to its less granular approach compared to journaling.'
+      text: RBDActionHelpers.snapshotTooltipText
     }
   ];
   poolMirrorMode: string;
   mirroring = false;
   currentPoolName = '';
   currentPoolMirrorMode = '';
-
+  copyMessage: string = RBDActionHelpers.copy;
   objectSizes: Array<string> = [
     '4 KiB',
     '8 KiB',
@@ -142,7 +137,7 @@ export class RbdFormComponent extends CdForm implements OnInit {
     super();
     this.routerUrl = this.router.url;
     this.poolPermission = this.authStorageService.getPermissions().pool;
-    this.resource = $localize`RBD`;
+    this.resource = $localize`Image`;
     this.features = {
       'deep-flatten': {
         desc: $localize`Deep flatten`,
@@ -880,5 +875,12 @@ export class RbdFormComponent extends CdForm implements OnInit {
         () => this.rbdForm.setErrors({ cdSubmitButton: true }),
         () => this.router.navigate(['/block/rbd'])
       );
+  }
+
+  onAlertAction() {
+    this.router.navigate([
+      '/block/mirroring',
+      { outlets: { modal: ['edit', this.rbdForm.getValue('pool')] } }
+    ]);
   }
 }

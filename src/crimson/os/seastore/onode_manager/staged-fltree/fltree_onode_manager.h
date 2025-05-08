@@ -36,19 +36,20 @@ struct FLTreeOnode final : Onode, Value {
   FLTreeOnode& operator=(const FLTreeOnode&) = delete;
 
   template <typename... T>
-  FLTreeOnode(uint32_t ddr, uint32_t dmr, T&&... args)
-    : Onode(ddr, dmr),
+  FLTreeOnode(uint32_t ddr, uint32_t dmr, const hobject_t &hobj, T&&... args)
+    : Onode(ddr, dmr, hobj),
       Value(std::forward<T>(args)...) {}
 
   template <typename... T>
-  FLTreeOnode(T&&... args)
-    : Onode(0, 0),
+  FLTreeOnode(const hobject_t &hobj, T&&... args)
+    : Onode(0, 0, hobj),
       Value(std::forward<T>(args)...) {}
 
   struct Recorder : public ValueDeltaRecorder {
     enum class delta_op_t : uint8_t {
       UPDATE_ONODE_SIZE,
       UPDATE_OMAP_ROOT,
+      UPDATE_LOG_ROOT,
       UPDATE_XATTR_ROOT,
       UPDATE_OBJECT_DATA,
       UPDATE_OBJECT_INFO,
@@ -66,7 +67,7 @@ struct FLTreeOnode final : Onode, Value {
     void apply_value_delta(
       ceph::bufferlist::const_iterator &bliter,
       NodeExtentMutable &value,
-      laddr_t value_addr) final;
+      laddr_offset_t value_addr_offset) final;
 
     void encode_update(NodeExtentMutable &payload_mut, delta_op_t op);
   };
@@ -119,6 +120,7 @@ struct FLTreeOnode final : Onode, Value {
   }
 
   void update_omap_root(Transaction &t, omap_root_t &oroot) final {
+    assert(oroot.get_type() == omap_type_t::OMAP);
     with_mutable_layout(
       t,
       [&oroot](NodeExtentMutable &payload_mut, Recorder *recorder) {
@@ -132,7 +134,23 @@ struct FLTreeOnode final : Onode, Value {
     });
   }
 
+  void update_log_root(Transaction &t, omap_root_t &lroot) final {
+    assert(lroot.get_type() == omap_type_t::LOG);
+    with_mutable_layout(
+      t,
+      [&lroot](NodeExtentMutable &payload_mut, Recorder *recorder) {
+	auto &mlayout = *reinterpret_cast<onode_layout_t*>(
+          payload_mut.get_write());
+	mlayout.log_root.update(lroot);
+	if (recorder) {
+	  recorder->encode_update(
+	    payload_mut, Recorder::delta_op_t::UPDATE_LOG_ROOT);
+	}
+    });
+  }
+
   void update_xattr_root(Transaction &t, omap_root_t &xroot) final {
+    assert(xroot.get_type() == omap_type_t::XATTR);
     with_mutable_layout(
       t,
       [&xroot](NodeExtentMutable &payload_mut, Recorder *recorder) {

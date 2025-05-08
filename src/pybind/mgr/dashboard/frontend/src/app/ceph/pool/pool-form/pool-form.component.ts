@@ -11,7 +11,7 @@ import { CrushRuleService } from '~/app/shared/api/crush-rule.service';
 import { ErasureCodeProfileService } from '~/app/shared/api/erasure-code-profile.service';
 import { PoolService } from '~/app/shared/api/pool.service';
 import { CrushNodeSelectionClass } from '~/app/shared/classes/crush.node.selection.class';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { SelectOption } from '~/app/shared/components/select/select-option.model';
 import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
 import { Icons } from '~/app/shared/enum/icons.enum';
@@ -87,6 +87,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
   crushRuleMaxSize = 10;
   DEFAULT_RATIO = 0.875;
   isApplicationsSelected = true;
+  msrCrush: boolean = false;
 
   private modalSubscription: Subscription;
 
@@ -166,7 +167,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
             CdValidators.custom(
               'required',
               (rule: CrushRule) =>
-                this.isReplicated && this.info.crush_rules_replicated.length > 0 && !rule
+                this.isReplicated && this.info?.crush_rules_replicated?.length > 0 && !rule
             )
           ]
         }),
@@ -200,6 +201,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
       this.listenToChanges();
       this.setComplexValidators();
     });
+    this.erasureProfileChange();
   }
 
   private initInfo(info: PoolFormInfo) {
@@ -299,7 +301,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
 
   private setAvailableApps(apps: string[] = this.data.applications.default) {
     this.data.applications.available = _.uniq(apps.sort()).map(
-      (x: string) => new SelectOption(false, x, '')
+      (x: string) => new SelectOption(false, x, this.data.APP_LABELS[x] || x)
     );
   }
 
@@ -685,7 +687,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
       return;
     }
     const name = value[nameAttribute];
-    this.modalService.show(CriticalConfirmationModalComponent, {
+    this.modalService.show(DeleteConfirmationModalComponent, {
       itemDescription,
       itemNames: [name],
       submitActionObservable: () => {
@@ -942,5 +944,13 @@ export class PoolFormComponent extends CdForm implements OnInit {
 
   appSelection() {
     this.form.get('name').updateValueAndValidity({ emitEvent: false, onlySelf: true });
+  }
+
+  erasureProfileChange() {
+    const profile = this.form.get('erasureProfile').value;
+    if (profile) {
+      this.msrCrush =
+        profile['crush-num-failure-domains'] > 0 || profile['crush-osds-per-failure-domain'] > 0;
+    }
   }
 }

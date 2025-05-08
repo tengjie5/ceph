@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ceph
-  VERSION 19.0.0
+  VERSION 20.0.0
   LANGUAGES CXX C ASM)
 
-foreach(policy CMP0127 CMP0135)
+foreach(policy CMP0127 CMP0135 CMP0175)
   if(POLICY ${policy})
     cmake_policy(SET ${policy} NEW)
   endif()
@@ -242,12 +242,6 @@ if(WITH_XFS)
   set(HAVE_LIBXFS ${XFS_FOUND})
 endif()
 
-option(WITH_ZFS "enable LibZFS if found" OFF)
-if(WITH_ZFS)
-  find_package(zfs)
-  set(HAVE_LIBZFS ${ZFS_FOUND})
-endif()
-
 option(WITH_BLUESTORE "Bluestore OSD backend" ON)
 if(WITH_BLUESTORE)
   if(LINUX)
@@ -263,6 +257,12 @@ endif()
 if(WITH_RBD AND LINUX)
   find_package(libcryptsetup 2.0.5 REQUIRED)
   set(HAVE_LIBCRYPTSETUP ${LIBCRYPTSETUP_FOUND})
+endif()
+
+# libnbd
+if(WITH_RBD AND NOT WIN32)
+  find_package(libnbd 1.0 REQUIRED)
+  set(HAVE_LIBNBD ${LIBNBD_FOUND})
 endif()
 
 include(CMakeDependentOption)
@@ -384,6 +384,15 @@ if(WITH_QATZIP)
   endif()
   set(HAVE_QATZIP TRUE)
 endif(WITH_QATZIP)
+
+CMAKE_DEPENDENT_OPTION(WITH_UADK "Enable UADK" ON
+        "CMAKE_SYSTEM_PROCESSOR MATCHES aarch64" OFF)
+if(WITH_UADK)
+  include(Builduadk)
+  build_uadk()
+  set(HAVE_UADK TRUE)
+  message("HAVE_UADK " ${HAVE_UADK})
+endif(WITH_UADK)
 
 # needs mds and? XXX
 option(WITH_LIBCEPHFS "libcephfs client library" ON)
@@ -508,6 +517,28 @@ if(WITH_JAEGER)
   set(HAVE_JAEGER TRUE)
 endif()
 
+# Catch2 C++ Unit Test support:
+# This needs to come before any tests using Catch2.
+option(WITH_CATCH2 "Enable Catch2 unit tests" ON)
+option(WITH_SYSTEM_CATCH2 "Enable Catch2 unit tests (require system packages)" OFF)
+
+if(WITH_CATCH2)
+  # Save pre-existing definitions (if any):
+  set(ORIG_CPM_LOCAL_PACKAGES_ONLY ${CPM_USE_LOCAL_PACKAGES_ONLY})
+
+    if(WITH_SYSTEM_CATCH2)
+   set(CPM_LOCAL_PACKAGES_ONLY ON)
+  endif()
+
+  include(${CMAKE_MODULE_PATH}/CPM.cmake)
+  CPMAddPackage("gh:catchorg/Catch2@3.8.1")
+
+  # Restore the original CPM settings in case someone else wants to use the module:
+  set(CPM_USE_LOCAL_PACKAGES_ONLY, ${ORIG_CPM_USE_LOCAL_PACKAGES_ONLY})
+
+  message("-- Enabled Catch2 support")
+endif()
+
 #option for RGW
 option(WITH_RADOSGW "RADOS Gateway is enabled" ON)
 option(WITH_RADOSGW_BEAST_OPENSSL "RADOS Gateway's Beast frontend uses OpenSSL" ON)
@@ -518,7 +549,7 @@ option(WITH_RADOSGW_DBSTORE "DBStore backend for RADOS Gateway" ON)
 option(WITH_RADOSGW_MOTR "CORTX-Motr backend for RADOS Gateway" OFF)
 option(WITH_RADOSGW_DAOS "DAOS backend for RADOS Gateway" OFF)
 option(WITH_RADOSGW_D4N "D4N wrapper for RADOS Gateway" ON)
-option(WITH_RADOSGW_POSIX "POSIX backend for Rados Gateway" ON)
+option(WITH_RADOSGW_POSIX "POSIX backend for RADOS Gateway" ON)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
 option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
@@ -583,10 +614,13 @@ endif (WITH_RADOSGW)
 option(WITH_CEPHFS "CephFS is enabled" ON)
 
 if(NOT WIN32)
-# Please specify 3.[0-7] if you want to build with a certain version of python3.
+# Please specify 3.x if you want to build with a certain version of python3.
 set(WITH_PYTHON3 "3" CACHE STRING "build with specified python3 version")
 find_package(Python3 ${WITH_PYTHON3} EXACT REQUIRED
   COMPONENTS Interpreter Development)
+if(Python3_VERSION VERSION_LESS 3.9)
+  message(FATAL_ERROR "${Python3_VERSION} is not supported, please use Python 3.9 and up")
+endif()
 
 option(WITH_MGR "ceph-mgr is enabled" ON)
 if(WITH_MGR)
@@ -693,8 +727,8 @@ if (WITH_SYSTEM_ROCKSDB)
   find_package(RocksDB 5.14 REQUIRED)
 endif()
 
-option(WITH_SEASTAR "Build seastar components")
-set(HAVE_SEASTAR ${WITH_SEASTAR})
+option(WITH_CRIMSON "Build seastar components")
+set(HAVE_SEASTAR ${WITH_CRIMSON})
 
 # Boost
 option(WITH_SYSTEM_BOOST "require and build with system Boost" OFF)
@@ -709,12 +743,17 @@ if(WITH_MGR)
   list(APPEND BOOST_COMPONENTS
     python${MGR_PYTHON_VERSION_MAJOR}${MGR_PYTHON_VERSION_MINOR})
 endif()
-if(WITH_SEASTAR)
+if(WITH_CRIMSON)
   list(APPEND BOOST_COMPONENTS timer)
 endif()
 
 if(WITH_RADOSGW AND WITH_RADOSGW_LUA_PACKAGES)
   list(APPEND BOOST_COMPONENTS filesystem)
+endif()
+
+if(WITH_LIBCEPHFS OR WITH_FUSE)
+  find_package(ICU REQUIRED COMPONENTS uc i18n)
+  list(APPEND BOOST_COMPONENTS locale)
 endif()
 
 set(Boost_USE_MULTITHREADED ON)
@@ -731,7 +770,7 @@ if(WITH_SYSTEM_BOOST)
   if(BOOST_ROOT AND CMAKE_LIBRARY_ARCHITECTURE)
     set(BOOST_LIBRARYDIR "${BOOST_ROOT}/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
   endif()
-  find_package(Boost 1.85 COMPONENTS ${BOOST_COMPONENTS} REQUIRED)
+  find_package(Boost 1.87 COMPONENTS ${BOOST_COMPONENTS} REQUIRED)
   if(NOT ENABLE_SHARED)
     set_property(TARGET Boost::iostreams APPEND PROPERTY
       INTERFACE_LINK_LIBRARIES ZLIB::ZLIB)
@@ -745,7 +784,7 @@ else()
   set(BOOST_J ${DEFAULT_BOOST_J} CACHE STRING "max jobs for Boost build") # override w/-DBOOST_J=<n>
   set(Boost_USE_STATIC_LIBS ON)
   include(BuildBoost)
-  build_boost(1.85
+  build_boost(1.87
     COMPONENTS ${BOOST_COMPONENTS} ${BOOST_HEADER_COMPONENTS})
 endif()
 include_directories(BEFORE SYSTEM ${Boost_INCLUDE_DIRS})
@@ -818,3 +857,4 @@ add_tags(ctags
   EXCLUDE_OPTS ${CTAG_EXCLUDES}
   EXCLUDES "*.js" "*.css" ".tox" "python-common/build")
 add_custom_target(tags DEPENDS ctags)
+

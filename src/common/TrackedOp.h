@@ -16,12 +16,31 @@
 
 #include <atomic>
 #include "common/StackStringStream.h"
+#include "common/ceph_context.h"
 #include "common/ceph_mutex.h"
+#include "common/debug.h"
+#include "common/Formatter.h"
 #include "common/histogram.h"
+#include "common/perf_counters.h" // for class PerfCountersBuilder
 #include "common/Thread.h"
 #include "common/Clock.h"
+#include "common/zipkin_trace.h"
 #include "include/spinlock.h"
 #include "msg/Message.h"
+
+#ifdef WITH_CRIMSON
+#include "crimson/common/perf_counters_collection.h"
+#else
+#include "common/perf_counters_collection.h"
+#endif
+
+#include <boost/intrusive/list.hpp>
+#include <boost/intrusive_ptr.hpp>
+
+#include <atomic>
+#include <list>
+#include <set>
+#include <vector>
 
 #define OPTRACKER_PREALLOC_EVENTS 20
 
@@ -53,9 +72,9 @@ public:
 };
 
 enum {
-  l_osd_slow_op_first = 1000,
-  l_osd_slow_op_count,
-  l_osd_slow_op_last,
+  l_trackedop_slow_op_first = 1000,
+  l_trackedop_slow_op_count,
+  l_trackedop_slow_op_last,
 };
 
 class OpHistory {
@@ -68,7 +87,7 @@ class OpHistory {
   std::atomic_size_t history_size{0};
   std::atomic_uint32_t history_duration{0};
   std::atomic_size_t history_slow_op_size{0};
-  std::atomic_uint32_t history_slow_op_threshold{0};
+  std::atomic<float> history_slow_op_threshold{0};
   std::atomic_bool shutdown{false};
   OpHistoryServiceThread opsvc;
   friend class OpHistoryServiceThread;
@@ -76,9 +95,11 @@ class OpHistory {
 
 public:
   OpHistory(CephContext *c) : cct(c), opsvc(this) {
-    PerfCountersBuilder b(cct, "osd-slow-ops",
-                         l_osd_slow_op_first, l_osd_slow_op_last);
-    b.add_u64_counter(l_osd_slow_op_count, "slow_ops_count",
+    PerfCountersBuilder b(cct, "trackedop",
+                         l_trackedop_slow_op_first, l_trackedop_slow_op_last);
+    b.set_prio_default(PerfCountersBuilder::PRIO_USEFUL);
+
+    b.add_u64_counter(l_trackedop_slow_op_count, "slow_ops_count",
                       "Number of operations taking over ten second");
 
     logger.reset(b.create_perf_counters());
@@ -111,7 +132,7 @@ public:
     history_size = new_size;
     history_duration = new_duration;
   }
-  void set_slow_op_size_and_threshold(size_t new_size, uint32_t new_threshold) {
+  void set_slow_op_size_and_threshold(size_t new_size, float new_threshold) {
     history_slow_op_size = new_size;
     history_slow_op_threshold = new_threshold;
   }
@@ -142,7 +163,7 @@ public:
   void set_history_size_and_duration(uint32_t new_size, uint32_t new_duration) {
     history.set_size_and_duration(new_size, new_duration);
   }
-  void set_history_slow_op_size_and_threshold(uint32_t new_size, uint32_t new_threshold) {
+  void set_history_slow_op_size_and_threshold(uint32_t new_size, float new_threshold) {
     history.set_slow_op_size_and_threshold(new_size, new_threshold);
   }
   bool is_tracking() const {
@@ -241,6 +262,7 @@ private:
 public:
   typedef boost::intrusive::list<
   TrackedOp,
+  boost::intrusive::constant_time_size<false>,
   boost::intrusive::member_hook<
     TrackedOp,
     boost::intrusive::list_member_hook<>,

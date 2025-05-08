@@ -12,16 +12,13 @@
  * 
  */
 
-#include <string_view>
-
-#include <errno.h>
+#include "MDSAuthCaps.h"
 
 #include <boost/spirit/include/qi.hpp>
 #include <boost/phoenix/operator.hpp>
 #include <boost/phoenix.hpp>
 
 #include "common/debug.h"
-#include "MDSAuthCaps.h"
 #include "mdstypes.h"
 #include "include/ipaddr.h"
 
@@ -410,7 +407,11 @@ bool MDSAuthCaps::merge_one_cap_grant(MDSCapGrant ng)
       // fsname and path match but value of root_squash is different. update
       // its value.
       if (g.match.root_squash != ng.match.root_squash) {
-	g.match.root_squash = ng.match.root_squash;
+	// "fs authorize" command is not allowed to deduct caps. so, we can add
+	// but not remove root_squash from MDS auth caps.
+	if (g.match.root_squash == false) {
+	  g.match.root_squash = ng.match.root_squash;
+	}
       }
 
       // Since fsname and path matched and either perm/spec or root_squash

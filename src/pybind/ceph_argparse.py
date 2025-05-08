@@ -173,7 +173,7 @@ class CephArgtype(object):
             assert len(type_args) == 1
             attrs['n'] = 'N'
             return CephArgtype.to_argdesc(type_args[0], attrs, positional=positional)
-        elif orig_type is Tuple:
+        elif orig_type in (Tuple, tuple):
             assert len(type_args) >= 1
             inner_tp = type_args[0]
             assert type_args.count(inner_tp) == len(type_args), \
@@ -327,7 +327,7 @@ class CephString(CephArgtype):
     """
     String; pretty generic.  goodchars is a RE char class of valid chars
     """
-    def __init__(self, goodchars=''):
+    def __init__(self, goodchars='', allowempty=True):
         from string import printable
         try:
             re.compile(goodchars)
@@ -338,8 +338,12 @@ class CephString(CephArgtype):
         self.goodset = frozenset(
             [c for c in printable if re.match(goodchars, c)]
         )
+        self.allowempty = allowempty in (True, 'True', 'true')
 
     def valid(self, s: str, partial: bool = False) -> None:
+        if not self.allowempty and s == "":
+            raise ArgumentFormat("argument can't be an empty string")
+
         sset = set(s)
         if self.goodset and not sset <= self.goodset:
             raise ArgumentFormat("invalid chars {0} in {1}".
@@ -350,6 +354,7 @@ class CephString(CephArgtype):
         b = ''
         if self.goodchars:
             b += '(goodchars {0})'.format(self.goodchars)
+        b += f'(allowempty {self.allowempty})'
         return '<string{0}>'.format(b)
 
     def complete(self, s) -> List[str]:
@@ -361,6 +366,7 @@ class CephString(CephArgtype):
     def argdesc(self, attrs):
         if self.goodchars:
             attrs['goodchars'] = self.goodchars
+        attrs['allowempty'] = repr(self.allowempty)
         return super().argdesc(attrs)
 
 
@@ -502,13 +508,13 @@ class CephPgid(CephArgtype):
         try:
             poolid = int(poolid_s)
         except ValueError:
-            raise ArgumentFormat('pool {0} not integer'.format(poolid))
+            raise ArgumentFormat('pool {0} not integer'.format(poolid_s))
         if poolid < 0:
             raise ArgumentFormat('pool {0} < 0'.format(poolid))
         try:
             pgnum = int(pgnum_s, 16)
         except ValueError:
-            raise ArgumentFormat('pgnum {0} not hex integer'.format(pgnum))
+            raise ArgumentFormat('pgnum {0} not hex integer'.format(pgnum_s))
         self.val = s
 
     def __str__(self):

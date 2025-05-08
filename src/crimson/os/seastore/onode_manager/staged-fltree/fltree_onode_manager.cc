@@ -12,7 +12,7 @@ namespace crimson::os::seastore::onode {
 void FLTreeOnode::Recorder::apply_value_delta(
   ceph::bufferlist::const_iterator &bliter,
   NodeExtentMutable &value,
-  laddr_t value_addr)
+  laddr_offset_t value_addr_offset)
 {
   LOG_PREFIX(FLTreeOnode::Recorder::apply_value_delta);
   delta_op_t op;
@@ -27,6 +27,10 @@ void FLTreeOnode::Recorder::apply_value_delta(
     case delta_op_t::UPDATE_OMAP_ROOT:
       DEBUG("update omap root");
       bliter.copy(sizeof(mlayout.omap_root), (char *)&mlayout.omap_root);
+      break;
+    case delta_op_t::UPDATE_LOG_ROOT:
+      DEBUG("update log root");
+      bliter.copy(sizeof(mlayout.log_root), (char *)&mlayout.log_root);
       break;
     case delta_op_t::UPDATE_XATTR_ROOT:
       DEBUG("update xattr root");
@@ -88,6 +92,12 @@ void FLTreeOnode::Recorder::encode_update(
       (const char *)&layout.omap_root,
       sizeof(layout.omap_root));
     break;
+  case delta_op_t::UPDATE_LOG_ROOT:
+    DEBUG("update log root");
+    encoded.append(
+      (const char *)&layout.log_root,
+      sizeof(layout.log_root));
+   break;
   case delta_op_t::UPDATE_XATTR_ROOT:
     DEBUG("update xattr root");
     encoded.append(
@@ -151,6 +161,7 @@ FLTreeOnodeManager::get_onode_ret FLTreeOnodeManager::get_onode(
     auto val = OnodeRef(new FLTreeOnode(
 	default_data_reservation,
 	default_metadata_range,
+	hoid.hobj,
 	cursor.value()));
     return get_onode_iertr::make_ready_future<OnodeRef>(
       val
@@ -173,6 +184,7 @@ FLTreeOnodeManager::get_or_create_onode(
     auto onode = new FLTreeOnode(
 	default_data_reservation,
 	default_metadata_range,
+	hoid.hobj,
 	cursor.value());
     if (created) {
       DEBUGT("created onode for entry for {}", trans, hoid);

@@ -429,6 +429,19 @@ the host name:
 
    ceph dashboard set-rgw-api-ssl-verify False
 
+To set a custom hostname or address for an RGW gateway, set the value of ``RGW_HOSTNAME_PER_DAEMON``
+accordingly:
+
+.. promt:: bash $
+
+   ceph dashboard set-rgw-hostname <gateway_name> <hostname>
+
+The setting can be unset using:
+
+.. promt:: bash $
+
+   ceph dashboard unset-rgw-hostname <gateway_name>
+
 If the Object Gateway takes too long to process requests and the dashboard runs
 into timeouts, you can set the timeout value to your needs:
 
@@ -1310,9 +1323,9 @@ redirection on standby nodes.
     mode tcp
     option httpchk GET /
     http-check expect status 200
-    server x <HOST>:<PORT> ssl check verify none
-    server y <HOST>:<PORT> ssl check verify none
-    server z <HOST>:<PORT> ssl check verify none
+    server x <HOST>:<PORT> check check-ssl verify none
+    server y <HOST>:<PORT> check check-ssl verify none
+    server z <HOST>:<PORT> check check-ssl verify none
 
 .. _dashboard-auditing:
 
@@ -1441,9 +1454,9 @@ commands:
 
         /var/log/ceph/$cluster-$name.log
 
-#. Ensure the SSL/TSL support is configured properly:
+#. Ensure the SSL/TLS support is configured properly:
 
-   * Check if the SSL/TSL support is enabled:
+   * Check if the SSL/TLS support is enabled:
 
      .. prompt:: bash $
 

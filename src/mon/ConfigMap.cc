@@ -1,15 +1,17 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include <boost/algorithm/string/split.hpp>
-
 #include "ConfigMap.h"
 #include "crush/CrushWrapper.h"
 #include "common/entity_name.h"
 
+#include <boost/algorithm/string/split.hpp>
+
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
 #include "common/dout.h"
+
+#include <iomanip>
 
 using namespace std::literals;
 
@@ -266,7 +268,7 @@ int ConfigMap::add_option(
     ldout(cct, 10) << __func__ << " unrecognized option '" << name << "'" << dendl;
     stray_options.push_back(
       std::unique_ptr<Option>(
-	new Option(name, Option::TYPE_STR, Option::LEVEL_UNKNOWN)));
+	new Option(std::string{name}, Option::TYPE_STR, Option::LEVEL_UNKNOWN)));
     opt = stray_options.back().get();
   }
 

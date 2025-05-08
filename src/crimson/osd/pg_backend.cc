@@ -10,6 +10,7 @@
 #include <boost/range/algorithm/copy.hpp>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include "include/utime_fmt.h"
 #include <seastar/core/print.hh>
 
 #include "messages/MOSDOp.h"
@@ -29,6 +30,7 @@
 #include "replicated_recovery_backend.h"
 #include "ec_backend.h"
 #include "exceptions.h"
+#include "osd/object_state_fmt.h"
 
 namespace {
   seastar::logger& logger() {
@@ -151,54 +153,6 @@ PGBackend::load_metadata(const hobject_t& oid)
       }));
 }
 
-PGBackend::rep_op_fut_t
-PGBackend::mutate_object(
-  std::set<pg_shard_t> pg_shards,
-  crimson::osd::ObjectContextRef &&obc,
-  ceph::os::Transaction&& txn,
-  osd_op_params_t&& osd_op_p,
-  epoch_t min_epoch,
-  epoch_t map_epoch,
-  std::vector<pg_log_entry_t>&& log_entries)
-{
-  logger().trace("mutate_object: num_ops={}", txn.get_num_ops());
-  if (obc->obs.exists) {
-    obc->obs.oi.prior_version = obc->obs.oi.version;
-    obc->obs.oi.version = osd_op_p.at_version;
-    if (osd_op_p.user_modify)
-      obc->obs.oi.user_version = osd_op_p.at_version.version;
-    obc->obs.oi.last_reqid = osd_op_p.req_id;
-    obc->obs.oi.mtime = osd_op_p.mtime;
-    obc->obs.oi.local_mtime = ceph_clock_now();
-
-    // object_info_t
-    {
-      ceph::bufferlist osv;
-      obc->obs.oi.encode_no_oid(osv, CEPH_FEATURES_ALL);
-      // TODO: get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
-      txn.setattr(coll->get_cid(), ghobject_t{obc->obs.oi.soid}, OI_ATTR, osv);
-    }
-
-    // snapset
-    if (obc->obs.oi.soid.snap == CEPH_NOSNAP) {
-      logger().debug("final snapset {} in {}",
-        obc->ssc->snapset, obc->obs.oi.soid);
-      ceph::bufferlist bss;
-      encode(obc->ssc->snapset, bss);
-      txn.setattr(coll->get_cid(), ghobject_t{obc->obs.oi.soid}, SS_ATTR, bss);
-      obc->ssc->exists = true;
-    } else {
-      logger().debug("no snapset (this is a clone)");
-    }
-  } else {
-    // reset cached ObjectState without enforcing eviction
-    obc->obs.oi = object_info_t(obc->obs.oi.soid);
-  }
-  return _submit_transaction(
-    std::move(pg_shards), obc->obs.oi.soid, std::move(txn),
-    std::move(osd_op_p), min_epoch, map_epoch, std::move(log_entries));
-}
-
 static inline bool _read_verify_data(
   const object_info_t& oi,
   const ceph::bufferlist& data)
@@ -298,7 +252,7 @@ PGBackend::sparse_read(const ObjectState& os, OSDOp& osd_op,
     adjusted_length = adjusted_size - offset;
   }
   logger().trace("sparse_read: {} {}~{}",
-                 os.oi.soid, op.extent.offset, op.extent.length);
+                 os.oi.soid, (uint64_t)op.extent.offset, (uint64_t)op.extent.length);
   return interruptor::make_interruptible(store->fiemap(coll, ghobject_t{os.oi.soid},
     offset, adjusted_length)).safe_then_interruptible(
     [&delta_stats, &os, &osd_op, this](auto&& m) {
@@ -313,7 +267,7 @@ PGBackend::sparse_read(const ObjectState& os, OSDOp& osd_op,
           ceph::encode(extents, osd_op.outdata);
           encode_destructively(bl, osd_op.outdata);
           logger().trace("sparse_read got {} bytes from object {}",
-                         osd_op.op.extent.length, os.oi.soid);
+                         (uint64_t)osd_op.op.extent.length, os.oi.soid);
          delta_stats.num_rd++;
          delta_stats.num_rd_kb += shift_round_up(osd_op.op.extent.length, 10);
           return read_errorator::make_ready_future<>();
@@ -395,7 +349,7 @@ PGBackend::checksum(const ObjectState& os, OSDOp& osd_op)
     auto& checksum = osd_op.op.checksum;
     if (read_bl.length() != checksum.length) {
       logger().warn("checksum: bytes read {} != {}",
-                        read_bl.length(), checksum.length);
+                        read_bl.length(), (uint64_t)checksum.length);
       return crimson::ct_error::invarg::make();
     }
     // calculate its checksum and put the result in outdata
@@ -975,6 +929,7 @@ PGBackend::create_iertr::future<> PGBackend::create(
   ceph::os::Transaction& txn,
   object_stat_sum_t& delta_stats)
 {
+  logger().debug("{} obc existed: {}, osd_op {}", __func__, os, osd_op);
   if (os.exists && !os.oi.is_whiteout() &&
       (osd_op.op.flags & CEPH_OSD_OP_FLAG_EXCL)) {
     // this is an exclusive create
@@ -1328,22 +1283,6 @@ PGBackend::rm_xattr(
   return rm_xattr_iertr::now();
 }
 
-void PGBackend::clone(
-  /* const */object_info_t& snap_oi,
-  const ObjectState& os,
-  const ObjectState& d_os,
-  ceph::os::Transaction& txn)
-{
-  // See OpsExecutor::execute_clone documentation
-  txn.clone(coll->get_cid(), ghobject_t{os.oi.soid}, ghobject_t{d_os.oi.soid});
-  {
-    ceph::bufferlist bv;
-    snap_oi.encode_no_oid(bv, CEPH_FEATURES_ALL);
-    txn.setattr(coll->get_cid(), ghobject_t{d_os.oi.soid}, OI_ATTR, bv);
-  }
-  txn.rmattr(coll->get_cid(), ghobject_t{d_os.oi.soid}, SS_ATTR);
-}
-
 using get_omap_ertr =
   crimson::os::FuturizedStore::Shard::read_errorator::extend<
     crimson::ct_error::enodata>;
@@ -1386,9 +1325,10 @@ maybe_get_omap_vals(
 PGBackend::ll_read_ierrorator::future<ceph::bufferlist>
 PGBackend::omap_get_header(
   const crimson::os::CollectionRef& c,
-  const ghobject_t& oid) const
+  const ghobject_t& oid,
+  uint32_t op_flags) const
 {
-  return store->omap_get_header(c, oid)
+  return store->omap_get_header(c, oid, op_flags)
     .handle_error(
       crimson::ct_error::enodata::handle([] {
 	return seastar::make_ready_future<bufferlist>();
@@ -1401,10 +1341,13 @@ PGBackend::ll_read_ierrorator::future<>
 PGBackend::omap_get_header(
   const ObjectState& os,
   OSDOp& osd_op,
-  object_stat_sum_t& delta_stats) const
+  object_stat_sum_t& delta_stats,
+  uint32_t op_flags) const
 {
   if (os.oi.is_omap()) {
-    return omap_get_header(coll, ghobject_t{os.oi.soid}).safe_then_interruptible(
+    return omap_get_header(
+      coll, ghobject_t{os.oi.soid}, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED
+    ).safe_then_interruptible(
       [&delta_stats, &osd_op] (ceph::bufferlist&& header) {
         osd_op.outdata = std::move(header);
         delta_stats.num_rd_kb += shift_round_up(osd_op.outdata.length(), 10);
@@ -1768,7 +1711,8 @@ PGBackend::fiemap(
   CollectionRef c,
   const ghobject_t& oid,
   uint64_t off,
-  uint64_t len)
+  uint64_t len,
+  uint32_t op_flags)
 {
   return store->fiemap(c, oid, off, len);
 }
@@ -1815,8 +1759,9 @@ PGBackend::tmapup_iertr::future<> PGBackend::tmapup(
       return seastar::make_ready_future<bufferlist>();
     }),
     PGBackend::write_iertr::pass_further{},
-    crimson::ct_error::assert_all{"read error in mutate_object_contents"}
-  ).si_then([this, &os, &osd_op, &txn,
+    crimson::ct_error::assert_all{fmt::format(
+      "read error in mutate_object_contents of {}", os.oi.soid).c_str()
+    }).si_then([this, &os, &osd_op, &txn,
 	     &delta_stats, &osd_op_params]
 	    (auto &&bl) mutable -> PGBackend::tmapup_iertr::future<> {
     auto result = crimson::common::do_tmap_up(
@@ -1878,5 +1823,34 @@ PGBackend::read_ierrorator::future<> PGBackend::tmapget(
       return read_errorator::future<>{crimson::ct_error::object_corrupted::make()};
     }),
     read_errorator::pass_further{});
+}
+
+void PGBackend::set_metadata(
+  const hobject_t &obj,
+  object_info_t &oi,
+  const SnapSet *ss /* non-null iff head */,
+  ceph::os::Transaction& txn)
+{
+  ceph_assert((obj.is_head() && ss) || (!obj.is_head() && !ss));
+  {
+    ceph::bufferlist bv;
+    oi.encode_no_oid(bv, CEPH_FEATURES_ALL);
+    txn.setattr(coll->get_cid(), ghobject_t{obj}, OI_ATTR, bv);
+  }
+  if (ss) {
+    ceph::bufferlist bss;
+    encode(*ss, bss);
+    txn.setattr(coll->get_cid(), ghobject_t{obj}, SS_ATTR, bss);
+  }
+}
+
+void PGBackend::clone_for_write(
+  const hobject_t &from,
+  const hobject_t &to,
+  ceph::os::Transaction &txn)
+{
+  // See OpsExecuter::execute_clone documentation
+  txn.clone(coll->get_cid(), ghobject_t{from}, ghobject_t{to});
+  txn.rmattr(coll->get_cid(), ghobject_t{to}, SS_ATTR);
 }
 

@@ -1,11 +1,14 @@
 import os
 import pytest
-from mock.mock import patch, PropertyMock, create_autospec
+import argparse
+from unittest.mock import patch, PropertyMock, create_autospec, Mock, MagicMock
 from ceph_volume.api import lvm
 from ceph_volume.util import disk
 from ceph_volume.util import device
 from ceph_volume.util.constants import ceph_disk_guids
 from ceph_volume import conf, configuration, objectstore
+from ceph_volume.objectstore.rawbluestore import RawBlueStore
+from typing import Any, Dict, List, Optional, Callable
 
 
 class Capture(object):
@@ -27,14 +30,14 @@ class Capture(object):
 
 class Factory(object):
 
-    def __init__(self, **kw):
+    def __init__(self, **kw: Any) -> None:
         for k, v in kw.items():
             setattr(self, k, v)
 
 
 @pytest.fixture
-def factory():
-    return Factory
+def factory() -> Callable[..., argparse.Namespace]:
+    return argparse.Namespace
 
 def objectstore_bluestore_factory(**kw):
     o = objectstore.bluestore.BlueStore([])
@@ -68,29 +71,29 @@ def mock_lv_device_generator():
         return dev
     return mock_lv
 
-def mock_device(name='foo',
-                vg_name='vg_foo',
-                vg_size=None,
-                lv_name='lv_foo',
-                lv_size=None,
-                path='foo',
-                lv_path='',
-                number_lvs=0):
+def mock_device(**kw: Any) -> MagicMock:
+    number_lvs = kw.get('number_lvs', 0)
+    default_values = {
+        'vg_size': [21474836480],
+        'lv_size': kw.get('vg_size', [21474836480]),
+        'path': f"/dev/{kw.get('path', 'foo')}",
+        'vg_name': 'vg_foo',
+        'lv_name': 'lv_foo',
+        'symlink': None,
+        'available_lvm': True,
+        'vg_free': kw.get('vg_size', [21474836480]),
+        'lvs': [],
+        'lv_path': f"/dev/{kw.get('vg_name', 'vg_foo')}/{kw.get('lv_name', 'lv_foo')}",
+        'vgs': [lvm.VolumeGroup(vg_name=kw.get('vg_name', 'vg_foo'), lv_name=kw.get('lv_name', 'lv_foo'))],
+    }
+    for key, value in default_values.items():
+        kw.setdefault(key, value)
+
     dev = create_autospec(device.Device)
-    if vg_size is None:
-        dev.vg_size = [21474836480]
-    if lv_size is None:
-        lv_size = dev.vg_size
-    dev.lv_size = lv_size
-    dev.path = f'/dev/{path}'
-    dev.vg_name = f'{vg_name}'
-    dev.lv_name = f'{lv_name}'
-    dev.lv_path = lv_path if lv_path else f'/dev/{dev.vg_name}/{dev.lv_name}'
-    dev.symlink = None
-    dev.vgs = [lvm.VolumeGroup(vg_name=dev.vg_name, lv_name=dev.lv_name)]
-    dev.available_lvm = True
-    dev.vg_free = dev.vg_size
-    dev.lvs = []
+
+    for k, v in kw.items():
+        dev.__dict__[k] = v
+
     for n in range(0, number_lvs):
         dev.lvs.append(lvm.Volume(vg_name=f'{dev.vg_name}{n}',
                                   lv_name=f'{dev.lv_name}-{n}',
@@ -289,7 +292,7 @@ def disable_kernel_queries(monkeypatch):
 
 
 @pytest.fixture(params=[
-    '', 'ceph data', 'ceph journal', 'ceph block',
+    'ceph data', 'ceph journal', 'ceph block',
     'ceph block.wal', 'ceph block.db', 'ceph lockbox'])
 def ceph_partlabel(request):
     return request.param
@@ -358,7 +361,7 @@ def device_info(monkeypatch, patch_bluestore_label):
               has_bluestore_label=False):
         if devices:
             for dev in devices.keys():
-                devices[dev]['device_nodes'] = os.path.basename(dev)
+                devices[dev]['device_nodes'] = [os.path.basename(dev)]
         else:
             devices = {}
         lsblk = lsblk if lsblk else {}
@@ -494,6 +497,14 @@ raw_direct_report_data = {
         "osd_id": 9,
         "osd_uuid": "a0e07c5b-bee1-4ea2-ae07-cb89deda9b27",
         "type": "bluestore"
+    },
+    "db32a338-b640-4cbc-af17-f63808b1c36e": {
+        "ceph_fsid": "c301d0aa-288d-11ef-b535-c84bd6975560",
+        "device": "/dev/mapper/ceph-db32a338-b640-4cbc-af17-f63808b1c36e-sdb-block-dmcrypt",
+        "device_db": "/dev/mapper/ceph-db32a338-b640-4cbc-af17-f63808b1c36e-sdc-db-dmcrypt",
+        "osd_id": 0,
+        "osd_uuid": "db32a338-b640-4cbc-af17-f63808b1c36e",
+        "type": "bluestore"
     }
 }
 
@@ -504,3 +515,20 @@ def mock_lvm_direct_report(monkeypatch):
 @pytest.fixture
 def mock_raw_direct_report(monkeypatch):
     monkeypatch.setattr('ceph_volume.objectstore.rawbluestore.direct_report', lambda x: raw_direct_report_data)
+
+@pytest.fixture
+def fake_lsblk_all(monkeypatch: Any) -> Callable:
+    def apply(data: Optional[List[Dict[str, Any]]] = None) -> None:
+        if data is None:
+            devices = []
+        else:
+            devices = data
+        monkeypatch.setattr("ceph_volume.util.device.disk.lsblk_all", lambda *a, **kw: devices)
+    return apply
+
+@pytest.fixture
+def rawbluestore(factory: type[Factory]) -> RawBlueStore:
+    args = factory(devices=['/dev/foo'])
+    with patch('ceph_volume.objectstore.rawbluestore.prepare_utils.create_key', Mock(return_value=['AQCee6ZkzhOrJRAAZWSvNC3KdXOpC2w8ly4AZQ=='])):
+        r = RawBlueStore(args)  # type: ignore
+        return r

@@ -8,12 +8,15 @@ from io import BytesIO, StringIO
 from tasks.mgr.mgr_test_case import MgrTestCase
 from teuthology import contextutil
 from teuthology.exceptions import CommandFailedError
+from teuthology.orchestra.run import Raw
 
 log = logging.getLogger(__name__)
 
 NFS_POOL_NAME = '.nfs'  # should match mgr_module.py
 
 # TODO Add test for cluster update when ganesha can be deployed on multiple ports.
+
+
 class TestNFS(MgrTestCase):
     def _cmd(self, *args):
         return self.get_ceph_cmd_stdout(args)
@@ -52,15 +55,16 @@ class TestNFS(MgrTestCase):
          "squash": "none",
          "security_label": True,
          "protocols": [
-           4
+           3, 4
          ],
          "transports": [
            "TCP"
          ],
          "fsal": {
            "name": "CEPH",
-           "user_id": "nfs.test.1",
+           "user_id": "nfs.test.nfs-cephfs.3746f603",
            "fs_name": self.fs_name,
+           "cmount_path": "/",
          },
          "clients": []
         }
@@ -118,7 +122,7 @@ class TestNFS(MgrTestCase):
                     return
         self.fail(fail_msg)
 
-    def _check_auth_ls(self, export_id=1, check_in=False):
+    def _check_auth_ls(self, fs_name, check_in=False, user_id=None):
         '''
         Tests export user id creation or deletion.
         :param export_id: Denotes export number
@@ -126,10 +130,12 @@ class TestNFS(MgrTestCase):
         '''
         output = self._cmd('auth', 'ls')
         client_id = f'client.nfs.{self.cluster_id}'
+        search_id = f'client.{user_id}' if user_id else f'{client_id}.{fs_name}'
+
         if check_in:
-            self.assertIn(f'{client_id}.{export_id}', output)
+            self.assertIn(search_id, output)
         else:
-            self.assertNotIn(f'{client_id}.{export_id}', output)
+            self.assertNotIn(search_id, output)
 
     def _test_idempotency(self, cmd_func, cmd_args):
         '''
@@ -216,7 +222,7 @@ class TestNFS(MgrTestCase):
         # Runs the nfs export create command
         self._cmd(*export_cmd)
         # Check if user id for export is created
-        self._check_auth_ls(export_id, check_in=True)
+        self._check_auth_ls(self.fs_name, check_in=True)
         res = self._sys_cmd(['rados', '-p', NFS_POOL_NAME, '-N', self.cluster_id, 'get',
                              f'export-{export_id}', '-'])
         # Check if export object is created
@@ -230,12 +236,12 @@ class TestNFS(MgrTestCase):
         self._test_create_cluster()
         self._create_export(export_id='1', create_fs=True)
 
-    def _delete_export(self):
+    def _delete_export(self, pseduo_path=None, check_in=False, user_id=None):
         '''
         Delete an export.
         '''
-        self._nfs_cmd('export', 'rm', self.cluster_id, self.pseudo_path)
-        self._check_auth_ls()
+        self._nfs_cmd('export', 'rm', self.cluster_id, pseduo_path if pseduo_path else self.pseudo_path)
+        self._check_auth_ls(self.fs_name, check_in, user_id)
 
     def _test_list_export(self):
         '''
@@ -256,26 +262,27 @@ class TestNFS(MgrTestCase):
         self.sample_export['export_id'] = 2
         self.sample_export['pseudo'] = self.pseudo_path + '1'
         self.sample_export['access_type'] = 'RO'
-        self.sample_export['fsal']['user_id'] = f'{self.expected_name}.2'
+        self.sample_export['fsal']['user_id'] = f'{self.expected_name}.{self.fs_name}.3746f603'
         self.assertDictEqual(self.sample_export, nfs_output[1])
         # Export-3 for subvolume with r only
         self.sample_export['export_id'] = 3
         self.sample_export['path'] = sub_vol_path
         self.sample_export['pseudo'] = self.pseudo_path + '2'
-        self.sample_export['fsal']['user_id'] = f'{self.expected_name}.3'
+        self.sample_export['fsal']['user_id'] = f'{self.expected_name}.{self.fs_name}.3746f603'
         self.assertDictEqual(self.sample_export, nfs_output[2])
         # Export-4 for subvolume
         self.sample_export['export_id'] = 4
         self.sample_export['pseudo'] = self.pseudo_path + '3'
         self.sample_export['access_type'] = 'RW'
-        self.sample_export['fsal']['user_id'] = f'{self.expected_name}.4'
+        self.sample_export['fsal']['user_id'] = f'{self.expected_name}.{self.fs_name}.3746f603'
         self.assertDictEqual(self.sample_export, nfs_output[3])
 
-    def _get_export(self):
+    def _get_export(self, pseudo_path=None):
         '''
         Returns export block in json format
         '''
-        return json.loads(self._nfs_cmd('export', 'info', self.cluster_id, self.pseudo_path))
+        return json.loads(self._nfs_cmd('export', 'info', self.cluster_id,
+                                        pseudo_path if pseudo_path else self.pseudo_path))
 
     def _test_get_export(self):
         '''
@@ -313,7 +320,7 @@ class TestNFS(MgrTestCase):
                     else:
                         log.warning(f'{e}, retrying')
 
-    def _test_mnt(self, pseudo_path, port, ip, check=True):
+    def _test_mnt(self, pseudo_path, port, ip, check=True, datarw=False):
         '''
         Test mounting of created exports
         :param pseudo_path: It is the pseudo root name
@@ -341,10 +348,74 @@ class TestNFS(MgrTestCase):
         self.ctx.cluster.run(args=['sudo', 'chmod', '1777', '/mnt'])
 
         try:
+            # Clean up volumes directory created by subvolume create by some tests
+            self.ctx.cluster.run(args=['sudo', 'rm', '-rf', '/mnt/volumes'])
             self.ctx.cluster.run(args=['touch', '/mnt/test'])
             out_mnt = self._sys_cmd(['ls', '/mnt'])
             self.assertEqual(out_mnt,  b'test\n')
+            if datarw:
+              self.ctx.cluster.run(args=['echo', 'test data', Raw('|'), 'tee', '/mnt/test1'])
+              out_test1 = self._sys_cmd(['cat', '/mnt/test1'])
+              self.assertEqual(out_test1,  b'test data\n')
         finally:
+            self.ctx.cluster.run(args=['sudo', 'umount', '/mnt'])
+
+    def _test_data_read_write(self, pseudo_path, port, ip):
+        '''
+        Check if read/write works fine
+        '''
+        try:
+            self._test_mnt(pseudo_path, port, ip, True, True)
+        except CommandFailedError as e:
+            self.fail(f"expected read/write of a file to be successful but failed with {e.exitstatus}")
+
+    def _mnt_nfs(self, pseudo_path, port, ip):
+        '''
+        Mount created export
+        :param pseudo_path: It is the pseudo root name
+        :param port: Port of deployed nfs cluster
+        :param ip: IP of deployed nfs cluster
+        '''
+        tries = 3
+        while True:
+            try:
+                # TODO: NFS V4.2 is failing with libaio read.
+                # TODO: Reference: https://tracker.ceph.com/issues/70203
+                nfs_version_conf = self.ctx['config'].get('nfs', {})
+                nfs_version = nfs_version_conf.get('vers', 'latest')
+                if nfs_version == "latest":
+                    self.ctx.cluster.run(
+                        args=['sudo', 'mount', '-t', 'nfs', '-o', f'port={port}',
+                              f'{ip}:{pseudo_path}', '/mnt'])
+                else:
+                    self.ctx.cluster.run(
+                        args=['sudo', 'mount', '-t', 'nfs', '-o', f'port={port},vers={nfs_version}',
+                              f'{ip}:{pseudo_path}', '/mnt'])
+                    pass
+                break
+            except CommandFailedError:
+                if tries:
+                    tries -= 1
+                    time.sleep(2)
+                    continue
+                raise
+
+        self.ctx.cluster.run(args=['sudo', 'chmod', '1777', '/mnt'])
+
+    def _test_fio(self, pseudo_path, port, ip):
+        '''
+        run fio with libaio on /mnt/fio
+        :param mnt_path: nfs mount point
+        '''
+        try:
+            self._mnt_nfs(pseudo_path, port, ip)
+            self.ctx.cluster.run(args=['mkdir', '/mnt/fio'])
+            fio_cmd=['sudo', 'fio', '--ioengine=libaio', '-directory=/mnt/fio', '--filename=fio.randrw.test', '--name=job', '--bs=16k', '--direct=1', '--group_reporting', '--iodepth=128', '--randrepeat=0', '--norandommap=1', '--thread=2', '--ramp_time=20s', '--offset_increment=5%', '--size=5G', '--time_based', '--runtime=300', '--ramp_time=1s', '--percentage_random=0', '--rw=randrw', '--rwmixread=50']
+            self.ctx.cluster.run(args=fio_cmd)
+        except CommandFailedError as e:
+            self.fail(f"expected fio to be successful but failed with {e.exitstatus}")
+        finally:
+            self.ctx.cluster.run(args=['sudo', 'rm', '-rf', '/mnt/fio'])
             self.ctx.cluster.run(args=['sudo', 'umount', '/mnt'])
 
     def _write_to_read_only_export(self, pseudo_path, port, ip):
@@ -506,7 +577,7 @@ class TestNFS(MgrTestCase):
         self._test_delete_cluster()
         # Check if rados ganesha conf object is deleted
         self._check_export_obj_deleted(conf_obj=True)
-        self._check_auth_ls()
+        self._check_auth_ls(self.fs_name)
 
     def test_exports_on_mgr_restart(self):
         '''
@@ -591,6 +662,30 @@ class TestNFS(MgrTestCase):
         port, ip = self._get_port_ip_info()
         self._check_nfs_cluster_status('running', 'NFS Ganesha cluster restart failed')
         self._write_to_read_only_export(self.pseudo_path, port, ip)
+        self._test_delete_cluster()
+
+    def test_data_read_write(self):
+        '''
+        Test date read and write on export.
+        '''
+        self._test_create_cluster()
+        self._create_export(export_id='1', create_fs=True,
+                            extra_cmd=['--pseudo-path', self.pseudo_path])
+        port, ip = self._get_port_ip_info()
+        self._check_nfs_cluster_status('running', 'NFS Ganesha cluster restart failed')
+        self._test_data_read_write(self.pseudo_path, port, ip)
+        self._test_delete_cluster()
+
+    def test_async_io_fio(self):
+        '''
+        Test async io using fio. Expect completion without hang or crash
+        '''
+        self._test_create_cluster()
+        self._create_export(export_id='1', create_fs=True,
+                            extra_cmd=['--pseudo-path', self.pseudo_path])
+        port, ip = self._get_port_ip_info()
+        self._check_nfs_cluster_status('running', 'NFS Ganesha cluster restart failed')
+        self._test_fio(self.pseudo_path, port, ip)
         self._test_delete_cluster()
 
     def test_cluster_info(self):
@@ -935,7 +1030,7 @@ class TestNFS(MgrTestCase):
                     "protocols": [4],
                     "fsal": {
                         "name": "CEPH",
-                        "user_id": "nfs.test.1",
+                        "user_id": "nfs.test.nfs-cephfs.3746f603",
                         "fs_name": self.fs_name
                     }
                 },
@@ -948,7 +1043,7 @@ class TestNFS(MgrTestCase):
                     "protocols": [4],
                     "fsal": {
                         "name": "CEPH",
-                        "user_id": "nfs.test.2",
+                        "user_id": "nfs.test.nfs-cephfs.3746f603",
                         "fs_name": "invalid_fs_name"  # invalid fs
                     }
                 },
@@ -961,7 +1056,7 @@ class TestNFS(MgrTestCase):
                     "protocols": [4],
                     "fsal": {
                         "name": "CEPH",
-                        "user_id": "nfs.test.3",
+                        "user_id": "nfs.test.nfs-cephfs.3746f603",
                         "fs_name": self.fs_name
                     }
                 }
@@ -1008,7 +1103,7 @@ class TestNFS(MgrTestCase):
                 "protocols": [4],
                 "fsal": {
                     "name": "CEPH",
-                    "user_id": "nfs.test.1",
+                    "user_id": "nfs.test.nfs-cephfs.3746f603",
                     "fs_name": "invalid_fs_name"  # invalid fs
                 }
             }
@@ -1048,7 +1143,7 @@ class TestNFS(MgrTestCase):
                     "protocols": [4],
                     "fsal": {
                         "name": "CEPH",
-                        "user_id": "nfs.test.1",
+                        "user_id": "nfs.test.nfs-cephfs.3746f603",
                         "fs_name": self.fs_name
                     }
                 },
@@ -1061,7 +1156,7 @@ class TestNFS(MgrTestCase):
                     "protocols": [4],
                     "fsal": {
                         "name": "CEPH",
-                        "user_id": "nfs.test.2",
+                        "user_id": "nfs.test.nfs-cephfs.3746f603",
                         "fs_name": self.fs_name
                     }
                 },
@@ -1075,7 +1170,7 @@ class TestNFS(MgrTestCase):
                     "protocols": [4],
                     "fsal": {
                         "name": "CEPH",
-                        "user_id": "nfs.test.3",
+                        "user_id": "nfs.test.nfs-cephfs.3746f603",
                         "fs_name": "invalid_fs_name"
                     }
                 }
@@ -1211,3 +1306,65 @@ class TestNFS(MgrTestCase):
         finally:
             self.ctx.cluster.run(args=['rm', '-rf', f'{mnt_pt}/*'])
             self._delete_cluster_with_fs(self.fs_name, mnt_pt, preserve_mode)
+
+    def test_nfs_export_creation_without_cmount_path(self):
+        """
+        Test that ensure cmount_path is present in FSAL block
+        """
+        self._create_cluster_with_fs(self.fs_name)
+
+        pseudo_path = '/test_without_cmount'
+        self._create_export(export_id='1',
+                            extra_cmd=['--pseudo-path', pseudo_path])
+        nfs_output = self._get_export(pseudo_path)
+        self.assertIn('cmount_path', nfs_output['fsal'])
+
+        self._delete_export(pseudo_path)
+
+    def test_nfs_exports_with_same_and_diff_user_id(self):
+        """
+        Test that exports with same FSAL share same user_id
+        """
+        self._create_cluster_with_fs(self.fs_name)
+
+        pseudo_path_1 = '/test1'
+        pseudo_path_2 = '/test2'
+        pseudo_path_3 = '/test3'
+
+        # Create subvolumes
+        self._cmd('fs', 'subvolume', 'create', self.fs_name, 'sub_vol_1')
+        self._cmd('fs', 'subvolume', 'create', self.fs_name, 'sub_vol_2')
+
+        fs_path_1 = self._cmd('fs', 'subvolume', 'getpath', self.fs_name, 'sub_vol_1').strip()
+        fs_path_2 = self._cmd('fs', 'subvolume', 'getpath', self.fs_name, 'sub_vol_2').strip()
+        # Both exports should have same user_id(since cmount_path=/ & fs_name is same)
+        self._create_export(export_id='1',
+                            extra_cmd=['--pseudo-path', pseudo_path_1,
+                                       '--path', fs_path_1])
+        self._create_export(export_id='2',
+                            extra_cmd=['--pseudo-path', pseudo_path_2,
+                                       '--path', fs_path_2])
+
+        nfs_output_1 = self._get_export(pseudo_path_1)
+        nfs_output_2 = self._get_export(pseudo_path_2)
+        # Check if both exports have same user_id
+        self.assertEqual(nfs_output_2['fsal']['user_id'], nfs_output_1['fsal']['user_id'])
+        self.assertEqual(nfs_output_1['fsal']['user_id'], 'nfs.test.nfs-cephfs.3746f603')
+
+        cmount_path = '/volumes'
+        self._create_export(export_id='3',
+                            extra_cmd=['--pseudo-path', pseudo_path_3,
+                                       '--path', fs_path_1,
+                                       '--cmount-path', cmount_path])
+
+        nfs_output_3 = self._get_export(pseudo_path_3)
+        self.assertNotEqual(nfs_output_3['fsal']['user_id'], nfs_output_1['fsal']['user_id'])
+        self.assertEqual(nfs_output_3['fsal']['user_id'], 'nfs.test.nfs-cephfs.32cd8545')
+
+        # Deleting export with same user_id should not delete the user_id
+        self._delete_export(pseudo_path_1, True, nfs_output_1['fsal']['user_id'])
+        # Deleting export 22 should delete the user_id since it's only export left with that user_id
+        self._delete_export(pseudo_path_2, False, nfs_output_2['fsal']['user_id'])
+
+        # Deleting export 23 should delete the user_id since it's only export with that user_id
+        self._delete_export(pseudo_path_3, False, nfs_output_3['fsal']['user_id'])

@@ -120,6 +120,7 @@ export class ActionLabelsI18n {
   SET: string;
   SUBMIT: string;
   SHOW: string;
+  TIERING: string;
   TRASH: string;
   UNPROTECT: string;
   UNSET: string;
@@ -149,6 +150,8 @@ export class ActionLabelsI18n {
   RECONNECT: string;
   AUTHORIZE: string;
   EXPAND_CLUSTER: string;
+  SETUP_MULTISITE_REPLICATION: string;
+  NFS_EXPORT: string;
 
   constructor() {
     /* Create a new item */
@@ -157,6 +160,8 @@ export class ActionLabelsI18n {
     this.EXPORT = $localize`Export`;
 
     this.IMPORT = $localize`Import`;
+
+    this.SETUP_MULTISITE_REPLICATION = $localize`Setup Multi-site Replication`;
 
     this.MIGRATE = $localize`Migrate`;
 
@@ -202,6 +207,7 @@ export class ActionLabelsI18n {
     this.ROLLBACK = $localize`Rollback`;
     this.SCRUB = $localize`Scrub`;
     this.SHOW = $localize`Show`;
+    this.TIERING = $localize`Tiering`;
     this.TRASH = $localize`Move to Trash`;
     this.UNPROTECT = $localize`Unprotect`;
     this.CHANGE = $localize`Change`;
@@ -236,6 +242,8 @@ export class ActionLabelsI18n {
     this.DISCONNECT = $localize`Disconnect`;
     this.RECONNECT = $localize`Reconnect`;
     this.EXPAND_CLUSTER = $localize`Expand Cluster`;
+
+    this.NFS_EXPORT = $localize`Create NFS Export`;
   }
 }
 
@@ -346,3 +354,22 @@ export class TimerServiceInterval {
     this.TIMER_SERVICE_PERIOD = 5000;
   }
 }
+
+export const SSL_PROTOCOLS = ['TLSv1.2', 'TLSv1.3'];
+
+export const SSL_CIPHERS = [
+  'ECDHE',
+  'ECDSA',
+  'AES128',
+  'GCM',
+  'SHA256',
+  'RSA',
+  'AES256',
+  'SHA384',
+  'CHACHA20',
+  'POLY1305',
+  'DHE'
+];
+
+export const USER = 'user';
+export const VERSION_PREFIX = 'ceph version';

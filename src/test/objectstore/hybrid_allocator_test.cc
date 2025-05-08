@@ -6,14 +6,14 @@
 
 #include "os/bluestore/HybridAllocator.h"
 
-class TestHybridAllocator : public HybridAllocator {
+class TestHybridAllocator : public HybridAvlAllocator {
 public:
   TestHybridAllocator(CephContext* cct,
                       int64_t device_size,
                       int64_t _block_size,
                       uint64_t max_entries,
       const std::string& name) :
-    HybridAllocator(cct, device_size, _block_size,
+    HybridAvlAllocator(cct, device_size, _block_size,
       max_entries,
       name) {
   }
@@ -113,7 +113,7 @@ TEST(HybridAllocator, basic)
     PExtentVector extents;
     // allocate 4K, to be served from bitmap
     EXPECT_EQ(block_size, ha.allocate(block_size, block_size,
-      0, (int64_t)0, &extents));
+      0, (int64_t)-1, &extents));
     ASSERT_EQ(1, extents.size());
     ASSERT_EQ(0, extents[0].offset);
 
@@ -253,7 +253,7 @@ TEST(HybridAllocator, basic)
     // allocate 12M using 2M chunks. 10M to be returned
     PExtentVector extents;
     EXPECT_EQ(10 * _1m, ha.allocate(12 * _1m, 2 * _1m,
-      0, (int64_t)0, &extents));
+      0, (int64_t)-1, &extents));
 
     // release everything allocated
     for (auto& e : extents) {

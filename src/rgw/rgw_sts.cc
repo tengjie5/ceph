@@ -80,7 +80,7 @@ int Credentials::generateCredentials(const DoutPrefixProvider *dpp,
   buffer::ptr secret(secret_s.c_str(), secret_s.length());
   int ret = 0;
   if (ret = cryptohandler->validate_secret(secret); ret < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: Invalid rgw sts key, please ensure its length is 16" << dendl;
+    ldpp_dout(dpp, 0) << "ERROR: Invalid rgw sts key, please ensure it is an alphanumeric key of length 16" << dendl;
     return ret;
   }
   string error;
@@ -124,7 +124,7 @@ int Credentials::generateCredentials(const DoutPrefixProvider *dpp,
   if (identity) {
     token.acct_name = identity->get_acct_name();
     token.perm_mask = identity->get_perm_mask();
-    token.is_admin = identity->is_admin_of(token.user);
+    token.is_admin = identity->is_admin();
     token.acct_type = identity->get_identity_type();
   } else {
     token.acct_name = {};
@@ -300,7 +300,7 @@ std::tuple<int, rgw::sal::RGWRole*> STSService::getRoleInfo(const DoutPrefixProv
     }
 
     std::unique_ptr<rgw::sal::RGWRole> role = driver->get_role(roleName, tenant, account);
-    if (int ret = role->get(dpp, y); ret < 0) {
+    if (int ret = role->load_by_name(dpp, y); ret < 0) {
       if (ret == -ENOENT) {
         ldpp_dout(dpp, 0) << "Role doesn't exist: " << roleName << dendl;
         ret = -ERR_NO_ROLE_FOUND;

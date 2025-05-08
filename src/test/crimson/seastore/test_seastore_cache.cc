@@ -87,7 +87,10 @@ struct cache_test_t : public seastar_test_suite_t {
 
   auto get_transaction() {
     return cache->create_transaction(
-        Transaction::src_t::MUTATE, "test_cache", false);
+      Transaction::src_t::MUTATE,
+      "test_cache",
+      CACHE_HINT_TOUCH,
+      false);
   }
 
   template <typename T, typename... Args>
@@ -153,7 +156,7 @@ TEST_F(cache_test_t, test_addr_fixup)
 	0);
       extent->set_contents('c');
       csum = extent->calc_crc32c();
-      submit_transaction(std::move(t)).get0();
+      submit_transaction(std::move(t)).get();
       addr = extent->get_paddr();
     }
     {
@@ -161,7 +164,7 @@ TEST_F(cache_test_t, test_addr_fixup)
       auto extent = get_extent<TestBlockPhysical>(
 	*t,
 	addr,
-	TestBlockPhysical::SIZE).unsafe_get0();
+	TestBlockPhysical::SIZE).unsafe_get();
       ASSERT_EQ(extent->get_paddr(), addr);
       ASSERT_EQ(extent->calc_crc32c(), csum);
     }
@@ -192,14 +195,14 @@ TEST_F(cache_test_t, test_dirty_extent)
 	auto extent = get_extent<TestBlockPhysical>(
 	  *t,
 	  reladdr,
-	  TestBlockPhysical::SIZE).unsafe_get0();
+	  TestBlockPhysical::SIZE).unsafe_get();
 	ASSERT_TRUE(extent->is_clean());
 	ASSERT_TRUE(extent->is_pending());
 	ASSERT_TRUE(extent->get_paddr().is_relative());
 	ASSERT_EQ(extent->get_version(), 0);
 	ASSERT_EQ(csum, extent->calc_crc32c());
       }
-      submit_transaction(std::move(t)).get0();
+      submit_transaction(std::move(t)).get();
       addr = extent->get_paddr();
     }
     {
@@ -208,12 +211,12 @@ TEST_F(cache_test_t, test_dirty_extent)
       auto extent = get_extent<TestBlockPhysical>(
 	*t,
 	addr,
-	TestBlockPhysical::SIZE).unsafe_get0();
+	TestBlockPhysical::SIZE).unsafe_get();
       auto t2 = get_transaction();
       auto extent2 = get_extent<TestBlockPhysical>(
 	*t2,
 	addr,
-	TestBlockPhysical::SIZE).unsafe_get0();
+	TestBlockPhysical::SIZE).unsafe_get();
       ASSERT_EQ(&*extent, &*extent2);
     }
     {
@@ -222,7 +225,7 @@ TEST_F(cache_test_t, test_dirty_extent)
       auto extent = get_extent<TestBlockPhysical>(
 	*t,
 	addr,
-	TestBlockPhysical::SIZE).unsafe_get0();
+	TestBlockPhysical::SIZE).unsafe_get();
       // duplicate and reset contents
       extent = cache->duplicate_for_write(*t, extent)->cast<TestBlockPhysical>();
       extent->set_contents('c');
@@ -235,7 +238,7 @@ TEST_F(cache_test_t, test_dirty_extent)
 	auto extent = get_extent<TestBlockPhysical>(
 	  *t2,
 	  addr,
-	  TestBlockPhysical::SIZE).unsafe_get0();
+	  TestBlockPhysical::SIZE).unsafe_get();
 	ASSERT_TRUE(extent->is_clean());
 	ASSERT_FALSE(extent->is_pending());
 	ASSERT_EQ(addr, extent->get_paddr());
@@ -247,7 +250,7 @@ TEST_F(cache_test_t, test_dirty_extent)
 	auto extent = get_extent<TestBlockPhysical>(
 	  *t,
 	  addr,
-	  TestBlockPhysical::SIZE).unsafe_get0();
+	  TestBlockPhysical::SIZE).unsafe_get();
 	ASSERT_TRUE(extent->is_dirty());
 	ASSERT_TRUE(extent->is_pending());
 	ASSERT_EQ(addr, extent->get_paddr());
@@ -255,7 +258,7 @@ TEST_F(cache_test_t, test_dirty_extent)
 	ASSERT_EQ(csum2, extent->calc_crc32c());
       }
       // submit transaction
-      submit_transaction(std::move(t)).get0();
+      submit_transaction(std::move(t)).get();
       ASSERT_TRUE(extent->is_dirty());
       ASSERT_EQ(addr, extent->get_paddr());
       ASSERT_EQ(extent->get_version(), 1);
@@ -267,7 +270,7 @@ TEST_F(cache_test_t, test_dirty_extent)
       auto extent = get_extent<TestBlockPhysical>(
 	*t,
 	addr,
-	TestBlockPhysical::SIZE).unsafe_get0();
+	TestBlockPhysical::SIZE).unsafe_get();
       ASSERT_TRUE(extent->is_dirty());
       ASSERT_EQ(addr, extent->get_paddr());
       ASSERT_EQ(extent->get_version(), 1);
