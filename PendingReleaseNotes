@@ -39,6 +39,8 @@
   a large buildup of session metadata resulting in the MDS going read-only due to
   the RADOS operation exceeding the size threshold. `mds_session_metadata_threshold`
   config controls the maximum size that a (encoded) session metadata can grow.
+* CephFS: A new "mds last-seen" command is available for querying the last time
+  an MDS was in the FSMap, subject to a pruning threshold.
 * CephFS: For clusters with multiple CephFS file systems, all the snap-schedule
   commands now expect the '--fs' argument.
 * CephFS: The period specifier ``m`` now implies minutes and the period specifier
@@ -201,6 +203,10 @@ CephFS: Disallow delegating preallocated inode ranges to clients. Config
   without this feature will trigger the MDS to raise a HEALTH_ERR on the
   cluster, MDS_CLIENTS_BROKEN_ROOTSQUASH. See the documentation on this warning
   and the new feature bit for more information.
+* CephFS: Expanded removexattr support for cephfs virtual extended attributes.
+  Previously one had to use setxattr to restore the default in order to "remove".
+  You may now properly use removexattr to remove. You can also now remove layout
+  on root inode, which then will restore layout to default layout.
 
 * cls_cxx_gather is marked as deprecated.
 * CephFS: cephfs-journal-tool is guarded against running on an online file system.
